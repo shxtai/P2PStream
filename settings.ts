@@ -11,6 +11,14 @@ export type GoliveMode = "p2p" | "boost" | "off";
 export type Profile = "games" | "movies" | "manual";
 export type Codec = "auto" | "h264" | "vp9" | "av1";
 export type ContentHint = "motion" | "detail";
+export type AudioMode = "system" | "off";
+
+/** Обработчик переключения «нативных плиток» (регистрируется в nativeTiles, чтобы избежать цикла импортов) */
+export let onNativeTilesChange: ((enabled: boolean) => void) | null = null;
+
+export function setNativeTilesHandler(fn: (enabled: boolean) => void): void {
+    onNativeTilesChange = fn;
+}
 
 /** Порядок предпочтения кодеков в режиме «Авто» (от самого лёгкого для CPU/GPU) */
 export const AUTO_CODEC_ORDER: string[] = ["h264", "vp9", "av1"];
@@ -20,7 +28,7 @@ export const settings = definePluginSettings({
         type: OptionType.SELECT,
         description: "Что делает кнопка «Демонстрация экрана» в Discord",
         options: [
-            { label: "P2P-стрим — макс. качество, мин. задержка", value: "p2p", default: true },
+            { label: "Свой пикер: P2P-стрим или обычный стрим Discord", value: "p2p", default: true },
             { label: "Discord Go Live + буст качества", value: "boost" },
             { label: "Обычный Discord-стрим (без изменений)", value: "off" },
         ] as const,
@@ -54,13 +62,16 @@ export const settings = definePluginSettings({
     },
     fps: {
         type: OptionType.SELECT,
-        description: "Частота кадров",
+        description: "Частота кадров — Discord ограничивает 60, здесь до 240",
         options: [
             { label: "30 FPS", value: "30" },
             { label: "48 FPS", value: "48" },
             { label: "60 FPS", value: "60", default: true },
+            { label: "72 FPS", value: "72" },
+            { label: "90 FPS", value: "90" },
             { label: "120 FPS", value: "120" },
             { label: "144 FPS", value: "144" },
+            { label: "240 FPS", value: "240" },
         ] as const
     },
     videoBitrate: {
@@ -102,10 +113,13 @@ export const settings = definePluginSettings({
         default: 0,
         stickToMarkers: false
     },
-    shareAudio: {
-        type: OptionType.BOOLEAN,
-        description: "Захватывать системный звук (Windows: WASAPI loopback)",
-        default: true
+    audioMode: {
+        type: OptionType.SELECT,
+        description: "Звук трансляции: системный loopback (звук самого Discord в эфир не попадает) или без звука",
+        options: [
+            { label: "Системный звук (без Discord)", value: "system", default: true },
+            { label: "Без звука", value: "off" },
+        ] as const
     },
     autoDeleteSignals: {
         type: OptionType.BOOLEAN,
@@ -121,6 +135,12 @@ export const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Автоматически подключаться к P2P-эфиру (как у нативного стрима Discord)",
         default: false
+    },
+    nativeTiles: {
+        type: OptionType.BOOLEAN,
+        description: "Показывать P2P-эфир в звонке как обычный стрим: плитка с LIVE, меткой P2P, превью и зрителями (экспериментально)",
+        default: true,
+        onChange: (v: boolean) => onNativeTilesChange?.(v)
     },
     showStats: {
         type: OptionType.BOOLEAN,

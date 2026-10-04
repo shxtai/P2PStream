@@ -9,6 +9,7 @@ import { createRoot,React, SelectedChannelStore } from "@webpack/common";
 import { cl } from "../css";
 import { createStatsTracker, type HostSession, type LiveHost, manager, type StreamMeta, type WatchSession } from "../engine";
 import { applyProfile, settings } from "../settings";
+import { toast } from "../utils";
 
 const readOutStats = createStatsTracker("out");
 
@@ -122,7 +123,8 @@ function HostBar({ session }: { session: HostSession }) {
     const quickProfile = (p: "games" | "movies") => {
         applyProfile(p);
         settings.store.profile = p;
-        session.updateEncodings();
+        session.applyLiveChanges();
+        toast(p === "games" ? "Профиль «Игры» применён к эфиру" : "Профиль «Кино» применён к эфиру", "success");
     };
 
     return (

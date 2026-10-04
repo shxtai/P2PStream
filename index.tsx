@@ -5,11 +5,13 @@
  */
 
 import { ApplicationCommandInputType } from "@api/Commands";
+import { Settings as AppSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 
 import { manager } from "./engine";
-import { tryInstallHooks, uninstallHooks } from "./hooks";
+import { tryInstallHooks,uninstallHooks } from "./hooks";
+import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
 import managedStyle from "./styles.css?managed";
 import { AboutCard } from "./ui/AboutCard";
@@ -22,9 +24,17 @@ const logger = new Logger("P2PStream");
 /** Допускает UI-слой к открытию окна просмотра при создании сессии просмотра */
 manager.onWatchCreated = session => openViewerModal(session);
 
+/** Миграция старой настройки shareAudio (bool) -> audioMode (select) */
+function migrateLegacyAudio(): void {
+    try {
+        const raw = (AppSettings.plugins.P2PStream as any)?.shareAudio;
+        if (raw === false) settings.store.audioMode = "off";
+    } catch { /* ignore */ }
+}
+
 export default definePlugin({
     name: "P2PStream",
-    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, AV1/VP9/H.264, зум/PiP/фуллскрин у зрителя. Сигналинг невидим (автоудаление сообщений).",
+    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Нативный пикер с выбором P2P/обычного стрима, плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя.",
     searchTerms: ["p2p", "stream", "quality", "bitrate", "webrtc", "golive", "стрим", "качество"],
     tags: ["Voice", "Media", "Utility"],
     authors: [{ name: "Super Z", id: 0n }],
@@ -117,6 +127,9 @@ export default definePlugin({
     start() {
         manager.start();
         manager.onWatchCreated = session => openViewerModal(session);
+        migrateLegacyAudio();
+
+        if (settings.store.nativeTiles) installNativeTiles();
 
         this.unmountBars = mountBars();
 
@@ -142,6 +155,7 @@ export default definePlugin({
             this.hookTimer = undefined;
         }
         uninstallHooks();
+        uninstallNativeTiles();
         this.unmountBars?.();
         this.unmountBars = undefined;
         manager.onWatchCreated = null;

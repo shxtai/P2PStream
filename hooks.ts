@@ -6,10 +6,11 @@
 
 import { Logger } from "@utils/Logger";
 import { findByProps } from "@webpack";
-import { closeAllModals, UserStore } from "@webpack/common";
+import { UserStore } from "@webpack/common";
 
 import { manager } from "./engine";
 import { settings } from "./settings";
+import { openSharePicker } from "./ui/SharePicker";
 import { toast } from "./utils";
 
 const logger = new Logger("P2PStream:Hooks");
@@ -30,8 +31,8 @@ function makeInterceptor(key: string, orig: (...args: any[]) => any): (...args: 
                     toast("P2P-эфир уже идёт — панель остановки внизу экрана", "critical");
                     return;
                 }
-                void manager.startShare();
-                try { closeAllModals(); } catch { /* ignore */ }
+                // Свой пикер в стиле Discord: P2P или обычный стрим — на выбор
+                void openSharePicker({ startDefault: () => orig.apply(this, args) });
                 return;
             }
         } catch (e) {

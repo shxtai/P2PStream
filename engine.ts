@@ -6,7 +6,7 @@
 
 import { Logger } from "@utils/Logger";
 import { findByPropsLazy } from "@webpack";
-import { SelectedChannelStore, UserStore } from "@webpack/common";
+import { ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
@@ -50,6 +50,18 @@ const HOST_TIMEOUT_MS = 22_000;
 function currentVoiceChannelId(): string | null {
     try {
         return SelectedChannelStore.getVoiceChannelId?.() ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function currentVoiceGuildId(): string | null {
+    const channelId = currentVoiceChannelId();
+    if (!channelId) return null;
+    try {
+        const channel: any = ChannelStore.getChannel?.(channelId);
+        const gid = channel?.getGuildId?.() ?? channel?.guild_id ?? null;
+        return gid != null && gid !== "" ? String(gid) : null;
     } catch {
         return null;
     }
@@ -168,7 +180,7 @@ export function buildDisplayConstraints(): DisplayMediaStreamOptions {
     const video: MediaTrackConstraints = { frameRate: fps };
     if (res !== "native") video.height = Number(res);
 
-    const audio = settings.store.shareAudio
+    const audio = settings.store.audioMode === "system"
         ? { restrictOwnAudio: true } as MediaTrackConstraints
         : false;
 
@@ -180,6 +192,21 @@ export function buildDisplayConstraints(): DisplayMediaStreamOptions {
         selfBrowserSurface: "exclude",
         monitorTypeSurfaces: "include"
     } as DisplayMediaStreamOptions;
+}
+
+/** Живое применение качества к захваченному видеотреку (можно менять на лету: профиль Игры/Кино и т.д.) */
+export async function applyCaptureConstraints(track: MediaStreamTrack): Promise<void> {
+    const fps = Number(settings.store.fps) || 60;
+    const res = String(settings.store.resolution);
+    const constraints: MediaTrackConstraints = {
+        frameRate: { ideal: fps, max: 480 }
+    };
+    if (res !== "native") constraints.height = { ideal: Number(res) };
+    try {
+        await track.applyConstraints(constraints);
+    } catch (e) {
+        logger.debug("applyConstraints не удался:", e);
+    }
 }
 
 /** Применить битрейт/FPS к видеосендеру (можно вызывать на живую) */
@@ -451,6 +478,19 @@ export class HostSession {
 
     get meta(): StreamMeta {
         return currentMeta();
+    }
+
+    /** Живое применение профиля/качества к идущему эфиру (Игры/Кино, битрейт, FPS) */
+    applyLiveChanges(): void {
+        const video = this.capture.getVideoTracks()[0];
+        if (video) {
+            try {
+                video.contentHint = String(settings.store.contentHint) === "detail" ? "detail" : "motion";
+            } catch { /* ignore */ }
+            void applyCaptureConstraints(video);
+        }
+        this.updateEncodings();
+        this.mgr.announce();
     }
 
     createPeer(userId: string): HostPeer {
@@ -726,17 +766,54 @@ export class P2PManager {
     }
 
     // region стриминг
-    async startShare(): Promise<void> {
+    /** Проверки перед стартом эфира. true — можно начинать */
+    checkCanStart(): boolean {
         if (this.host) {
             toast("P2P-эфир уже идёт — остановите его в панели внизу", "critical");
+            return false;
+        }
+        if (!currentVoiceChannelId()) {
+            toast("Сначала подключитесь к голосовому каналу", "critical");
+            return false;
+        }
+        return true;
+    }
+
+    /** Старт эфира из собственного пикера (источник уже захвачен) */
+    async startShareWithCapture(capture: MediaStream): Promise<void> {
+        if (!this.checkCanStart()) {
+            for (const t of capture.getTracks()) {
+                try { t.stop(); } catch { /* ignore */ }
+            }
             return;
         }
 
-        const channelId = currentVoiceChannelId();
-        if (!channelId) {
-            toast("Сначала подключитесь к голосовому каналу", "critical");
+        const video = capture.getVideoTracks()[0];
+        if (!video) {
+            capture.getTracks().forEach(t => t.stop());
+            toast("Видеодорожка не получена", "critical");
             return;
         }
+
+        try {
+            video.contentHint = String(settings.store.contentHint) === "detail" ? "detail" : "motion";
+        } catch { /* ignore */ }
+        void applyCaptureConstraints(video);
+
+        this.host = new HostSession(this, currentVoiceChannelId()!, capture);
+        this.startHeartbeat();
+        this.bump();
+
+        // мгновенное объявление (не ждём первого тика heartbeat)
+        this.announce();
+
+        const meta = currentMeta();
+        toast(`P2P-эфир начат: ${meta.res} ${meta.fps} FPS, ${meta.bitrate} Мбит/с`, "success");
+        logger.info("Эфир начат", meta);
+    }
+
+    async startShare(): Promise<void> {
+        if (!this.checkCanStart()) return;
 
         const gdm = navigator.mediaDevices?.getDisplayMedia;
         if (!gdm) {
@@ -760,27 +837,7 @@ export class P2PManager {
             return;
         }
 
-        const video = capture.getVideoTracks()[0];
-        if (!video) {
-            capture.getTracks().forEach(t => t.stop());
-            toast("Видеодорожка не получена", "critical");
-            return;
-        }
-
-        try {
-            video.contentHint = String(settings.store.contentHint) === "detail" ? "detail" : "motion";
-        } catch { /* ignore */ }
-
-        this.host = new HostSession(this, channelId, capture);
-        this.startHeartbeat();
-        this.bump();
-
-        // мгновенное объявление (не ждём первого тика heartbeat)
-        this.sendAnnounce();
-
-        const meta = currentMeta();
-        toast(`P2P-эфир начат: ${meta.res} ${meta.fps} FPS, ${meta.bitrate} Мбит/с`, "success");
-        logger.info("Эфир начат", meta);
+        await this.startShareWithCapture(capture);
     }
 
     stopShare(sendBye = true): void {
@@ -793,7 +850,8 @@ export class P2PManager {
         logger.info("Эфир остановлен");
     }
 
-    private sendAnnounce(): void {
+    /** Объявить всем в канале текущее состояние эфира (announce = heartbeat) */
+    announce(): void {
         const { host } = this;
         if (!host) return;
         sendSignals(host.channelId, {
@@ -811,7 +869,7 @@ export class P2PManager {
                 toast("Вы покинули голосовой канал — P2P-эфир остановлен");
                 return;
             }
-            this.sendAnnounce();
+            this.announce();
         }, HEARTBEAT_MS);
     }
 
