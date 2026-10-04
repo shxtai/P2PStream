@@ -1,0 +1,340 @@
+/* Vencord P2PStream plugin — стили (максимум дизайн-токенов Discord) */
+
+/* ===== Плавающие панели ===== */
+.vc-p2p-bars-root {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 118px;
+    z-index: 5000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+}
+
+.vc-p2p-pill,
+.vc-p2p-hostbar {
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--background-floating, #111214);
+    border: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.06));
+    box-shadow: var(--shadow-high, 0 8px 16px rgba(0, 0, 0, 0.24));
+    border-radius: 10px;
+    padding: 8px 12px;
+    max-width: min(720px, 90vw);
+    animation: vc-p2p-slide-in 180ms ease-out;
+}
+
+@keyframes vc-p2p-slide-in {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.vc-p2p-live-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #f23f42;
+    box-shadow: 0 0 0 0 rgba(242, 63, 66, 0.5);
+    animation: vc-p2p-pulse 1.6s infinite;
+    flex-shrink: 0;
+}
+
+.vc-p2p-live-dot.off {
+    background: var(--text-muted, #949ba4);
+    animation: none;
+}
+
+@keyframes vc-p2p-pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(242, 63, 66, 0.5);
+    }
+    70% {
+        box-shadow: 0 0 0 6px rgba(242, 63, 66, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(242, 63, 66, 0);
+    }
+}
+
+.vc-p2p-pill-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.vc-p2p-pill-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-strong, #f2f3f5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.vc-p2p-pill-meta,
+.vc-p2p-hostbar-meta {
+    font-size: 12px;
+    color: var(--text-muted, #949ba4);
+    white-space: nowrap;
+}
+
+.vc-p2p-hostbar-label {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.4px;
+    color: #f23f42;
+}
+
+.vc-p2p-pill-state {
+    font-size: 12px;
+    color: var(--text-muted, #949ba4);
+    white-space: nowrap;
+}
+
+.vc-p2p-pill-state[data-state="live"] {
+    color: #23a55a;
+    font-weight: 600;
+}
+
+.vc-p2p-pill-state[data-state="failed"] {
+    color: #f23f42;
+}
+
+.vc-p2p-pill-btn,
+.vc-p2p-ctrl-btn {
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--button-secondary-background, #4e5058);
+    color: var(--text-strong, #f2f3f5);
+    white-space: nowrap;
+    transition: background 120ms ease;
+}
+
+.vc-p2p-pill-btn:hover,
+.vc-p2p-ctrl-btn:hover {
+    background: var(--button-secondary-background-hover, #6d6f78);
+}
+
+.vc-p2p-pill-btn.active {
+    background: var(--button-filled-brand-background, #5865f2);
+}
+
+.vc-p2p-pill-btn.danger,
+.vc-p2p-ctrl-btn.danger {
+    background: var(--button-danger-background, #da373c);
+}
+
+.vc-p2p-pill-btn.danger:hover,
+.vc-p2p-ctrl-btn.danger:hover {
+    background: var(--button-danger-background-hover, #a12828);
+}
+
+.vc-p2p-pill-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.vc-p2p-hostbar .vc-p2p-spacer {
+    width: 8px;
+}
+
+.vc-p2p-spacer {
+    flex: 1;
+}
+
+/* ===== Карточка в настройках ===== */
+.vc-p2p-about {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.vc-p2p-about-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.vc-p2p-about-status {
+    font-size: 13px;
+    color: var(--text-muted, #949ba4);
+}
+
+.vc-p2p-about-hint {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-default, #dbdee1);
+    background: var(--background-secondary, #1e1f22);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+/* ===== Окно просмотра ===== */
+.vc-p2p-viewer-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.vc-p2p-video-wrap {
+    position: relative;
+    overflow: hidden;
+    background: #000;
+    border-radius: 8px;
+    height: min(72vh, calc(100vh - 260px));
+    min-height: 320px;
+    user-select: none;
+}
+
+.vc-p2p-video-wrap.zoomed {
+    cursor: grab;
+}
+
+.vc-p2p-video-wrap.zoomed:active {
+    cursor: grabbing;
+}
+
+.vc-p2p-video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    transform-origin: 0 0;
+    will-change: transform;
+}
+
+.vc-p2p-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.6);
+    color: var(--text-strong, #f2f3f5);
+    font-size: 16px;
+    font-weight: 600;
+    pointer-events: none;
+}
+
+.vc-p2p-overlay-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-muted, #949ba4);
+}
+
+.vc-p2p-spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.2);
+    border-top-color: #5865f2;
+    animation: vc-p2p-spin 0.8s linear infinite;
+}
+
+@keyframes vc-p2p-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.vc-p2p-zoom-badge {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    border-radius: 6px;
+    padding: 4px 8px;
+    pointer-events: none;
+}
+
+.vc-p2p-stats {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    background: rgba(0, 0, 0, 0.65);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: var(--font-code, monospace);
+    font-size: 12px;
+    line-height: 1.55;
+    color: #b5bac1;
+    pointer-events: none;
+}
+
+.vc-p2p-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.vc-p2p-volume {
+    width: 120px;
+    accent-color: #5865f2;
+}
+
+.vc-p2p-chip {
+    font-size: 12px;
+    color: var(--text-muted, #949ba4);
+    background: var(--background-secondary, #1e1f22);
+    border-radius: 6px;
+    padding: 4px 8px;
+    white-space: nowrap;
+}
+
+/* Заголовок модалки */
+.vc-p2p-viewer-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.vc-p2p-viewer-name {
+    font-weight: 700;
+    color: var(--text-strong, #f2f3f5);
+}
+
+.vc-p2p-live-label {
+    background: #f23f42;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
+.vc-p2p-viewer-meta {
+    font-size: 12px;
+    color: var(--text-muted, #949ba4);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Фуллскрин: растягиваем видео */
+.vc-p2p-video-wrap:fullscreen {
+    border-radius: 0;
+    height: 100vh;
+}
