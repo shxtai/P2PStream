@@ -5,8 +5,7 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { findByPropsLazy } from "@webpack";
-import { ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
+import { ChannelStore, ApplicationStreamingStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
@@ -22,8 +21,6 @@ import {
 import { myId, randomId, toast } from "./utils";
 
 const logger = new Logger("P2PStream:Engine");
-
-const ApplicationStreamingStore = findByPropsLazy("getStreamForUser", "getAllApplicationStreams");
 
 export interface StreamMeta {
     res?: string;
