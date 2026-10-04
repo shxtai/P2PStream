@@ -5,7 +5,7 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { ChannelStore, ApplicationStreamingStore, SelectedChannelStore, UserStore } from "@webpack/common";
+import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
@@ -347,12 +347,18 @@ class HostPeer {
     private iceBuf: RTCIceCandidateInit[] = [];
     private iceTimer: NodeJS.Timeout | undefined;
     private restarted = false;
+    /** Канал превью (кадры для плиток, пока зритель не смотрит) */
+    previewDc?: RTCDataChannel;
 
     constructor(
         private host: HostSession,
         public userId: string
     ) {
         this.pc = new RTCPeerConnection(buildRtcConfig());
+
+        try {
+            this.previewDc = this.pc.createDataChannel("vcP2PPreview");
+        } catch { /* ignore */ }
 
         for (const track of host.capture.getTracks()) {
             this.pc.addTrack(track, host.capture);
@@ -442,6 +448,15 @@ class HostPeer {
         }
     }
 
+    /** Отправить кадр превью зрителю (DataChannel) */
+    sendPreview(url: string): void {
+        const dc = this.previewDc;
+        if (!dc || dc.readyState !== "open") return;
+        try {
+            dc.send(JSON.stringify({ t: "preview", s: this.host.streamId, d: url }));
+        } catch { /* ignore */ }
+    }
+
     close(): void {
         if (this.closed) return;
         this.closed = true;
@@ -522,6 +537,11 @@ export class HostSession {
         for (const peer of this.peers.values()) {
             void applySendParameters(peer.pc);
         }
+    }
+
+    /** Разослать кадр превью всем зрителям (для плиток до подключения просмотра) */
+    broadcastPreview(url: string): void {
+        for (const peer of this.peers.values()) peer.sendPreview(url);
     }
 
     stop(sendBye = true): void {
@@ -641,6 +661,16 @@ export class WatchSession {
         const pc = new RTCPeerConnection(buildRtcConfig());
         this.pc = pc;
 
+        pc.ondatachannel = e => {
+            const dc = e.channel;
+            dc.onmessage = ev => {
+                try {
+                    const m = JSON.parse(String(ev.data));
+                    if (m?.t === "preview" && m.s && m.d) this.mgr.onPreviewFrame?.(String(m.s), String(m.d));
+                } catch { /* ignore */ }
+            };
+        };
+
         pc.ontrack = e => {
             const { track } = e;
             try { this.stream.addTrack(track); } catch { /* ignore */ }
@@ -708,6 +738,8 @@ export class P2PManager {
     version = 0;
     /** вызывается UI-слоем: открывает окно просмотра для новой сессии */
     onWatchCreated: ((session: WatchSession) => void) | null = null;
+    /** кадр превью пришёл по DataChannel (подключается nativeTiles) */
+    onPreviewFrame: ((streamId: string, url: string) => void) | null = null;
 
     private listeners = new Set<() => void>();
     private heartbeatTimer: NodeJS.Timeout | undefined;

@@ -10,7 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 
 import { manager } from "./engine";
-import { tryInstallHooks,uninstallHooks } from "./hooks";
+import { installShareHook, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
 import managedStyle from "./styles.css?managed";
@@ -133,28 +133,16 @@ export default definePlugin({
 
         this.unmountBars = mountBars();
 
-        // Перехват кнопки может требовать прогрева webpack — пробуем с повторами
-        this.hookAttempts = 0;
-        this.hookTimer = setInterval(() => {
-            if (this.hookTimer === undefined) return;
-            if (tryInstallHooks() || ++this.hookAttempts > 40) {
-                clearInterval(this.hookTimer);
-                this.hookTimer = undefined;
-                if (!tryInstallHooks()) {
-                    logger.info("Перехват кнопки не удался — доступны /p2p-start и пилюли");
-                }
-            }
-        }, 3000);
+        // Кнопка «Демонстрация экрана» → наш пикер: подменяем getDisplayMedia
+        // (тот же приём, что у встроенного плагина Vencord WebScreenShare —
+        // устойчив к переименованиям модулей Discord).
+        installShareHook();
 
         logger.info("Плагин запущен");
     },
 
     stop() {
-        if (this.hookTimer) {
-            clearInterval(this.hookTimer);
-            this.hookTimer = undefined;
-        }
-        uninstallHooks();
+        uninstallShareHook();
         uninstallNativeTiles();
         this.unmountBars?.();
         this.unmountBars = undefined;
@@ -163,7 +151,5 @@ export default definePlugin({
         logger.info("Плагин остановлен");
     },
 
-    hookTimer: undefined as NodeJS.Timeout | undefined,
-    hookAttempts: 0,
     unmountBars: undefined as (() => void) | undefined
 });

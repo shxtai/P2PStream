@@ -312,9 +312,51 @@ function placeholderUrl(): string {
     return PLACEHOLDER;
 }
 
+/** Снять кадр с видео в jpeg-dataURL (480x270) */
+function grabFrame(video: HTMLVideoElement): string | null {
+    if (!previewCanvas) {
+        previewCanvas = document.createElement("canvas");
+        previewCanvas.width = 480;
+        previewCanvas.height = 270;
+    }
+    const ctx = previewCanvas.getContext("2d");
+    if (!ctx) return null;
+    try {
+        ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
+        return previewCanvas.toDataURL("image/jpeg", 0.55);
+    } catch {
+        return null;
+    }
+}
+
 function tickPreviews(): void {
     try {
         const active = new Set(manager.watches.keys());
+        let changed = false;
+
+        // Превью собственного эфира + рассылка кадров зрителям
+        const { host } = manager;
+        if (host) {
+            active.add(host.streamId);
+            let video = previewVideos.get(host.streamId);
+            if (!video) {
+                video = document.createElement("video");
+                video.muted = true;
+                video.autoplay = true;
+                video.playsInline = true;
+                video.srcObject = host.capture;
+                void video.play().catch(() => { /* ignore */ });
+                previewVideos.set(host.streamId, video);
+            }
+            if (video.readyState >= 2) {
+                const url = grabFrame(video);
+                if (url && previewUrls.get(host.streamId) !== url) {
+                    previewUrls.set(host.streamId, url);
+                    host.broadcastPreview(url);
+                    changed = true;
+                }
+            }
+        }
 
         for (const [streamId, watch] of manager.watches) {
             if (watch.state !== "live" || watch.pc == null) continue;
@@ -331,17 +373,11 @@ function tickPreviews(): void {
             }
             if (video.readyState < 2) continue;
 
-            if (!previewCanvas) {
-                previewCanvas = document.createElement("canvas");
-                previewCanvas.width = 480;
-                previewCanvas.height = 270;
+            const url = grabFrame(video);
+            if (url && previewUrls.get(streamId) !== url) {
+                previewUrls.set(streamId, url);
+                changed = true;
             }
-            const ctx = previewCanvas.getContext("2d");
-            if (!ctx) continue;
-            try {
-                ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-                previewUrls.set(streamId, previewCanvas.toDataURL("image/jpeg", 0.55));
-            } catch { /* ignore */ }
         }
 
         for (const streamId of [...previewVideos.keys()]) {
@@ -354,6 +390,8 @@ function tickPreviews(): void {
         for (const streamId of [...previewUrls.keys()]) {
             if (!active.has(streamId)) previewUrls.delete(streamId);
         }
+
+        if (changed) pokeUI();
     } catch (e) {
         logger.debug("tickPreviews:", e);
     }
@@ -498,3 +536,9 @@ setNativeTilesHandler(enabled => {
     if (enabled) installNativeTiles();
     else uninstallNativeTiles();
 });
+
+// входящие превью-кадры от хостов (DataChannel) — рисуем их в плитках сразу
+manager.onPreviewFrame = (streamId, url) => {
+    previewUrls.set(streamId, url);
+    pokeUI();
+};

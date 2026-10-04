@@ -5,7 +5,6 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { findByProps } from "@webpack";
 import { UserStore } from "@webpack/common";
 
 import { manager } from "./engine";
@@ -15,75 +14,87 @@ import { toast } from "./utils";
 
 const logger = new Logger("P2PStream:Hooks");
 
+/**
+ * Оригинальный getDisplayMedia, снятый в момент загрузки модуля — до того,
+ * как кто-либо (WebScreenShare, Vesktop и т.д.) успел его подменить.
+ * Через него идут «обычные» стримы Discord — так пользователь видит ровно
+ * тот пикер, к которому привык (Vesktop-пикер / браузерный).
+ */
+const realGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+
+function notAllowedError(): Error {
+    const e = new Error("P2PStream: cancelled");
+    e.name = "NotAllowedError";
+    return e;
+}
+
 let installed = false;
-const originals: Array<[any, string, any]> = [];
+let reassertTimer: NodeJS.Timeout | undefined;
+let ourWrapper: ((opts: DisplayMediaStreamOptions) => Promise<MediaStream>) | null = null;
 
-function makeInterceptor(key: string, orig: (...args: any[]) => any): (...args: any[]) => any {
-    const wrapped = function (this: any, ...args: any[]) {
+function makeWrapper(): (opts: DisplayMediaStreamOptions) => Promise<MediaStream> {
+    return async function (opts: DisplayMediaStreamOptions) {
+        if (String(settings.store.goliveMode) !== "p2p") {
+            return realGetDisplayMedia(opts);
+        }
         try {
-            const mode = String(settings.store.goliveMode);
-            if (mode === "p2p") {
-                if (manager.hasDiscordStream(UserStore.getCurrentUser()?.id ?? "")) {
-                    toast("Сначала остановите Discord-стрим", "critical");
-                    return;
-                }
-                if (manager.host) {
-                    toast("P2P-эфир уже идёт — панель остановки внизу экрана", "critical");
-                    return;
-                }
-                // Свой пикер в стиле Discord: P2P или обычный стрим — на выбор
-                void openSharePicker({ startDefault: () => orig.apply(this, args) });
-                return;
+            const me = UserStore.getCurrentUser()?.id ?? "";
+            if (manager.hasDiscordStream(me)) {
+                toast("Сначала остановите Discord-стрим", "critical");
+                throw notAllowedError();
             }
+            if (manager.host) {
+                toast("P2P-эфир уже идёт — панель остановки внизу экрана", "critical");
+                throw notAllowedError();
+            }
+            // Свой пикер: резолвится потоком для «обычного стрима»,
+            // кидает NotAllowedError при отмене и после старта P2P.
+            const stream = await openSharePicker({
+                discordOptions: opts,
+                gdm: realGetDisplayMedia
+            });
+            return stream;
         } catch (e) {
-            logger.error("Interceptor error:", e);
+            // Пользователь отменил / выбрал P2P — для Discord это «отмена захвата».
+            if ((e as any)?.name === "NotAllowedError") throw e;
+            logger.error("Ошибка пикера:", e);
+            throw notAllowedError();
         }
-        return orig.apply(this, args);
     };
-    (wrapped as any).__vcP2PWrapped = true;
-    return wrapped;
 }
 
-/** Попытаться обернуть точки входа Go Live. Возвращает true, если хоть что-то обёрнуто. */
-export function tryInstallHooks(): boolean {
-    if (installed) return true;
-
-    const candidateProps: string[][] = [
-        ["openShareModal"],
-        ["setGoLiveSource", "stopStream"],
-        ["startStream", "stopStream"]
-    ];
-
-    let count = 0;
-    for (const props of candidateProps) {
-        let mod: any;
-        try {
-            mod = findByProps(...props) as any;
-        } catch {
-            mod = null;
-        }
-        if (!mod) continue;
-        for (const key of props) {
-            const orig = mod[key];
-            if (typeof orig !== "function" || orig.__vcP2PWrapped) continue;
-            mod[key] = makeInterceptor(key, orig);
-            originals.push([mod, key, orig]);
-            count++;
-        }
-        if (count > 0) break; // одной точки входа достаточно
+/** Установить/переподтвердить нашу подмену getDisplayMedia (устойчиво к чужим подменам). */
+function assertWrapper(): void {
+    if (!ourWrapper) ourWrapper = makeWrapper();
+    const current = navigator.mediaDevices.getDisplayMedia;
+    if (current !== ourWrapper) {
+        navigator.mediaDevices.getDisplayMedia = ourWrapper as any;
+        logger.info("getDisplayMedia перехвачен: кнопка стрима открывает пикер P2PStream");
     }
-
-    if (count > 0) {
-        installed = true;
-        logger.info(`Перехват кнопки демонстрации экрана установлен (${count} ф.)`);
-    }
-    return installed;
 }
 
-export function uninstallHooks(): void {
-    for (const [mod, key, orig] of originals) {
-        try { mod[key] = orig; } catch { /* ignore */ }
+export function installShareHook(): void {
+    assertWrapper();
+    if (!reassertTimer) {
+        // если другой плагин (например, WebScreenShare) подменяет getDisplayMedia
+        // после нас — тихо перекрываем обратно
+        reassertTimer = setInterval(assertWrapper, 3000);
     }
-    originals.length = 0;
+    installed = true;
+}
+
+export function uninstallShareHook(): void {
+    if (reassertTimer) {
+        clearInterval(reassertTimer);
+        reassertTimer = undefined;
+    }
+    if (installed && ourWrapper && navigator.mediaDevices.getDisplayMedia === ourWrapper) {
+        navigator.mediaDevices.getDisplayMedia = realGetDisplayMedia as any;
+    }
     installed = false;
+    logger.info("Перехват getDisplayMedia снят");
+}
+
+export function isShareHookInstalled(): boolean {
+    return installed;
 }
