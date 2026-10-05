@@ -43,7 +43,10 @@ export class Broker {
     async fetch(request) {
         const pair = new WebSocketPair();
         const server = pair[1];
-        this.state.acceptWebSocket(server);
+        // Обычный accept(): обработчики ниже — addEventListener. Раньше был
+        // state.acceptWebSocket() (Hibernation API): с ним события приходят ТОЛЬКО
+        // в методы webSocketMessage/webSocketClose, и брокер не видел ни одного пакета.
+        server.accept();
         this.clients.set(server, new Set());
 
         server.addEventListener("message", ev => {
@@ -87,15 +90,20 @@ export class Broker {
                 this.send(ws, new Uint8Array([0x20, 0x02, 0x00, 0x00]));
                 return;
             }
-            case 0x82: { // SUBSCRIBE -> SUBACK (QoS 0 для каждого фильтра)
+            // тип = старшие 4 бита: SUBSCRIBE (0x82 на проводе) приходит сюда как 0x80.
+            // Раньше было case 0x82 — подписки не регистрировались никогда.
+            case 0x80: { // SUBSCRIBE -> SUBACK (QoS 0 для каждого фильтра)
                 if (body.length < 4) return;
                 const topics = this.clients.get(ws) ?? new Set();
                 const filters = parseSubscribeTopics(body);
                 for (const f of filters) topics.add(f);
-                const ack = new Uint8Array(2 + filters.length);
+                // SUBACK: packet id (2 байта, как в SUBSCRIBE) + код на каждый фильтр
+                const ack = new Uint8Array(4 + filters.length);
                 ack[0] = 0x90;
-                ack[1] = filters.length;
-                for (let k = 0; k < filters.length; k++) ack[2 + k] = 0;
+                ack[1] = 2 + filters.length;
+                ack[2] = body[0];
+                ack[3] = body[1];
+                for (let k = 0; k < filters.length; k++) ack[4 + k] = 0;
                 this.send(ws, ack);
                 return;
             }
@@ -118,13 +126,17 @@ export class Broker {
                     if (client.readyState !== 1) continue; // OPEN
                     for (const f of filters) {
                         if (topicMatches(f, topic)) {
-                            const out = new Uint8Array(1 + 2 + tLen + payload.length);
+                            // remaining length — varint (раньше 1 байт: любой пакет
+                            // длиннее 127 байт, т.е. каждый offer/answer, приходил битым)
+                            const head = varint(2 + tLen + payload.length);
+                            const out = new Uint8Array(1 + head.length + 2 + tLen + payload.length);
                             out[0] = 0x30;
-                            out[1] = (2 + tLen + payload.length) & 0xff; // payload << 120KB не бывает
-                            out[2] = (tLen >> 8) & 0xff;
-                            out[3] = tLen & 0xff;
-                            out.set(body.subarray(2, 2 + tLen), 4);
-                            out.set(payload, 4 + tLen);
+                            out.set(head, 1);
+                            let o = 1 + head.length;
+                            out[o++] = (tLen >> 8) & 0xff;
+                            out[o++] = tLen & 0xff;
+                            out.set(body.subarray(2, 2 + tLen), o);
+                            out.set(payload, o + tLen);
                             this.send(client, out);
                             break;
                         }
@@ -145,6 +157,18 @@ export class Broker {
 // ---------------------------------------------------------------------------
 // MQTT-помощники
 // ---------------------------------------------------------------------------
+
+/** MQTT remaining length (variable byte integer) */
+function varint(len) {
+    const out = [];
+    do {
+        let d = len % 128;
+        len = Math.floor(len / 128);
+        if (len > 0) d |= 0x80;
+        out.push(d);
+    } while (len > 0);
+    return out;
+}
 
 /** Вытащить фильтры топиков из SUBSCRIBE (пропуская packet id) */
 function parseSubscribeTopics(body) {

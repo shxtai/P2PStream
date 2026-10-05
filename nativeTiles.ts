@@ -332,68 +332,84 @@ function placeholderUrl(): string {
     return PLACEHOLDER;
 }
 
-/** Снять кадр с видео в jpeg-dataURL (480x270) */
+/** Снять кадр с видео в jpeg-dataURL (320x180 — плитке больше не нужно) */
 function grabFrame(video: HTMLVideoElement): string | null {
     if (!previewCanvas) {
         previewCanvas = document.createElement("canvas");
-        previewCanvas.width = 480;
-        previewCanvas.height = 270;
+        previewCanvas.width = 320;
+        previewCanvas.height = 180;
     }
-    const ctx = previewCanvas.getContext("2d");
+    const ctx = previewCanvas.getContext("2d", { alpha: false });
     if (!ctx) return null;
     try {
         ctx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
-        return previewCanvas.toDataURL("image/jpeg", 0.55);
+        return previewCanvas.toDataURL("image/jpeg", 0.5);
     } catch {
         return null;
     }
 }
 
-function tickPreviews(): void {
+/**
+ * Разовый снимок кадра. Скрытый <video> НЕ играет постоянно: раньше он без
+ * остановки декодировал/композитил весь поток 1080p60 ради одного кадра в 2 с.
+ * Теперь: play -> дождаться одного кадра -> снять -> pause.
+ */
+async function snapshot(streamId: string, stream: MediaStream): Promise<string | null> {
+    let video = previewVideos.get(streamId);
+    if (!video) {
+        video = document.createElement("video");
+        video.muted = true;
+        video.playsInline = true;
+        video.srcObject = stream;
+        previewVideos.set(streamId, video);
+    } else if (video.srcObject !== stream) {
+        video.srcObject = stream;
+    }
     try {
-        const active = new Set(manager.watches.keys());
+        await video.play();
+        await new Promise<void>(resolve => {
+            const done = () => { clearTimeout(t); resolve(); };
+            const t = setTimeout(done, 600);
+            const v: any = video;
+            if (typeof v.requestVideoFrameCallback === "function") v.requestVideoFrameCallback(done);
+            else if (video!.readyState >= 2) done();
+            else video!.addEventListener("loadeddata", done, { once: true });
+        });
+        return video.readyState >= 2 ? grabFrame(video) : null;
+    } catch {
+        return null;
+    } finally {
+        try { video.pause(); } catch { /* ignore */ }
+    }
+}
+
+let ticking = false;
+
+async function tickPreviews(): Promise<void> {
+    // Discord свёрнут/в трее — плитки никто не видит, ничего не снимаем
+    if (ticking || document.hidden) return;
+    ticking = true;
+    try {
+        const active = new Set<string>();
         let changed = false;
 
-        // Превью собственного эфира + рассылка кадров зрителям
+        // Превью собственного эфира (только для своей плитки). Рассылки кадров
+        // зрителям больше нет: пир у хоста появляется лишь после join, т.е. кадры
+        // уходили тем, кто эфир УЖЕ смотрит — лишний JPEG + трафик впустую.
         const { host } = manager;
         if (host) {
             active.add(host.streamId);
-            let video = previewVideos.get(host.streamId);
-            if (!video) {
-                video = document.createElement("video");
-                video.muted = true;
-                video.autoplay = true;
-                video.playsInline = true;
-                video.srcObject = host.capture;
-                void video.play().catch(() => { /* ignore */ });
-                previewVideos.set(host.streamId, video);
-            }
-            if (video.readyState >= 2) {
-                const url = grabFrame(video);
-                if (url && previewUrls.get(host.streamId) !== url) {
-                    previewUrls.set(host.streamId, url);
-                    host.broadcastPreview(url);
-                    changed = true;
-                }
+            const url = await snapshot(host.streamId, host.capture);
+            if (url && previewUrls.get(host.streamId) !== url) {
+                previewUrls.set(host.streamId, url);
+                changed = true;
             }
         }
 
         for (const [streamId, watch] of manager.watches) {
             if (watch.state !== "live" || watch.pc == null) continue;
-
-            let video = previewVideos.get(streamId);
-            if (!video) {
-                video = document.createElement("video");
-                video.muted = true;
-                video.autoplay = true;
-                video.playsInline = true;
-                video.srcObject = watch.stream;
-                void video.play().catch(() => { /* ignore */ });
-                previewVideos.set(streamId, video);
-            }
-            if (video.readyState < 2) continue;
-
-            const url = grabFrame(video);
+            active.add(streamId);
+            const url = await snapshot(streamId, watch.stream);
             if (url && previewUrls.get(streamId) !== url) {
                 previewUrls.set(streamId, url);
                 changed = true;
@@ -403,17 +419,19 @@ function tickPreviews(): void {
         for (const streamId of [...previewVideos.keys()]) {
             if (!active.has(streamId)) {
                 const video = previewVideos.get(streamId);
-                try { video?.pause(); } catch { /* ignore */ }
+                try { video?.pause(); if (video) video.srcObject = null; } catch { /* ignore */ }
                 previewVideos.delete(streamId);
             }
         }
         for (const streamId of [...previewUrls.keys()]) {
-            if (!active.has(streamId)) previewUrls.delete(streamId);
+            if (!active.has(streamId) && !manager.liveHosts.has(streamId)) previewUrls.delete(streamId);
         }
 
-        if (changed) pokeUI();
+        if (changed) pokeUI(true);
     } catch (e) {
         logger.debug("tickPreviews:", e);
+    } finally {
+        ticking = false;
     }
 }
 
@@ -478,8 +496,8 @@ function installWatchIntercept(): void {
                     const key0 = first?.streamKey ?? first?.streamId ?? (typeof first === "string" ? first : undefined);
                     const host = key0 != null ? hostByStreamKey(key0) : null;
                     if (host) {
-                        const session = manager.watch(host.streamId);
-                        if (session) manager.onWatchCreated?.(session);
+                        // своя плитка: смотреть самого себя нечего (раньше — тост «Эфир не найден»)
+                        if (host.userId !== myId()) manager.watch(host.streamId);
                         return;
                     }
                 } catch (e) {
@@ -500,15 +518,33 @@ function installWatchIntercept(): void {
 // region обновление UI Discord'а
 /** Мягкий «пинок»: пустой VOICE_STATE_UPDATES заставляет сторы эмитнуть изменение
  *  и перерисовать плитки звонка. */
-function pokeUI(): void {
+let lastTilesKey = "";
+let forcePoke = false;
+
+/** Ключ того, что реально видно в плитках: эфиры, состояния просмотров, превью */
+function tilesKey(): string {
+    const hosts = allHosts().map(h => h.streamId).sort().join(",");
+    const watches = [...manager.watches.values()].map(w => `${w.host.streamId}:${w.state}`).sort().join(",");
+    return `${hosts}|${watches}`;
+}
+
+function pokeUI(previewChanged = false): void {
+    if (previewChanged) forcePoke = true;
     if (pokeScheduled) return;
     pokeScheduled = true;
+    // Каждый «пинок» заставляет Discord пересчитать сторы звонка и перерисоваться.
+    // Раньше он летел на КАЖДЫЙ bump менеджера (любой анонс/сигнал) через 150 мс —
+    // теперь не чаще раза в 500 мс и только если в плитках что-то поменялось.
     setTimeout(() => {
         pokeScheduled = false;
+        const key = tilesKey();
+        if (!forcePoke && key === lastTilesKey) return;
+        forcePoke = false;
+        lastTilesKey = key;
         try {
             FluxDispatcher.dispatch({ type: "VOICE_STATE_UPDATES", voiceStates: [] } as any);
         } catch { /* ignore */ }
-    }, 150);
+    }, 500);
 }
 // endregion
 
@@ -521,8 +557,9 @@ export function installNativeTiles(): boolean {
         wrapPreviewStore();
         installWatchIntercept();
 
-        previewTimer = setInterval(tickPreviews, 2000);
-        unsubscribeManager = manager.subscribe(pokeUI);
+        // превью раз в 5 с (было 2 с): плитке звонка этого достаточно
+        previewTimer = setInterval(() => { void tickPreviews(); }, 5000);
+        unsubscribeManager = manager.subscribe(() => pokeUI());
 
         installed = true;
         logger.info("Нативные плитки P2P-эфиров включены");
@@ -543,7 +580,7 @@ export function uninstallNativeTiles(): void {
     unsubscribeManager?.();
     unsubscribeManager = undefined;
     for (const video of previewVideos.values()) {
-        try { video.pause(); } catch { /* ignore */ }
+        try { video.pause(); video.srcObject = null; } catch { /* ignore */ }
     }
     previewVideos.clear();
     previewUrls.clear();
@@ -560,5 +597,5 @@ setNativeTilesHandler(enabled => {
 // входящие превью-кадры от хостов (DataChannel) — рисуем их в плитках сразу
 manager.onPreviewFrame = (streamId, url) => {
     previewUrls.set(streamId, url);
-    pokeUI();
+    pokeUI(true);
 };

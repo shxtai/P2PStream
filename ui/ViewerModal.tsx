@@ -12,8 +12,6 @@ import { settings } from "../settings";
 import { toast } from "../utils";
 import { openMiniPlayer } from "./MiniPlayer";
 
-const readStats = createStatsTracker("in");
-
 export function openViewerModal(session: WatchSession): void {
     if (openSessions.has(session.host.streamId)) return;
     openSessions.add(session.host.streamId);
@@ -24,9 +22,12 @@ export function openViewerModal(session: WatchSession): void {
                 openSessions.delete(session.host.streamId);
                 // закрытие модалки НЕ останавливает просмотр — эфир продолжает
                 // играть в компактном мини-плеере («панелька где-то сбоку»)
-                if (manager.watches.get(session.host.streamId) === session
-                    && session.state !== "ended" && session.state !== "failed") {
+                if (manager.watches.get(session.host.streamId) !== session) return;
+                if (session.state !== "ended" && session.state !== "failed") {
                     openMiniPlayer(session);
+                } else {
+                    // эфир кончился/упал — убираем сессию, иначе она висит мёртвой
+                    manager.unwatch(session.host.streamId);
                 }
             }
         }
@@ -44,6 +45,9 @@ function useStats(pc: RTCPeerConnection | undefined, active: boolean): StreamSta
     const [stats, setStats] = React.useState<StreamStats | null>(null);
     React.useEffect(() => {
         if (!pc || !active) return;
+        // свой счётчик на каждый pc: общий модульный считал дельты байтов между
+        // РАЗНЫМИ соединениями (после переподключения/другого эфира — мусор)
+        const readStats = createStatsTracker("in");
         let alive = true;
         const tick = () => {
             void readStats(pc).then(s => { if (alive) setStats(s); });

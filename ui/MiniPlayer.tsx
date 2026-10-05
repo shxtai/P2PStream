@@ -76,15 +76,19 @@ function MiniPlayer({ session }: { session: WatchSession }) {
     const { state } = session;
     const { host } = session;
 
-    // подключение потока
+    // подключение потока: только при новых дорожках/смене состояния/разворачивании.
+    // Раньше srcObject переприсваивался на КАЖДЫЙ рендер (а рендер — на каждый
+    // bump менеджера), и видео перезагружалось с чёрным кадром.
+    const trackCount = session.stream.getTracks().length;
     React.useEffect(() => {
         const v = videoRef.current;
         if (!v) return;
+        v.srcObject = null;
         v.srcObject = session.stream;
         v.volume = volume;
         v.muted = muted;
         v.play?.().catch(() => { /* автоплей до жеста может быть отклонён */ });
-    });
+    }, [trackCount, state, collapsed]);
 
     React.useEffect(() => {
         const v = videoRef.current;
@@ -97,7 +101,10 @@ function MiniPlayer({ session }: { session: WatchSession }) {
     // авто-закрытие при завершении/потере эфира
     React.useEffect(() => {
         if (state === "ended" || state === "failed") {
-            const t = setTimeout(() => closeMiniPlayer(session.host.streamId), 1800);
+            const t = setTimeout(() => {
+                closeMiniPlayer(session.host.streamId);
+                if (manager.watches.get(session.host.streamId) === session) manager.unwatch(session.host.streamId);
+            }, 1800);
             return () => clearTimeout(t);
         }
     }, [state]);

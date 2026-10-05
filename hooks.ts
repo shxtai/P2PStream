@@ -140,10 +140,15 @@ async function startP2PFromDiscordSource(sourceId: string, payload: any): Promis
     } catch { /* имя останется базовым */ }
 
     // уважим качество, выбранное в стоковом пикере
+    // (только значения, которые есть в настройках: Discord шлёт resolution 0 = «источник»
+    // и FPS вроде 5/15 — раньше они записывались как есть и ломали селекты/захват)
     const quality = payload?.quality ?? payload?.source?.quality;
     try {
-        if (quality?.frameRate) (settings.store as any).fps = String(quality.frameRate);
-        if (quality?.resolution) (settings.store as any).resolution = String(quality.resolution);
+        const fps = Number(quality?.frameRate);
+        if ([30, 48, 60, 72, 90, 120, 144, 240].includes(fps)) (settings.store as any).fps = String(fps);
+        const res = Number(quality?.resolution);
+        if (res === 0) (settings.store as any).resolution = "native";
+        else if ([720, 1080, 1440, 2160].includes(res)) (settings.store as any).resolution = String(res);
     } catch { /* ignore */ }
 
     const stream = await captureDesktopSource(sourceId, {
@@ -152,8 +157,7 @@ async function startP2PFromDiscordSource(sourceId: string, payload: any): Promis
         audio: String(settings.store.audioMode) !== "off"
     });
     if (!stream) throw new Error("Захват источника не удался");
-    await manager.startShareWithCapture(stream, meta);
-    toast(`P2P-эфир начат (источник: ${meta.name})`, "success");
+    await manager.startShareWithCapture(stream, meta); // тост «эфир начат» показывает движок
 }
 
 async function hijackGoLive(payload: any): Promise<void> {

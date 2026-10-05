@@ -126,8 +126,11 @@ const DISCONNECT = new Uint8Array([0xe0, 0x00]);
 // endregion
 
 // region ECDH + AES-GCM (шифрование переговорных payloads)
-let ecdhPair: CryptoKeyPair | null = null;
-/** кэш экспортированного публичного ключа (base64url) */
+/** ПРОМИС пары (а не сама пара): параллельные первые вызовы (Promise.all в
+ *  encodeSignal: seal + publicKey) раньше генерировали ДВЕ разные пары —
+ *  шифровали ключом A, а в конверт клали публичный B, и у зрителя оффер
+ *  никогда не распечатывался (OperationError). */
+let ecdhPair: Promise<CryptoKeyPair> | null = null;
 let ecdhPubB64: string | null = null;
 const peerAesCache = new Map<string, CryptoKey>();
 
@@ -138,16 +141,14 @@ export interface Sealed {
     ct: string;
 }
 
-async function getEcdhPair(): Promise<CryptoKeyPair> {
-    if (!ecdhPair) {
-        // ECDH: для deriveKey нужен ПРИВАТНЫЙ ключ своей пары (+ публичный ключ пира),
-        // а пиру отдаём ПУБЛИЧНЫЙ — поэтому храним всю пару
-        ecdhPair = await crypto.subtle.generateKey(
-            { name: "ECDH", namedCurve: "P-256" },
-            true,
-            ["deriveKey"]
-        ) as CryptoKeyPair;
-    }
+function getEcdhPair(): Promise<CryptoKeyPair> {
+    // ECDH: для deriveKey нужен ПРИВАТНЫЙ ключ своей пары (+ публичный ключ пира),
+    // а пиру отдаём ПУБЛИЧНЫЙ — поэтому храним всю пару
+    ecdhPair ??= crypto.subtle.generateKey(
+        { name: "ECDH", namedCurve: "P-256" },
+        true,
+        ["deriveKey"]
+    ) as Promise<CryptoKeyPair>;
     return ecdhPair;
 }
 
@@ -311,6 +312,7 @@ function connect(): Promise<void> {
     const clientId = `p2ps-${randomId(10)}`;
     status = "connecting";
     currentUrl = url;
+    recv = []; // недочитанный хвост прошлого сокета испортил бы разбор пакетов нового
 
     return new Promise(resolve => {
         let settled = false;
@@ -365,7 +367,16 @@ function connect(): Promise<void> {
         };
         sock.onerror = () => { /* onclose придёт сам */ };
         sock.onclose = () => {
-            if (gen !== wsGeneration || settled) return;
+            if (gen !== wsGeneration) return;
+            if (settled) {
+                // обрыв ПОСЛЕ CONNACK: раньше статус оставался "connected", пинг-таймер
+                // тикал в мёртвый сокет, подписки не восстанавливались
+                cleanupSocket(sock);
+                status = "failed";
+                lastError = "соединение с брокером оборвалось";
+                scheduleReconnect();
+                return;
+            }
             settled = true;
             clearTimeout(connackTimer);
             lastError = "WebSocket закрыт до CONNACK";

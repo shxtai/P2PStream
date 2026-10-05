@@ -11,7 +11,13 @@ import { createStatsTracker, type HostSession, type LiveHost, manager, type Stre
 import { applyProfile, settings } from "../settings";
 import { toast } from "../utils";
 
-const readOutStats = createStatsTracker("out");
+/** свой счётчик на каждое соединение — дельты байтов не смешиваются между зрителями */
+const outTrackers = new WeakMap<RTCPeerConnection, ReturnType<typeof createStatsTracker>>();
+function readOutStats(pc: RTCPeerConnection) {
+    let t = outTrackers.get(pc);
+    if (!t) outTrackers.set(pc, t = createStatsTracker("out"));
+    return t(pc);
+}
 
 export function mountBars(): () => void {
     const el = document.createElement("div");
@@ -74,12 +80,10 @@ function LivePill({ host, isMine }: { host: LiveHost; isMine?: boolean }) {
                 <div className={cl("pill-name")}>{host.name}</div>
                 <div className={cl("pill-meta")}>{metaText(host.meta) || "P2P-эфир"}{isMine ? " · вы" : ""}</div>
             </div>
-            {watch ? (
+            {watch && watch.state !== "ended" && watch.state !== "failed" ? (
                 <>
                     <span className={cl("pill-state")} data-state={watch.state}>
-                        {watch.state === "live" ? "Смотрю"
-                            : watch.state === "connecting" || watch.state === "reconnecting" ? "Подключение…"
-                                : watch.state === "failed" ? "Ошибка" : "Завершён"}
+                        {watch.state === "live" ? "Смотрю" : "Подключение…"}
                     </span>
                     <button
                         className={cl("pill-btn")}
@@ -96,7 +100,7 @@ function LivePill({ host, isMine }: { host: LiveHost; isMine?: boolean }) {
                 </>
             ) : (
                 <button className={cl("pill-btn")} onClick={() => manager.watch(host.streamId)}>
-                    Смотреть
+                    {watch?.state === "failed" ? "Повторить" : "Смотреть"}
                 </button>
             )}
         </div>
@@ -106,17 +110,22 @@ function LivePill({ host, isMine }: { host: LiveHost; isMine?: boolean }) {
 function HostBar({ session }: { session: HostSession }) {
     useManager();
     const [mbps, setMbps] = React.useState(0);
-    const peer = session.peers.values().next().value as { pc: RTCPeerConnection } | undefined;
-    const live = peer != null && session.peers.size > 0;
+    const live = session.peers.size > 0;
 
+    // суммарная отдача по ВСЕМ зрителям (раньше — только первый, и общий счётчик)
     React.useEffect(() => {
-        if (!live) return;
+        if (!live) { setMbps(0); return; }
         let alive = true;
-        const tick = () => void readOutStats(peer!.pc).then(s => { if (alive && s) setMbps(s.mbps); });
+        const tick = () => {
+            const pcs = [...session.peers.values()].map(p => p.pc);
+            void Promise.all(pcs.map(readOutStats)).then(list => {
+                if (alive) setMbps(list.reduce((a, s) => a + (s?.mbps ?? 0), 0));
+            });
+        };
         tick();
-        const timer = setInterval(tick, 1000);
+        const timer = setInterval(tick, 2000); // getStats по всем зрителям — не чаще раза в 2 с
         return () => { alive = false; clearInterval(timer); };
-    }, [live, peer]);
+    }, [live, session]);
 
     const profile = String(settings.store.profile);
 

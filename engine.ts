@@ -58,7 +58,9 @@ export type WatchState = "connecting" | "live" | "reconnecting" | "ended" | "fai
 
 export const MAX_VIEWERS = 5;
 const HEARTBEAT_MS = 8000;
-const HOST_TIMEOUT_MS = 22_000;
+/** > интервала анонса в Discord-транспорте (20 с) с запасом на задержки REST/429 —
+ *  при 22 с эфир «пропадал» у зрителя от одного опоздавшего анонса */
+const HOST_TIMEOUT_MS = 45_000;
 
 function currentVoiceChannelId(): string | null {
     try {
@@ -138,7 +140,9 @@ function buildRtcConfig(): RTCConfiguration {
     return {
         iceServers,
         bundlePolicy: "max-bundle",
-        iceCandidatePoolSize: 2
+        // без пула: кандидаты (в т.ч. TURN-аллокации) не собираются заранее
+        // впустую — сбор всё равно стартует с setLocalDescription
+        iceCandidatePoolSize: 0
     };
 }
 
@@ -176,6 +180,11 @@ function applyVideoCodecPreference(pc: RTCPeerConnection, codec: string): void {
     } catch (e) {
         logger.debug("setCodecPreferences не удался:", e);
     }
+}
+
+/** id сеанса из строки o= SDP: меняется только при НОВОМ RTCPeerConnection */
+function sdpSessionId(sdp: string): string {
+    return /^o=\S+ (\S+)/m.exec(sdp)?.[1] ?? "";
 }
 
 /** SDP-мунж: стерео Opus + максимальная полоса для музыки/звука без потерь */
@@ -423,18 +432,14 @@ class HostPeer {
     private restarted = false;
     /** Публичный ECDH-ключ зрителя (пришёл в join) — им шифруем offer/ice ему */
     peerPk: string | null = null;
-    /** Канал превью (кадры для плиток, пока зритель не смотрит) */
-    previewDc?: RTCDataChannel;
 
     constructor(
         private host: HostSession,
         public userId: string
     ) {
+        // (v1.11) без DataChannel превью: кадры уходили только тем, кто эфир уже
+        // смотрит (пир создаётся по join) — лишние JPEG, SCTP и размер оффера
         this.pc = new RTCPeerConnection(buildRtcConfig());
-
-        try {
-            this.previewDc = this.pc.createDataChannel("vcP2PPreview");
-        } catch { /* ignore */ }
 
         for (const track of host.capture.getTracks()) {
             this.pc.addTrack(track, host.capture);
@@ -543,15 +548,6 @@ class HostPeer {
         }
     }
 
-    /** Отправить кадр превью зрителю (DataChannel) */
-    sendPreview(url: string): void {
-        const dc = this.previewDc;
-        if (!dc || dc.readyState !== "open") return;
-        try {
-            dc.send(JSON.stringify({ t: "preview", s: this.host.streamId, d: url }));
-        } catch { /* ignore */ }
-    }
-
     close(): void {
         if (this.closed) return;
         this.closed = true;
@@ -602,11 +598,14 @@ export class HostSession {
         this.mgr.announce();
     }
 
-    createPeer(userId: string, peerPk?: string): HostPeer {
+    createPeer(userId: string, peerPk?: string): HostPeer | null {
         const existing = this.peers.get(userId);
         if (existing && !existing.closed) {
             const st = existing.pc?.connectionState;
-            if (st === "new" || st === "connecting" || st === "connected") {
+            // зритель пришёл с ДРУГИМ ключом (перезапустил Discord) — старая сессия
+            // шифрует оффер ключом, который он уже не распечатает: пересоздаём
+            const keyChanged = !!peerPk && !!existing.peerPk && peerPk !== existing.peerPk && st !== "connected";
+            if (!keyChanged && (st === "new" || st === "connecting" || st === "connected")) {
                 // живая сессия — обновляем ключ, если он впервые пришёл
                 if (peerPk && !existing.peerPk) existing.peerPk = peerPk;
                 return existing;
@@ -621,7 +620,7 @@ export class HostSession {
 
         if (this.peers.size >= MAX_VIEWERS) {
             toast(`Достигнут лимит зрителей (${MAX_VIEWERS})`, "critical");
-            return existing!;
+            return null;
         }
 
         logger.info(`Зритель подключается: ${userId}`);
@@ -648,11 +647,6 @@ export class HostSession {
         for (const peer of this.peers.values()) {
             void applySendParameters(peer.pc);
         }
-    }
-
-    /** Разослать кадр превью всем зрителям (для плиток до подключения просмотра) */
-    broadcastPreview(url: string): void {
-        for (const peer of this.peers.values()) peer.sendPreview(url);
     }
 
     stop(sendBye = true): void {
@@ -715,7 +709,12 @@ export class WatchSession {
         this.joinAttempts = 0;
         this.sendJoin();
         this.joinTimer = setInterval(() => {
-            if (this.state !== "connecting") {
+            // ждём оффер и при первом подключении, и при переподключении
+            if (this.state !== "connecting" && this.state !== "reconnecting") {
+                this.stopJoinLoop();
+                return;
+            }
+            if (this.pc?.remoteDescription) { // оффер уже получен — ждать нечего
                 this.stopJoinLoop();
                 return;
             }
@@ -755,6 +754,13 @@ export class WatchSession {
             // шифруем answer/ice хосту только если его сторона распечатает:
             // старые хосты в чат-режиме ждут plain-d — шифрование их сломало бы
             if (hostPk && this.shouldSealHost()) this.hostPk = hostPk;
+            // Хост пересоздал пира (новый RTCPeerConnection: другой o=-сеанс, DTLS и ICE) —
+            // старый pc такой оффер не примет как ренеготиацию: начинаем с чистого
+            if (this.pc && this.pc.remoteDescription
+                && sdpSessionId(this.pc.remoteDescription.sdp) !== sdpSessionId(d.sdp)) {
+                logger.info(`Хост ${this.host.name} начал новую сессию — пересоздаю соединение`);
+                this.resetPc();
+            }
             if (!this.pc) this.setupPc();
             const pc = this.pc!;
             this.stopJoinLoop();
@@ -882,6 +888,18 @@ export class WatchSession {
         };
     }
 
+    /** Закрыть текущий pc и убрать его дорожки из stream (перед новой сессией) */
+    private resetPc(): void {
+        if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
+        this.iceBuf = [];
+        this.pendingIce = [];
+        try { this.pc?.close(); } catch { /* ignore */ }
+        this.pc = undefined;
+        for (const t of this.stream.getTracks()) {
+            try { this.stream.removeTrack(t); } catch { /* ignore */ }
+        }
+    }
+
     private reconnect(): void {
         if (this.restarts >= 2) {
             this.setState("failed");
@@ -890,10 +908,7 @@ export class WatchSession {
         }
         this.restarts++;
         this.stopJoinLoop();
-        if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
-        this.iceBuf = [];
-        try { this.pc?.close(); } catch { /* ignore */ }
-        this.pc = undefined;
+        this.resetPc();
         this.setState("reconnecting");
         this.startJoinLoop();
     }
@@ -1298,7 +1313,16 @@ export class P2PManager {
     // region просмотр
     watch(streamId: string): WatchSession | null {
         const existing = this.watches.get(streamId);
-        if (existing) return existing;
+        if (existing) {
+            if (existing.state !== "ended" && existing.state !== "failed") {
+                this.onWatchCreated?.(existing); // уже смотрим — просто показываем окно
+                return existing;
+            }
+            // мёртвая сессия (таймаут/обрыв) раньше навсегда блокировала повторное
+            // подключение: watch() возвращал её, и кнопка «Смотреть» ничего не делала
+            existing.stop(false);
+            this.watches.delete(streamId);
+        }
 
         brokerEnsure(); // join уйдёт адресно через брокер
         const host = this.liveHosts.get(streamId);
@@ -1491,6 +1515,10 @@ export class P2PManager {
                 s: typeof msg.s === "string" ? msg.s : "*",
                 from: msg.from,
                 to: msg.to,
+                // ключ отправителя: без него хост не мог зашифровать оффер зрителю,
+                // а зритель — ответ хосту (брокерный путь offer/answer был мёртв)
+                pk: typeof msg.pk === "string" ? msg.pk : undefined,
+                ch: typeof msg.ch === "string" ? msg.ch : undefined,
                 d
             };
             const channelId = typeof msg.ch === "string" && msg.ch ? msg.ch : currentVoiceChannelId();

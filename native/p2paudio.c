@@ -41,15 +41,19 @@
 /* Ручные объявления (нет в заголовках mingw-w64)                      */
 /* ------------------------------------------------------------------ */
 
-/* L"{2E6BC2EB-5032-4B47-82A1-4F204F314D40}" — виртуальное устройство
- * process loopback (VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK из audiopolicy.h). */
+/* VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK из audioclientactivationparams.h.
+ * Раньше здесь стоял выдуманный GUID "{2E6BC2EB-...}" — такого устройства нет,
+ * и ActivateAudioInterfaceAsync сразу отвечал E_ILLEGAL_METHOD_CALL (0x8000000E). */
 static LPCWSTR VC_VirtualAudioDevicePath(void) {
-    return L"{2E6BC2EB-5032-4B47-82A1-4F204F314D40}";
+    return L"VAD\\Process_Loopback";
 }
 
-/* {94EA2B94-E9CC-49E0-B0A0-EE64CA8F5B90} — IAgileObject */
+/* {94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90} — IAgileObject. Раньше здесь была опечатка
+ * (B0A0 вместо C0FF): Windows не находила IAgileObject у обработчика и
+ * ActivateAudioInterfaceAsync сразу отвечал E_ILLEGAL_METHOD_CALL (0x8000000E) —
+ * «умный звук» не работал ни у кого. */
 static const IID VC_IID_IAgileObject =
-    { 0x94ea2b94, 0xe9cc, 0x49e0, { 0xb0, 0xa0, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 } };
+    { 0x94ea2b94, 0xe9cc, 0x49e0, { 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 } };
 
 typedef enum VC_AUDIOCLIENT_ACTIVATION_TYPE {
     VC_AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
@@ -61,9 +65,12 @@ typedef enum VC_PROCESS_LOOPBACK_MODE {
     VC_PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1
 } VC_PROCESS_LOOPBACK_MODE;
 
+/* Порядок полей — как в audioclientactivationparams.h: СНАЧАЛА pid, потом режим.
+ * Раньше было наоборот: Windows видела pid = 0/1 и режим = номер процесса,
+ * активация отвечала E_INVALIDARG (0x80070057). */
 typedef struct VC_AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-    VC_PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
     DWORD TargetProcessId;
+    VC_PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
 } VC_AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
 
 typedef struct VC_AUDIOCLIENT_ACTIVATION_PARAMS {
@@ -73,10 +80,9 @@ typedef struct VC_AUDIOCLIENT_ACTIVATION_PARAMS {
     } u;
 } VC_AUDIOCLIENT_ACTIVATION_PARAMS;
 
-/* в заголовках mingw-w64 значения AUDCLNT_SHAREMODE не определены */
-#ifndef AUDCLNT_SHAREMODE_CAPTURE
-#define AUDCLNT_SHAREMODE_CAPTURE ((AUDCLNT_SHAREMODE)1)
-#endif
+/* Process loopback работает ТОЛЬКО в shared-режиме. Раньше здесь был
+ * самодельный AUDCLNT_SHAREMODE_CAPTURE = 1 — а 1 это AUDCLNT_SHAREMODE_EXCLUSIVE. */
+#define VC_SHAREMODE_SHARED ((AUDCLNT_SHAREMODE)0)
 
 typedef HRESULT (WINAPI *PFN_ActivateAudioInterfaceAsync)(
     LPCWSTR deviceInterfacePath,
@@ -105,17 +111,18 @@ typedef struct VC_HandlerVtbl {
     HRESULT (STDMETHODCALLTYPE *ActivateCompleted)(void *, void *);
 } VC_HandlerVtbl;
 
-typedef struct VC_AgileVtbl {
-    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void *, REFIID, void **);
-    ULONG   (STDMETHODCALLTYPE *AddRef)(void *);
-    ULONG   (STDMETHODCALLTYPE *Release)(void *);
-} VC_AgileVtbl;
-
+/* IAgileObject — маркер без собственных методов: на него отвечаем ТЕМ ЖЕ
+ * указателем. Раньше QI возвращал self+8 (второй vtable), а AddRef/Release
+ * трактовали его как весь объект и делали InterlockedIncrement по чужой памяти
+ * на стеке — активация получала испорченный обработчик (0x8000000E). */
 typedef struct VC_Handler {
     VC_HandlerVtbl *handlerVtbl;
-    VC_AgileVtbl   *agileVtbl;
     HANDLE done;
     LONG   refs;
+    /* free-threaded marshaler (как FtmBase в WRL-примере Microsoft): без IMarshal
+     * от FTM ActivateAudioInterfaceAsync считает обработчик не-agile и сразу
+     * отвечает E_ILLEGAL_METHOD_CALL (0x8000000E) */
+    IUnknown *ftm;
 } VC_Handler;
 
 static HRESULT STDMETHODCALLTYPE VC_QI(void *self, REFIID riid, void **out) {
@@ -123,15 +130,14 @@ static HRESULT STDMETHODCALLTYPE VC_QI(void *self, REFIID riid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
     if (IsEqualGUID(riid, &IID_IUnknown) ||
-        IsEqualGUID(riid, &IID_IActivateAudioInterfaceCompletionHandler)) {
+        IsEqualGUID(riid, &IID_IActivateAudioInterfaceCompletionHandler) ||
+        IsEqualGUID(riid, &VC_IID_IAgileObject)) {
         *out = self;
         InterlockedIncrement(&h->refs);
         return S_OK;
     }
-    if (IsEqualGUID(riid, &VC_IID_IAgileObject)) {
-        *out = (char *)self + sizeof(void *);
-        InterlockedIncrement(&h->refs);
-        return S_OK;
+    if (IsEqualGUID(riid, &IID_IMarshal) && h->ftm) {
+        return h->ftm->lpVtbl->QueryInterface(h->ftm, riid, out);
     }
     return E_NOINTERFACE;
 }
@@ -154,11 +160,13 @@ static HRESULT STDMETHODCALLTYPE VC_ActivateCompleted(void *self, void *op) {
 }
 
 static VC_HandlerVtbl g_handlerVtbl = { VC_QI, VC_AddRef, VC_Release, VC_ActivateCompleted };
-static VC_AgileVtbl   g_agileVtbl   = { VC_QI, VC_AddRef, VC_Release };
 
 /* ------------------------------------------------------------------ */
 /* Утилиты                                                             */
 /* ------------------------------------------------------------------ */
+
+/* этап активации для сообщения об ошибке (диагностика без отладчика) */
+static const char *g_stage = "init";
 
 static void fail(const char *msg) {
     fprintf(stderr, "ERR %s\n", msg);
@@ -204,10 +212,12 @@ static HRESULT activateLoopback(DWORD pid, VC_PROCESS_LOOPBACK_MODE mode, void *
 
     ZeroMemory(&handler, sizeof(handler));
     handler.handlerVtbl = &g_handlerVtbl;
-    handler.agileVtbl = &g_agileVtbl;
     handler.refs = 1;
     handler.done = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!handler.done) return HRESULT_FROM_WIN32(GetLastError());
+    g_stage = "CoCreateFreeThreadedMarshaler";
+    hr = CoCreateFreeThreadedMarshaler((IUnknown *)&handler, &handler.ftm);
+    if (FAILED(hr)) { CloseHandle(handler.done); return hr; }
 
     ZeroMemory(&params, sizeof(params));
     params.ActivationType = VC_AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
@@ -219,18 +229,23 @@ static HRESULT activateLoopback(DWORD pid, VC_PROCESS_LOOPBACK_MODE mode, void *
     pv.blob.cbSize = sizeof(params);
     pv.blob.pBlobData = (BYTE *)&params;
 
+    g_stage = "ActivateAudioInterfaceAsync";
     hr = pActivate(VC_VirtualAudioDevicePath(), &IID_IAudioClient,
                    &pv, &handler, &op);
     if (FAILED(hr)) goto done;
+    g_stage = "wait";
 
     if (WaitForSingleObject(handler.done, 10000) != WAIT_OBJECT_0) {
         hr = E_FAIL;
         goto done;
     }
 
+    if (!op) { hr = E_POINTER; goto done; }
     vt = *(VC_AsyncOpVtbl **)op;
+    g_stage = "GetActivateResult";
     hr = vt->GetActivateResult(op, &hrActivate, &unk);
     if (FAILED(hr)) goto done;
+    g_stage = "activate result";
     hr = hrActivate;
     if (FAILED(hr) || !unk) goto done;
 
@@ -243,6 +258,7 @@ done:
         vt->Release(op);
     }
     if (handler.done) CloseHandle(handler.done);
+    if (handler.ftm) handler.ftm->lpVtbl->Release(handler.ftm);
     return hr;
 }
 
@@ -307,7 +323,7 @@ int main(int argc, char **argv) {
     hr = activateLoopback(pid, mode, &audioClientVoid);
     if (FAILED(hr)) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "activation failed: 0x%08lX", (unsigned long)hr);
+        snprintf(buf, sizeof(buf), "activation failed at %s: 0x%08lX", g_stage, (unsigned long)hr);
         fail(buf);
     }
     client = (IAudioClient *)audioClientVoid;
@@ -319,10 +335,10 @@ int main(int argc, char **argv) {
         props.bIsOffload = FALSE;
         props.eCategory = AudioCategory_GameMedia;
         props.Options = 0;
-        hr = client2->lpVtbl->SetClientProperties(client2, &props);
+        /* не обязательно для loopback-захвата: при отказе просто продолжаем */
+        (void)client2->lpVtbl->SetClientProperties(client2, &props);
         client2->lpVtbl->Release(client2);
         client2 = NULL;
-        if (FAILED(hr)) fail("SetClientProperties failed");
     }
 
     ZeroMemory(&wfx, sizeof(wfx));
@@ -334,7 +350,7 @@ int main(int argc, char **argv) {
     wfx.nAvgBytesPerSec = 48000 * 8;
     wfx.cbSize = 0;
 
-    hr = client->lpVtbl->Initialize(client, AUDCLNT_SHAREMODE_CAPTURE,
+    hr = client->lpVtbl->Initialize(client, VC_SHAREMODE_SHARED,
                                     AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                     200000, 0, &wfx, NULL);
     if (FAILED(hr)) {

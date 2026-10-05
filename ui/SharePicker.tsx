@@ -141,6 +141,16 @@ function SharePickerModal({
     const [busy, setBusy] = React.useState(false);
     const [showAdvanced, setShowAdvanced] = React.useState(false);
     const videoRef = React.useRef<HTMLVideoElement | null>(null);
+    /** текущий предпросмотр и флаг «поток передан движку/Discord» — для очистки при закрытии */
+    const previewRef = React.useRef<MediaStream | null>(null);
+    const handedOffRef = React.useRef(false);
+    previewRef.current = preview;
+
+    // Закрытие пикера (Esc, клик мимо, крестик) раньше НЕ гасило захват
+    // предпросмотра — экран продолжал захватываться в фоне
+    React.useEffect(() => () => {
+        if (!handedOffRef.current) stopPreview(previewRef.current);
+    }, []);
 
     const inVoice = !!SelectedChannelStore.getVoiceChannelId?.();
 
@@ -261,6 +271,7 @@ function SharePickerModal({
         try {
             const track = preview.getVideoTracks()[0];
             if (track) await liveApplyTrackConstraints(track);
+            handedOffRef.current = true;
             modalProps.onClose();
             // владение потоком передаётся движку; локальную ссылку не гасим.
             // Для gdm-источника selected фиктивный (id "") — передаём null:
@@ -289,6 +300,7 @@ function SharePickerModal({
             // Нативный захват уже есть — отдаём его Discord'у, лишний пикер не показываем
             if (preview && !previewIsGdm) {
                 const s = preview;
+                handedOffRef.current = true;
                 setPreview(null);
                 setSelected(null);
                 modalProps.onClose();
@@ -298,6 +310,7 @@ function SharePickerModal({
             // веб-фолбэк или ещё не захватывали: честный путь через системный пикер
             const s = await options.gdm(options.discordOptions);
             stopPreview(preview);
+            handedOffRef.current = true;
             setPreview(null);
             modalProps.onClose();
             onDefaultStream(s);
@@ -477,7 +490,7 @@ function SharePickerModal({
                 )}
 
                 <span className={cl("picker-hint")}>
-                    Задержка 30–80 мс · до 5 зрителей · сигналинг через отдельный брокер — в чате кодов не будет
+                    Задержка 30–80 мс · до 5 зрителей · служебные сообщения тихие (@silent) и удаляются сами
                 </span>
 
                 <div className={cl("picker-footer")}>
