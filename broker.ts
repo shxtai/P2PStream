@@ -126,7 +126,9 @@ const DISCONNECT = new Uint8Array([0xe0, 0x00]);
 // endregion
 
 // region ECDH + AES-GCM (шифрование переговорных payloads)
-let ecdhPair: CryptoKey | null = null;
+let ecdhPair: CryptoKeyPair | null = null;
+/** кэш экспортированного публичного ключа (base64url) */
+let ecdhPubB64: string | null = null;
 const peerAesCache = new Map<string, CryptoKey>();
 
 export interface Sealed {
@@ -136,15 +138,15 @@ export interface Sealed {
     ct: string;
 }
 
-async function getEcdhKey(): Promise<CryptoKey> {
+async function getEcdhPair(): Promise<CryptoKeyPair> {
     if (!ecdhPair) {
-        // ECDH: для deriveKey нужен ПРИВАТНЫЙ ключ своей пары (+ публичный ключ пира)
-        const pair = await crypto.subtle.generateKey(
+        // ECDH: для deriveKey нужен ПРИВАТНЫЙ ключ своей пары (+ публичный ключ пира),
+        // а пиру отдаём ПУБЛИЧНЫЙ — поэтому храним всю пару
+        ecdhPair = await crypto.subtle.generateKey(
             { name: "ECDH", namedCurve: "P-256" },
             true,
             ["deriveKey"]
-        );
-        ecdhPair = (pair as unknown as CryptoKeyPair).privateKey;
+        ) as CryptoKeyPair;
     }
     return ecdhPair;
 }
@@ -166,9 +168,13 @@ function unb64url(s: string): Uint8Array {
 
 /** Свой публичный ключ (base64url raw P-256) — прикладывается к join/offer. */
 export async function brokerPublicKey(): Promise<string> {
-    const key = await getEcdhKey();
-    const raw = await crypto.subtle.exportKey("raw", key);
-    return b64url(new Uint8Array(raw));
+    if (ecdhPubB64) return ecdhPubB64;
+    // "raw" экспортируется ТОЛЬКО у публичного EC-ключа: exportKey("raw", privateKey)
+    // бросает InvalidAccessError — из-за этого раньше падал КАЖДЫЙ join/offer/answer/ice
+    const { publicKey } = await getEcdhPair();
+    const raw = await crypto.subtle.exportKey("raw", publicKey);
+    ecdhPubB64 = b64url(new Uint8Array(raw));
+    return ecdhPubB64;
 }
 
 async function deriveAes(peerPubB64: string): Promise<CryptoKey> {
@@ -182,7 +188,7 @@ async function deriveAes(peerPubB64: string): Promise<CryptoKey> {
         true,
         []
     );
-    const myKey = await getEcdhKey();
+    const myKey = (await getEcdhPair()).privateKey;
     const aes = await crypto.subtle.deriveKey(
         { name: "ECDH", public: peerKey as CryptoKey },
         myKey,

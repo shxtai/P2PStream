@@ -518,7 +518,9 @@ class HostPeer {
 
     async handleAnswer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }): Promise<void> {
         try {
-            if (this.pc.signalingState === "have-local-offer" && !this.pc.remoteDescription) {
+            // после ICE-restart remoteDescription уже есть (от прошлого раунда) —
+            // проверяем только состояние, иначе answer на рестарт игнорировался
+            if (this.pc.signalingState === "have-local-offer") {
                 await this.pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
                 this.pendingIce = [];

@@ -84,16 +84,20 @@ function ViewerModal({
         modalProps.onClose();
     };
 
-    // Подключение потока к <video>
+    // Подключение потока к <video>. Модалка открывается ДО прихода дорожек:
+    // при пустом MediaStream play() не стартует, и видео оставалось чёрным —
+    // переподключаем srcObject и заново зовём play() при каждой новой дорожке.
+    const trackCount = session.stream.getTracks().length;
     React.useEffect(() => {
         const v = videoRef.current;
         if (!v) return;
+        v.srcObject = null;
         v.srcObject = session.stream;
         v.volume = volume;
         v.muted = muted;
         const p = v.play();
         if (p) p.catch(() => { /* автоплей может быть отклонён до жеста */ });
-    }, []);
+    }, [trackCount, state]);
 
     React.useEffect(() => {
         const v = videoRef.current;
