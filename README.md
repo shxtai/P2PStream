@@ -1,6 +1,8 @@
 # P2PStream
 
-Плагин P2P-стриминга для **Vesktop** (через [veskforge](https://github.com/Microck/veskforge) или наш **VencForge**) — замена Discord Go Live без лимитов Discord:
+Плагин P2P-стриминга для **Vesktop** (через [veskforge](https://github.com/Microck/veskforge) или наш **VencForge**) — замена Discord Go Live без лимитов Discord.
+
+> Устройство плагина, разбор всех проблем/ограничений и диагностика — в [PROJECT.md](PROJECT.md).
 
 - до **100 Мбит/с** видео (Discord даёт ~8), разрешение до 4K, до **240 FPS**
 - задержка **30–80 мс** в mesh-сети до 5 зрителей (WebRTC P2P, без сервера)
