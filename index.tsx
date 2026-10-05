@@ -10,7 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 import { MessageActions, SelectedChannelStore } from "@webpack/common";
 
-import { brokerLabel, brokerStatus } from "./broker";
+import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
 import { manager } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
@@ -51,8 +51,13 @@ function collectDiagnostics(): string[] {
     push("сигналинг (усп/ошибок подряд)", `${signalingHealth.sent} / ${signalingHealth.consecutiveFailures}${signalingHealth.lastError ? ` (последняя: ${signalingHealth.lastError})` : ""}`);
     push("брокер сигналинга", brokerStatus() === "connected"
         ? `${brokerLabel()} — коды в чат НЕ пишутся`
-        : `не подключён (${brokerStatus()}) — фолбэк: ${settings.store.chatFallback ? "коды в чат с самоудалением" : "выключен"}`);
+        : `не подключён (${brokerStatus()}; посл. причина: ${brokerLastError()}) — фолбэк: ${settings.store.chatFallback ? "коды в чат с самоудалением" : "выключен"}`);
     push("чат-фолбэк", settings.store.chatFallback);
+    try {
+        const stuns = String(settings.store.stunServers ?? "").split(",").map(s => s.trim()).filter(Boolean);
+        push("STUN", stuns.join(", ") || "НЕТ — P2P между разными сетями не соберётся");
+        push("TURN", settings.store.turnUrl ? String(settings.store.turnUrl) : "нет (нужен при симметричном NAT)");
+    } catch { /* ignore */ }
     push("эфиров видно", manager.liveHosts.size);
     push("своих P2P-эфиров", manager.host ? 1 : 0);
     push("просмотров", manager.watches.size);

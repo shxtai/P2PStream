@@ -10,11 +10,10 @@ import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStor
 import {
     brokerEnsure,
     brokerIdleCheck,
-    brokerLabel,
+    brokerIsConnected,
     brokerOpen,
     brokerSetChannel,
     brokerShutdown,
-    brokerStatus,
     setBrokerMessageHandler
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
@@ -259,6 +258,20 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
     }
 }
 
+/** Диагностика ICE: сколько внешних кандидатов собрали — сразу видно, пробивается ли NAT */
+function logIceSummary(pc: RTCPeerConnection, label: string): void {
+    try {
+        const sdp = pc.localDescription?.sdp ?? "";
+        const srflx = (sdp.match(/typ srflx/g) ?? []).length;
+        const relay = (sdp.match(/typ relay/g) ?? []).length;
+        const host_ = (sdp.match(/typ host/g) ?? []).length;
+        logger.info(`ICE [${label}]: сбор завершён — host=${host_}, srflx=${srflx}, relay=${relay}`);
+        if (!srflx && !relay) {
+            logger.warn(`ICE [${label}]: внешних кандидатов нет — STUN недоступен или UDP заблокирован; между разными сетями без TURN соединения не будет`);
+        }
+    } catch { /* ignore */ }
+}
+
 function applyReceiveLatency(pc: RTCPeerConnection): void {
     const target = Number(settings.store.jitterBuffer) || 0;
     for (const receiver of pc.getReceivers()) {
@@ -395,6 +408,12 @@ class HostPeer {
                 if (!this.iceTimer) {
                     this.iceTimer = setTimeout(() => this.flushIce(), 120);
                 }
+            }
+        };
+        this.pc.onicegatheringstatechange = () => {
+            if (this.pc.iceGatheringState === "complete") {
+                logIceSummary(this.pc, `эфир → ${userId}`);
+                this.flushIce(); // финальная порция кандидатов
             }
         };
         this.pc.onconnectionstatechange = () => {
@@ -535,12 +554,20 @@ export class HostSession {
     }
 
     createPeer(userId: string, peerPk?: string): HostPeer {
-        // новая сессия с этим зрителем — транспорт определим заново по его join
-        this.mgr.resetPeerTransport(userId);
         const existing = this.peers.get(userId);
         if (existing && !existing.closed) {
-            if (peerPk && !existing.peerPk) existing.peerPk = peerPk;
-            return existing;
+            const st = existing.pc?.connectionState;
+            if (st === "new" || st === "connecting" || st === "connected") {
+                // живая сессия — обновляем ключ, если он впервые пришёл
+                if (peerPk && !existing.peerPk) existing.peerPk = peerPk;
+                return existing;
+            }
+            // МЁРТВАЯ сессия (disconnected/failed/closed): зритель прислал свежий join —
+            // пересоздаём пира. Иначе новый оффер НЕ УЙДЁТ НИКОГДА и зритель зависнет
+            // в join-цикле (спам кодами без результата).
+            logger.info(`Пересоздаю пира ${userId} (state=${st ?? "нет"})`);
+            existing.close();
+            this.peers.delete(userId);
         }
 
         if (this.peers.size >= MAX_VIEWERS) {
@@ -605,6 +632,9 @@ export class WatchSession {
     private joinAttempts = 0;
     private pendingIce: RTCIceCandidateInit[] = [];
     private restarts = 0;
+    /** буфер ICE-кандидатов (батчинг, как у хоста) — против спама по 1 сообщению на кандидата */
+    private iceBuf: RTCIceCandidateInit[] = [];
+    private iceTimer: NodeJS.Timeout | undefined;
     /** Публичный ECDH-ключ хоста (пришёл в offer) — им шифруем answer/ice ему */
     hostPk: string | null = null;
 
@@ -632,14 +662,14 @@ export class WatchSession {
                 return;
             }
             this.joinAttempts++;
-            if (this.joinAttempts > 5) {
+            if (this.joinAttempts > 2) { // 1 отправка + 2 повтора — раньше 6 join'ов подряд заливали чат
                 this.stopJoinLoop();
                 this.setState("failed");
                 toast("Не удалось подключиться к P2P-эфиру (хост недоступен?)", "critical");
                 return;
             }
             this.sendJoin();
-        }, 2500);
+        }, 3000);
     }
 
     private stopJoinLoop(): void {
@@ -703,6 +733,20 @@ export class WatchSession {
         }
     }
 
+    /** Отправить накопленных кандидатов одной пачкой (батчинг как у хоста) */
+    private flushIce(): void {
+        if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
+        if (!this.iceBuf.length) return;
+        const candidates = this.iceBuf;
+        this.iceBuf = [];
+        sendSignals(this.host.channelId, {
+            v: 1, t: "ice", s: this.host.streamId, from: myId(), to: this.host.userId,
+            pk: this.hostPk ?? undefined,
+            _route: this.hostRoute(),
+            d: { candidates }
+        });
+    }
+
     handleBye(): void {
         this.setState("ended");
     }
@@ -730,14 +774,20 @@ export class WatchSession {
             }
             this.mgr.bump();
         };
+        // Кандидаты — БАТЧАМИ (как у хоста). Раньше каждый кандидат был отдельным
+        // сообщением: в чат-фолбэке зритель заливал 10-20 кодов за сессию.
         pc.onicecandidate = e => {
             if (e.candidate) {
-                sendSignals(this.host.channelId, {
-                    v: 1, t: "ice", s: this.host.streamId, from: myId(), to: this.host.userId,
-                    pk: this.hostPk ?? undefined,
-                    _route: this.hostRoute(),
-                    d: { candidates: [e.candidate.toJSON()] }
-                });
+                this.iceBuf.push(e.candidate.toJSON());
+                if (!this.iceTimer) {
+                    this.iceTimer = setTimeout(() => this.flushIce(), 120);
+                }
+            }
+        };
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === "complete") {
+                logIceSummary(pc, `просмотр ${this.host.name}`);
+                this.flushIce(); // финальная порция
             }
         };
         pc.onconnectionstatechange = () => {
@@ -759,9 +809,13 @@ export class WatchSession {
     private reconnect(): void {
         if (this.restarts >= 2) {
             this.setState("failed");
+            toast("P2P не подключился: скорее всего, NAT не пробивается. Помогает TURN-сервер (настройки плагина)", "critical");
             return;
         }
         this.restarts++;
+        this.stopJoinLoop();
+        if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
+        this.iceBuf = [];
         try { this.pc?.close(); } catch { /* ignore */ }
         this.pc = undefined;
         this.setState("reconnecting");
@@ -770,6 +824,8 @@ export class WatchSession {
 
     stop(sendLeave = true): void {
         this.stopJoinLoop();
+        if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
+        this.iceBuf = [];
         if (sendLeave && this.state !== "ended") {
             sendSignals(this.host.channelId, {
                 v: 1, t: "leave", s: this.host.streamId, from: myId(), to: this.host.userId,
@@ -808,6 +864,8 @@ export class P2PManager {
     private discoverTimer: NodeJS.Timeout | undefined;
     private lastQuerySent = 0;
     private lastQueryReply = 0;
+    /** время последнего announce, ушедшего в чат (троттлинг чат-фолбэка) */
+    private lastChatAnnounce = 0;
     private signalingWarned = false;
     private lastVoiceJoinAt = 0;
     private lastVoiceChannelId: string | null = null;
@@ -928,9 +986,10 @@ export class P2PManager {
             await new Promise(r => setTimeout(r, 2500));
             list = [...this.liveHosts.values()];
         }
-        // в канале могут сидеть хосты со старой версией (только чат) — один тихий
-        // чат-пинг (самоудаляется) даёт совместимость, ничего не ломая в брокере
-        if (list.length === 0 && currentVoiceChannelId() && settings.store.discoverPings !== false) {
+        // в канале могут сидеть хосты со старой версией (только чат). Второй чат-
+        // пинг нужен ТОЛЬКО если первый ушёл через брокер (старые хосты его не
+        // слышат). Если брокер лежал — первый query уже упал в чат: дубль не нужен.
+        if (list.length === 0 && brokerIsConnected() && currentVoiceChannelId() && settings.store.discoverPings !== false) {
             const voice = currentVoiceChannelId()!;
             sendSignals(voice, { v: 1, t: "query", s: "*", from: myId(), _route: "chat" });
             await new Promise(r => setTimeout(r, 2500));
@@ -972,8 +1031,11 @@ export class P2PManager {
         let changed = false;
         for (const [sid, host] of this.liveHosts) {
             if (now - host.lastSeen > HOST_TIMEOUT_MS) {
-                this.liveHosts.delete(sid);
+                // Активный просмотр не убиваем: в чат-фолбэке announce редеет до
+                // 1/20 с, и гэп в 22 с ещё не значит, что эфир кончился.
                 const watch = this.watches.get(sid);
+                if (watch && (watch.state === "connecting" || watch.state === "live" || watch.state === "reconnecting")) continue;
+                this.liveHosts.delete(sid);
                 if (watch) watch.handleBye();
                 changed = true;
             }
@@ -1049,6 +1111,7 @@ export class P2PManager {
         this.host = new HostSession(this, currentVoiceChannelId()!, capture);
         this.host.nativeAudio = nativeAudioHandle;
         this.startHeartbeat();
+        this.lastChatAnnounce = 0; // новый эфир — первый анонс уходит сразу, без троттлинга
         this.bump();
 
         // мгновенное объявление (не ждём первого тика heartbeat)
@@ -1119,6 +1182,14 @@ export class P2PManager {
     announce(route?: "chat"): void {
         const { host } = this;
         if (!host) return;
+        // Чат-фолбэк при лежащем брокере: announce-хартбит раз в 8 с превращал чат
+        // в кашу (7+ сообщений в минуту, удаление не успевает). В брокере не видно —
+        // там без изменений; в чат — не чаще раза в 20 с (укладывается в HOST_TIMEOUT_MS 22 с).
+        if (!route && !brokerIsConnected()) {
+            const now = Date.now();
+            if (now - this.lastChatAnnounce < 20_000) return;
+            this.lastChatAnnounce = now;
+        }
         sendSignals(host.channelId, {
             v: 1, t: "announce", s: host.streamId, from: myId(),
             _route: route,

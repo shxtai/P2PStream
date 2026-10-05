@@ -42,6 +42,11 @@ const KEEPALIVE_S = 60;
 const PING_MS = 40_000;
 const RECONNECT_BASE_MS = 2_500;
 const RECONNECT_MAX_MS = 20_000;
+/** таймаут на CONNACK/открытие WSS — раньше при молчащем брокере навсегда висели в "connecting" */
+const CONNECT_TIMEOUT_MS = 6_000;
+/** после стольких неудач подряд — длинный cooldown, чтобы не долбить мёртвые брокеры */
+const COOLDOWN_AFTER_ATTEMPTS = 10;
+const COOLDOWN_MS = 60_000;
 /** Столько брокер не нужен (нет голоса/эфира/просмотров) — отключаемся. */
 const IDLE_DISCONNECT_MS = 120_000;
 
@@ -214,6 +219,8 @@ export type BrokerStatus = "off" | "connecting" | "connected" | "failed";
 
 let ws: WebSocket | null = null;
 let status: BrokerStatus = "off";
+/** последняя причина отказа брокера (для /p2p-doctor) */
+let lastError = "—";
 let urlIndex = 0;
 let reconnectAttempts = 0;
 let wsGeneration = 0;
@@ -249,6 +256,11 @@ export function brokerLabel(): string | null {
     } catch {
         return currentUrl;
     }
+}
+
+/** Последняя причина отказа брокера (для /p2p-doctor) */
+export function brokerLastError(): string {
+    return lastError;
 }
 
 let currentUrl: string | null = null;
@@ -294,8 +306,9 @@ function connect(): Promise<void> {
         let sock: WebSocket;
         try {
             sock = new WebSocket(url);
-        } catch (e) {
+        } catch (e: any) {
             logger.warn("Не удалось открыть WebSocket:", url, e);
+            lastError = e?.message ?? "WebSocket не открылся";
             status = "failed";
             scheduleReconnect();
             resolve();
@@ -307,12 +320,19 @@ function connect(): Promise<void> {
         const failOver = (why: string) => {
             if (gen !== wsGeneration || settled) return;
             settled = true;
+            lastError = why;
+            clearTimeout(connackTimer);
             logger.warn(`Брокер ${url} не подошёл (${why}) — пробую следующий`);
             cleanupSocket(sock);
             status = "failed";
             scheduleReconnect();
             resolve();
         };
+
+        // Раньше здесь не было таймаута: если WSS открылся, но CONNACK не пришёл
+        // (молчаливый брокер/CSP/фильтр), клиент навсегда зависал в "connecting"
+        // и ротации брокеров не происходило.
+        const connackTimer = setTimeout(() => failOver(`таймаут ${CONNECT_TIMEOUT_MS / 1000} с (нет CONNACK)`), CONNECT_TIMEOUT_MS);
 
         sock.onopen = () => {
             if (gen !== wsGeneration) return;
@@ -336,6 +356,8 @@ function connect(): Promise<void> {
         sock.onclose = () => {
             if (gen !== wsGeneration || settled) return;
             settled = true;
+            clearTimeout(connackTimer);
+            lastError = "WebSocket закрыт до CONNACK";
             cleanupSocket(sock);
             status = "failed";
             scheduleReconnect();
@@ -377,6 +399,7 @@ function connect(): Promise<void> {
                     if (code === 0) {
                         if (settled) return;
                         settled = true;
+                        clearTimeout(connackTimer);
                         status = "connected";
                         reconnectAttempts = 0;
                         logger.info(`Сигналинг через брокер ${url}`);
@@ -417,6 +440,14 @@ function connect(): Promise<void> {
 function scheduleReconnect(): void {
     if (reconnectTimer) return;
     reconnectAttempts++;
+    if (reconnectAttempts > COOLDOWN_AFTER_ATTEMPTS) {
+        // мёртвые брокеры не долбим: длинная пауза, чат-фолбэк тем временем работает
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = undefined;
+            if (wantSubs.size > 0 || needKeepAlive()) void connect();
+        }, COOLDOWN_MS);
+        return;
+    }
     // каждые 2 попытки переключаемся на следующий брокер (urlIndex уже крутится в connect)
     const delay = Math.min(RECONNECT_BASE_MS * reconnectAttempts, RECONNECT_MAX_MS);
     reconnectTimer = setTimeout(() => {

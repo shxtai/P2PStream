@@ -167,7 +167,7 @@ export const settings = definePluginSettings({
     stunServers: {
         type: OptionType.STRING,
         description: "STUN-серверы через запятую (помогают пробить NAT)",
-        default: "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302",
+        default: "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun.cloudflare.com:3478",
         placeholder: "stun:stun.l.google.com:19302"
     },
     turnUrl: {
