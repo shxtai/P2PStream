@@ -29,11 +29,19 @@ export interface P2PAudioStartResult {
     error?: string;
 }
 
-/** Список источников захвата (экраны вперёд, затем окна) с превью для собственного пикера. */
-export async function getSources(width = 384, height = 216): Promise<P2PSourceInfo[]> {
+/** Список источников захвата (экраны вперёд, затем окна) с превью для собственного пикера.
+ *  ВАЖНО: Vencord вызывает native-функции как (IpcMainInvokeEvent, ...args) — первый
+ *  аргумент ВСЕГДА event (см. папку src/plugins у Vencord: любые native.ts). Раньше мы объявляли
+ *  getSources(width, height) без event-параметра: width = event-объект, height = 384,
+ *  а thumbnailSize = { width: <event>, height: 384 } → gin-конверсия падала с
+ *  «Error processing argument at index 2» и пикер навсегда оставался пустым. */
+export async function getSources(_e: IpcMainInvokeEvent, width = 384, height = 216): Promise<P2PSourceInfo[]> {
+    // страховка от нецелых/битых значений — gfx::Size требует строгие целые
+    const w = Math.max(1, Math.floor(Number(width) || 384));
+    const h = Math.max(1, Math.floor(Number(height) || 216));
     const sources = await desktopCapturer.getSources({
         types: ["window", "screen"],
-        thumbnailSize: { width, height },
+        thumbnailSize: { width: w, height: h },
         fetchWindowIcons: true
     });
 

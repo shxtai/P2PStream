@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import { MessageActions, SelectedChannelStore } from "@webpack/common";
 
 import { manager } from "./engine";
-import { installShareHook, isShareHookInstalled, uninstallShareHook } from "./hooks";
+import { installShareHook, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
 import { signalingHealth } from "./signaling";
@@ -33,6 +33,7 @@ function collectDiagnostics(): string[] {
     push("голосовой канал", (() => { try { return SelectedChannelStore.getVoiceChannelId?.() ?? "нет"; } catch { return "нет"; } })());
     push("режим кнопки стрима", settings.store.goliveMode);
     push("getDisplayMedia перехвачен", isShareHookInstalled());
+    push("стоковая кнопка (Go Live → P2P)", isGoLiveHijackInstalled());
 
     const helpers = (globalThis as any).VencordNative?.pluginHelpers?.P2PStream;
     push("native-каналы (getSources/звук)", helpers ? Object.keys(helpers).join(", ") : "НЕТ — плагин без native-части (однофайловая сборка?)");

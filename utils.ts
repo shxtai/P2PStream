@@ -7,7 +7,7 @@
 import { Toasts, UserStore } from "@webpack/common";
 
 /** Версия плагина (видна в консоли, /p2p-doctor и анонсах) */
-export const PLUGIN_VERSION = "1.5.0";
+export const PLUGIN_VERSION = "1.5.1";
 
 export function toast(message: string, variant: "default" | "success" | "critical" = "default"): void {
     try {
