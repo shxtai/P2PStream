@@ -1,0 +1,20 @@
+# P2PStream signaling broker — конфиг для wrangler (CLI-деплой)
+# Альтернатива деплою через дашборд (см. инструкции в шапке worker.js).
+#
+#   npm install -g wrangler
+#   wrangler login
+#   wrangler deploy
+#
+# После деплоя адрес брокера: wss://p2ps-broker.<account>.workers.dev/mqtt
+
+name = "p2ps-broker"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "BROKER"
+class_name = "Broker"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Broker"]

@@ -8,7 +8,7 @@ import { ApplicationCommandInputType } from "@api/Commands";
 import { Settings as AppSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
-import { MessageActions, SelectedChannelStore } from "@webpack/common";
+import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
 import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
 import { manager } from "./engine";
@@ -48,13 +48,15 @@ function collectDiagnostics(): string[] {
         push("видеокодеки", codecs?.join(", ") ?? "неизвестно");
     } catch { push("видеокодеки", "ошибка"); }
     push("sendMessage доступен", typeof MessageActions.sendMessage === "function");
+    push("RestAPI доступен", typeof (RestAPI as any)?.post === "function");
     push("сигналинг (усп/ошибок подряд)", `${signalingHealth.sent} / ${signalingHealth.consecutiveFailures}${signalingHealth.lastError ? ` (последняя: ${signalingHealth.lastError})` : ""}`);
     push("брокер сигналинга", !settings.store.brokerEnabled
-        ? "выключен — компактные коды в чате (3-5 шт., самоудаляются за ~2 с)"
+        ? "выключен — используется тихий Discord-транспорт"
         : brokerStatus() === "connected"
-            ? `${brokerLabel()} — коды в чат НЕ пишутся`
-            : `включён, не подключён (${brokerStatus()}; посл. причина: ${brokerLastError()}) — фолбэк: ${settings.store.chatFallback ? "коды в чат с самоудалением" : "выключен"}`);
-    push("чат-фолбэк", settings.store.chatFallback);
+            ? `${brokerLabel()} — Discord для сигналинга не используется`
+            : `включён, не подключён (${brokerStatus()}; посл. причина: ${brokerLastError()}) — фолбэк: ${settings.store.chatFallback ? "тихий Discord-транспорт" : "выключен"}`);
+    push("тихий Discord-транспорт", settings.store.silentDm === false ? "выключен (видимые коды с автоудалением)" : "@silent: адресные коды в ЛС, анонсы в голосовой канал; самоудаление ~2 с; уведомлений нет");
+    push("чат-фолбэк (Discord-транспорт)", settings.store.chatFallback);
     try {
         const stuns = String(settings.store.stunServers ?? "").split(",").map(s => s.trim()).filter(Boolean);
         push("STUN", stuns.join(", ") || "НЕТ — P2P между разными сетями не соберётся");
@@ -83,7 +85,7 @@ function migrateLegacyAudio(): void {
 
 export default definePlugin({
     name: "P2PStream",
-    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Свой пикер с выбором P2P/обычного стрима, умный звук приложения (WASAPI Process Loopback — как у Discord: окно → звук приложения, экран → система без Discord), плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя.",
+    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Свой пикер с выбором P2P/обычного стрима, умный звук приложения (WASAPI Process Loopback — как у Discord), плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя. Тихий сигналинг: служебные коды — @silent-сообщениями в ЛС с автоудалением (ни у кого никаких уведомлений) или через свой MQTT-брокер.",
     searchTerms: ["p2p", "stream", "quality", "bitrate", "webrtc", "golive", "стрим", "качество"],
     tags: ["Voice", "Media", "Utility"],
     authors: [{ name: "Super Z", id: 0n }],

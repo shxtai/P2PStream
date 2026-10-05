@@ -3,26 +3,42 @@
  * Copyright (c) 2026 Super Z
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Кодирование/отправка сигналов. С v1.7 сигналы по умолчанию идут через
- * публичный MQTT-брокер (см. broker.ts) — в чате Discord кодов НЕТ.
- * Чат остаётся аварийным фолбэком (settings.chatFallback): коды отправляются
- * и удаляются отправителем с защитой от 404/429.
+ * Кодирование/отправка сигналов. Транспорты (в порядке приоритета):
+ *
+ *  1. MQTT-брокер (broker.ts, опционально) — Discord вообще не участвует.
+ *
+ *  2. ТИХИЙ ДИСКОРД-ТРАНСПОРТ (v1.10, основной): сигналы едут штатными
+ *     сообщениями Discord с флагом SUPPRESS_NOTIFICATIONS (1<<12) — тем же,
+ *     что клиент ставит для «@silent». Ни у кого НИКАКИХ уведомлений:
+ *       - адресные сигналы (join/offer/answer/ice/leave, reply на query)
+ *         идут в ЛС между стримером и зрителем — канал никто не видит;
+ *       - broadcast (announce/query/bye) — в чат голосового канала;
+ *     каждое сообщение удаляется отправителем через ~2 с (REST возвращает
+ *     реальный id сразу — самоудаление надёжнее, чем через эхо шлюза).
+ *     offer/answer/ice дополнительно шифруются ECDH P-256 + AES-GCM (та же
+ *     крипта, что в брокере) — даже внутри ЛС SDP с IP-адресами запечатан.
+ *
+ *  3. Старый путь MessageActions (видимые коды с автоудалением) — последний
+ *     фолбэк, если REST-отправка не удалась.
  */
 
 import { Logger } from "@utils/Logger";
-import { MessageActions } from "@webpack/common";
+import { ChannelStore, MessageActions, RestAPI } from "@webpack/common";
 
 import {
     brokerChannelTopic,
     brokerIsConnected,
+    brokerOpen,
     brokerPublicKey,
     brokerPublish,
     brokerSeal,
     brokerStatus,
     brokerWaitConnected,
+    type Sealed,
     TOPIC_PREFIX
 } from "./broker";
 import { settings } from "./settings";
+import { PLUGIN_VERSION } from "./utils";
 
 export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave" | "query";
 
@@ -35,13 +51,17 @@ export interface Signal {
     from: string;
     /** userId адресата (для адресных сообщений) */
     to?: string;
-    /** данные */
+    /** данные (на проводе в offer/answer/ice заменяется на запечатанный e) */
     d?: any;
-    /** ПУБЛИЧНЫЙ КЛЮЧ АДРЕСАТА (base64url P-256) — нужен для шифрования
-     *  offer/answer/ice; в брокерном конверте уходит и наш публичный ключ. */
+    /** ПУБЛИЧНЫЙ КЛЮЧ: у исходящего сигнала — ключ АДРЕСАТА (шим шифруем),
+     *  во входящем конверте — ключ ОТПРАВИТЕЛЯ (им шифруем ответ). */
     pk?: string;
+    /** голосовой канал, к которому относится сигнал (в ЛС-транспорте msg.channel_id — ЛС, поэтому ch обязателен) */
+    ch?: string;
+    /** версия плагина отправителя (join — чтобы хост знал, можно ли шифровать ему) */
+    av?: string;
     /** Принудительная маршрутизация (внутреннее поле движка):
-     *  "broker" — только брокер; "chat" — только чат (пир старой версии);
+     *  "broker" — только брокер; "chat" — только Discord-транспорт (пир старой версии);
      *  "both" — в оба канала (возможности пира неизвестны). */
     _route?: "broker" | "chat" | "both";
 }
@@ -52,8 +72,10 @@ const MARKER = "```vcp2p\n";
 const TAIL = "\n```";
 /** максимальная длина полезной нагрузки в одном сообщении (лимит Discord 2000 с запасом) */
 const MAX_CHUNK = 1700;
-/** время жизни собственных служебных сообщений (фолбэк), мс */
+/** время жизни собственных служебных сообщений, мс */
 export const SELF_DESTRUCT_MS = 1500;
+/** флаг Discord «@silent»: без push-уведомлений и значков у получателей */
+const SUPPRESS_NOTIFICATIONS = 1 << 12;
 
 // region base64url
 function bytesToB64url(bytes: Uint8Array): string {
@@ -137,21 +159,9 @@ export function pruneFragments(): void {
 }
 // endregion
 
-async function decodeBody(body: string): Promise<Signal | null> {
-    try {
-        const json = await inflate(b64urlToBytes(body));
-        const sig = JSON.parse(json) as Signal;
-        if (sig && sig.v === 1 && typeof sig.t === "string" && typeof sig.s === "string" && typeof sig.from === "string") {
-            return sig;
-        }
-        return null;
-    } catch (e) {
-        logger.debug("Не удалось разобрать сигнал:", e);
-        return null;
-    }
-}
-
-/** Разобрать содержимое сообщения в 0..1 сигналов (фрагменты собираются автоматически) */
+/** Разобрать содержимое сообщения в 0..1 сигналов (фрагменты собираются автоматически).
+ *  Здесь же распечатываются зашифрованные payloads (e): конверт несёт публичный
+ *  ключ отправителя (pk) — им выводится общий секрет, расшифровываем d. */
 export async function parseSignals(content: string): Promise<Signal[]> {
     if (!isSignalContent(content)) return [];
     const body = payloadOf(content);
@@ -162,13 +172,71 @@ export async function parseSignals(content: string): Promise<Signal[]> {
     } else {
         payload = body;
     }
-    const sig = await decodeBody(payload);
-    return sig ? [sig] : [];
+    try {
+        const wire = JSON.parse(await inflate(b64urlToBytes(payload))) as Record<string, any>;
+        if (!wire || wire.v !== 1 || typeof wire.t !== "string" || typeof wire.s !== "string" || typeof wire.from !== "string") {
+            return [];
+        }
+        const sig: Signal = {
+            v: 1,
+            t: wire.t as SignalType,
+            s: wire.s,
+            from: wire.from,
+            to: typeof wire.to === "string" ? wire.to : undefined,
+            ch: typeof wire.ch === "string" ? wire.ch : undefined,
+            pk: typeof wire.pk === "string" ? wire.pk : undefined,
+            av: typeof wire.av === "string" ? wire.av : undefined
+        };
+        if (wire.e && wire.pk) {
+            // запечатанный payload (offer/answer/ice) — распечатываем
+            try {
+                sig.d = await brokerOpen(wire.pk, wire.e as Sealed);
+            } catch (e) {
+                logger.debug("Не удалось распечатать сигнал (чужой/битый ключ?):", e);
+                return [];
+            }
+        } else {
+            sig.d = wire.d;
+        }
+        return [sig];
+    } catch (e) {
+        logger.debug("Не удалось разобрать сигнал:", e);
+        return [];
+    }
 }
 
-/** Закодировать сигнал в 1..N содержимых сообщений */
-export async function encodeSignal(sig: Signal): Promise<string[]> {
-    const bytes = await deflate(JSON.stringify(sig));
+/**
+ * Закодировать сигнал в 1..N содержимых сообщений (конверт Discord-транспорта).
+ * Конверт: { v:1, t, s, from, to?, ch, d? | (e? + pk?), pk? }:
+ *   - ch — голосовой канал (в ЛС-транспорте получатель не увидит его из msg.channel_id);
+ *   - offer/answer/ice с известным ключом адресата уезжают запечатанными
+ *     ECDH+AES-GCM, в конверте остаётся НАШ публичный ключ для обратного ответа;
+ *   - join несёт наш публичный ключ в pk — хост им зашифрует оффер нам.
+ */
+export async function encodeSignal(sig: Signal, voiceChannelId?: string): Promise<string[]> {
+    const wire: Record<string, unknown> = {
+        v: 1,
+        t: sig.t,
+        s: sig.s,
+        from: sig.from,
+        ch: voiceChannelId ?? sig.ch
+    };
+    if (sig.to) wire.to = sig.to;
+
+    if (sig.d !== undefined && sig.pk) {
+        const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, sig.d), brokerPublicKey()]);
+        wire.e = sealed;
+        wire.pk = myPk;
+    } else {
+        wire.d = sig.d ?? null;
+        if (sig.t === "join") {
+            // наш публичный ключ (хост им зашифрует оффер нам) + версия (гейтинг шифрования)
+            wire.pk = await brokerPublicKey();
+            wire.av = PLUGIN_VERSION;
+        }
+    }
+
+    const bytes = await deflate(JSON.stringify(wire));
     const body = bytesToB64url(bytes);
     if (body.length <= MAX_CHUNK) {
         return [MARKER + body + TAIL];
@@ -226,9 +294,139 @@ async function tryBrokerSend(channelId: string, sig: Signal): Promise<boolean> {
 }
 // endregion
 
+// region тихий Discord-транспорт (@silent + ЛС + самоудаление)
+/** Здоровье сигналинга — движок по нему предупреждает, если эфир видят только мы */
+export const signalingHealth = {
+    sent: 0,
+    failed: 0,
+    consecutiveFailures: 0,
+    lastError: null as string | null,
+    lastSuccess: 0
+};
+
+function healthOk(): void {
+    signalingHealth.sent++;
+    signalingHealth.consecutiveFailures = 0;
+    signalingHealth.lastSuccess = Date.now();
+}
+
+function healthFail(e: unknown): void {
+    signalingHealth.failed++;
+    signalingHealth.consecutiveFailures++;
+    signalingHealth.lastError = e instanceof Error ? e.message : String(e);
+}
+
+/** Кэш ЛС-каналов: userId -> channelId (заполняется ChannelStore и REST'ом) */
+const dmChannels = new Map<string, string>();
+
+/** Существующий ЛС-канал с пользователем (синхронно, без запросов) */
+function existingDm(userId: string): string | null {
+    try {
+        const id = ChannelStore?.getDMFromUserId?.(userId);
+        if (typeof id === "string" && id) {
+            dmChannels.set(userId, id);
+            return id;
+        }
+    } catch { /* ignore */ }
+    return dmChannels.get(userId) ?? null;
+}
+
+/** channelIds, для которых ЛС создать не вышло (не долбим REST повторно) */
+const dmFailedUntil = new Map<string, number>();
+
+/** ЛС-канал с пользователем; при отсутствии — создать REST-запросом */
+async function dmChannelFor(userId: string): Promise<string | null> {
+    if (!userId) return null;
+    const cached = existingDm(userId);
+    if (cached) return cached;
+    const blocked = dmFailedUntil.get(userId);
+    if (blocked && Date.now() < blocked) return null;
+    try {
+        const res: any = await RestAPI.post({
+            url: "/users/@me/channels",
+            body: { recipient_id: userId }
+        });
+        const id: string | undefined = res?.body?.id;
+        if (id) {
+            dmChannels.set(userId, id);
+            return id;
+        }
+        return null;
+    } catch (e) {
+        // 403 — у адресата закрыты ЛС; не повторяем 2 минуты
+        dmFailedUntil.set(userId, Date.now() + 120_000);
+        healthFail(e);
+        return null;
+    }
+}
+
+/** Отправить ОДНО тихое сообщение REST-ом; возвращает messageId или null */
+async function sendSilentMessage(channelId: string, content: string): Promise<string | null> {
+    const nonce = makeNonce();
+    try {
+        const res: any = await RestAPI.post({
+            url: `/channels/${channelId}/messages`,
+            body: {
+                content,
+                flags: SUPPRESS_NOTIFICATIONS,
+                tts: false,
+                nonce,
+                allowedMentions: { parse: [] }
+            }
+        });
+        const id: string | undefined = res?.body?.id;
+        if (!id) throw new Error("REST-ответ без id сообщения");
+        healthOk();
+        return id;
+    } catch (e: any) {
+        healthFail(e);
+        const status = e?.status ?? e?.body?.code;
+        logger.warn(`Тихая отправка в ${channelId} не удалась (${status ?? e?.message}): перехожу на обычную`);
+        return null;
+    }
+}
+
+/** Отправить сигнал адресно через ЛС (@silent, самоудаление). true — ушло. */
+async function sendViaDm(voiceChannelId: string, sig: Signal, contents: string[]): Promise<boolean> {
+    const dm = await dmChannelFor(sig.to!);
+    // ЛС закрыто — падаем в тихий канал голосового чата
+    const target = dm ?? voiceChannelId;
+    let sent = 0;
+    for (const content of contents) {
+        const id = await sendSilentMessage(target, content);
+        if (!id) break;
+        scheduleSelfDelete(target, id);
+        sent++;
+    }
+    return sent === contents.length;
+}
+
+/** Отправить broadcast-сигнал в голосовой канал (@silent, самоудаление). true — ушло. */
+async function sendViaVoiceChannel(voiceChannelId: string, contents: string[]): Promise<boolean> {
+    let sent = 0;
+    for (const content of contents) {
+        const id = await sendSilentMessage(voiceChannelId, content);
+        if (!id) break;
+        scheduleSelfDelete(voiceChannelId, id);
+        sent++;
+    }
+    return sent === contents.length;
+}
+
+/** Самоудаление тихого сообщения: REST вернул реальный id — надёжно и без эха шлюза */
+function scheduleSelfDelete(channelId: string, messageId: string): void {
+    setTimeout(() => {
+        if (cleanupEnabled()) queueDelete(channelId, messageId);
+    }, SELF_DESTRUCT_MS + 500);
+}
+// endregion
+
 /** Отправить сигнал. Маршрут: _route="chat"/"both" (совместимость со старыми
- *  версиями пира) или брокер-первым (по умолчанию). В чате при брокере НИЧЕГО
- *  не появляется, кроме случая "chat"/"both" для старых версий пиров. */
+ *  версиями пиров) или брокер-первым (по умолчанию).
+ *
+ *  Discord-транспорт (v1.10): тихие @silent-сообщения через REST;
+ *  адресные сигналы — в ЛС с получателем, broadcast — в голосовой канал.
+ *  Если REST не удался — старый путь MessageActions (видимые коды с самоудалением). */
 export function sendSignals(channelId: string, sig: Signal): void {
     void (async () => {
         try {
@@ -241,10 +439,21 @@ export function sendSignals(channelId: string, sig: Signal): void {
             }
             if (route === "broker") return;
             if (settings.store.chatFallback === false) {
-                if (route !== "both") logger.warn("Брокер недоступен, чат-фолбэк выключен — сигнал не отправлен:", sig.t);
+                if (route !== "both") logger.warn("Брокер недоступен, Discord-транспорт выключен — сигнал не отправлен:", sig.t);
                 return;
             }
-            const contents = await encodeSignal(sig);
+
+            const contents = await encodeSignal(sig, channelId);
+
+            // 1) адресные сигналы — в ЛС с получателем (никто не видит), тихо
+            if (sig.to && settings.store.silentDm !== false) {
+                if (await sendViaDm(channelId, sig, contents)) return;
+            }
+            // 2) broadcast (или ЛС не вышло) — тихое сообщение в голосовой канал
+            if (settings.store.silentDm !== false) {
+                if (await sendViaVoiceChannel(channelId, contents)) return;
+            }
+            // 3) последний фолбэк — старый путь (видимые коды с автоудалением)
             for (const content of contents) {
                 const ok = await sendMessageSafe(channelId, content);
                 if (!ok) break; // сигналинг лежит — не спамим остальными фрагментами
@@ -254,15 +463,6 @@ export function sendSignals(channelId: string, sig: Signal): void {
         }
     })();
 }
-
-/** Здоровье сигналинга — движок по нему предупреждает, если эфир видят только мы */
-export const signalingHealth = {
-    sent: 0,
-    failed: 0,
-    consecutiveFailures: 0,
-    lastError: null as string | null,
-    lastSuccess: 0
-};
 
 /** Числовой nonce в духе Discord (произвольная строка, сервер возвращает её в эхе) */
 function makeNonce(): string {

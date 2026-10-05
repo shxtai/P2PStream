@@ -95,8 +95,13 @@ const FALLBACK_FLAG = "__p2pstreamFallback";
 
 /** Метки кнопки начала стрима (EN/RU и близкие); матчим только «старт» */
 const START_STREAM_LABEL_RE = /(go[ ._-]?live|stream|screen[ ._-]?share|share|broadcast|стрим|трансляц|демонстрац|экран|поделиться|эфир)/i;
-/** Исключения: остановка стрима, просмотр чужого, участники и т.п. */
-const NOT_START_LABEL_RE = /(stop|end|leave|disconnect|watch|view|просмотр|смотр|останов|стоп|законч|заверш|отключ|выключ)/i;
+/**
+ * Исключения: остановка стрима, просмотр чужого, участники и т.п.
+ * ВАЖНО (v1.10): сюда же добавлены полноэкранные метки — кнопка фуллскрина на
+ * плитке обычного Discord-стрима («Полноэкранный режим») содержит слово «экран»
+ * и раньше ошибочно открывала наш пикер вместо разворачивания видео.
+ */
+const NOT_START_LABEL_RE = /(stop|end|leave|disconnect|watch|view|просмотр|смотр|останов|стоп|законч|заверш|отключ|выключ|полноэкран|фуллскрин|full[ ._-]?screen|во весь экран|весь экран|развернут|pop[ ._-]?out|настройк|setting)/i;
 
 let goLiveInterceptor: ((payload: any) => boolean | void) | null = null;
 let goLiveHijackInstalled = false;
@@ -276,6 +281,12 @@ function docClickCapture(e: MouseEvent): void {
         if (!label || !START_STREAM_LABEL_RE.test(label) || NOT_START_LABEL_RE.test(label)) return;
         // только иконочные кнопки: у share-кнопок в embeds/профилях есть текст — отсекаем их
         if (btn.textContent?.trim()) return;
+        // (v1.10) страховка от ложных срабатываний на плитках стрима: если кнопка
+        // живёт в контейнере с <video> (плитка/поп-аут стрима) — это кнопка
+        // фуллскрина/настроек стрима, а не «начать демонстрацию»
+        if (btn.closest("video")) return;
+        const tile = btn.closest('[class*="tile"], [class*="tileContainer"], [class*="videoLayer"], [class*="popout_"]');
+        if (tile && tile.querySelector("video")) return;
         // не в модалках/слоях/меню/настройках и не в нашем UI
         if (btn.closest(EXCLUDED_ZONE_RE)) return;
         if (btn.getAttribute("aria-disabled") === "true" || btn.hasAttribute("disabled")) return;

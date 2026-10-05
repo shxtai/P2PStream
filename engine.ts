@@ -27,8 +27,9 @@ import {
     sendSignals,
     setCleanupEnabledGetter,
     type Signal,
-    signalingHealth } from "./signaling";
-import { myId, PLUGIN_VERSION, randomId, toast } from "./utils";
+    signalingHealth
+} from "./signaling";
+import { myId, PLUGIN_VERSION, randomId, toast, versionAtLeast } from "./utils";
 
 const logger = new Logger("P2PStream:Engine");
 
@@ -693,6 +694,13 @@ export class WatchSession {
         return "both";
     }
 
+    /** Шифровать ли answer/ice для этого хоста: брокерные пиры — всегда
+     *  (их движок требует e), Discord-транспорт — только v1.10+. */
+    private shouldSealHost(): boolean {
+        if (this.hostRoute() === "broker") return true;
+        return versionAtLeast(this.host.hostVersion, 1, 10);
+    }
+
     constructor(
         private mgr: P2PManager,
         host: LiveHost
@@ -742,7 +750,9 @@ export class WatchSession {
 
     async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }, hostPk?: string): Promise<void> {
         try {
-            if (hostPk) this.hostPk = hostPk;
+            // шифруем answer/ice хосту только если его сторона распечатает:
+            // старые хосты в чат-режиме ждут plain-d — шифрование их сломало бы
+            if (hostPk && this.shouldSealHost()) this.hostPk = hostPk;
             if (!this.pc) this.setupPc();
             const pc = this.pc!;
             this.stopJoinLoop();
@@ -1356,6 +1366,16 @@ export class P2PManager {
                     if (now - this.lastQueryReply > 5000) {
                         this.lastQueryReply = now;
                         this.announce(via === "chat" ? "chat" : undefined);
+                        // (v1.10) адресный ответ зрителю: broadcast-анонс троттлится,
+                        // а зритель ждёт ответ на СВОЙ query. Через ЛС он придёт
+                        // гарантированно и никому больше не виден.
+                        if (via === "chat" && sig.from && settings.store.silentDm !== false) {
+                            sendSignals(channelId, {
+                                v: 1, t: "announce", s: this.host.streamId, from: myId(), to: sig.from,
+                                _route: "chat",
+                                d: { ...this.host.meta, av: PLUGIN_VERSION }
+                            });
+                        }
                     }
                 }
                 return true;
@@ -1369,7 +1389,11 @@ export class P2PManager {
             }
             case "join": {
                 if (this.host && sig.s === this.host.streamId) {
-                    this.host.createPeer(sig.from, sig.pk);
+                    // Шифруем offer/ice зрителю, если его сторона умеет распечатывать:
+                    //  - брокерные пиры (v1.7+) — ВСЕГДА (их движок требует запечатанные e);
+                    //  - Discord-транспорт — только v1.10+ (старые версии ждут plain-d).
+                    const canSeal = via === "broker" || versionAtLeast(sig.av, 1, 10);
+                    this.host.createPeer(sig.from, canSeal ? sig.pk : undefined);
                 }
                 return true;
             }
@@ -1420,7 +1444,7 @@ export class P2PManager {
 
             const me = myId();
             if (msg.author?.id === me) {
-                // своё эхо (фолбэк): удаляем только реальный id из шлюза (не optimistic)
+                // своё эхо (только legacy-путь): удаляем только реальный id из шлюза (не optimistic)
                 if (settings.store.autoDeleteSignals) {
                     handleOwnEcho({ ...msg, optimistic: payload?.optimistic === true });
                 }
@@ -1429,9 +1453,9 @@ export class P2PManager {
 
             void parseSignals(msg.content).then(sigs => {
                 for (const sig of sigs) {
-                    // удаление чужих сигналов НЕ делаем: отправитель чистит своё сам —
-                    // двойное удаление давало 404 и шторм 429 у обоих клиентов
-                    this.handleSignal(sig, msg.channel_id, "chat");
+                    // (v1.10) тихий транспорт: конверт несёт голосовой канал (ch) —
+                    // в ЛС msg.channel_id это ЛС, а не канал эфира
+                    this.handleSignal(sig, sig.ch ?? msg.channel_id, "chat");
                 }
             });
         } catch (e) {
