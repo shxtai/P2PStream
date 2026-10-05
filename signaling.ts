@@ -2,10 +2,27 @@
  * Vencord, a Discord client mod
  * Copyright (c) 2026 Super Z
  * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Кодирование/отправка сигналов. С v1.7 сигналы по умолчанию идут через
+ * публичный MQTT-брокер (см. broker.ts) — в чате Discord кодов НЕТ.
+ * Чат остаётся аварийным фолбэком (settings.chatFallback): коды отправляются
+ * и удаляются отправителем с защитой от 404/429.
  */
 
 import { Logger } from "@utils/Logger";
 import { MessageActions } from "@webpack/common";
+
+import {
+    brokerChannelTopic,
+    brokerIsConnected,
+    brokerPublicKey,
+    brokerPublish,
+    brokerSeal,
+    brokerStatus,
+    brokerWaitConnected,
+    TOPIC_PREFIX
+} from "./broker";
+import { settings } from "./settings";
 
 export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave" | "query";
 
@@ -20,6 +37,13 @@ export interface Signal {
     to?: string;
     /** данные */
     d?: any;
+    /** ПУБЛИЧНЫЙ КЛЮЧ АДРЕСАТА (base64url P-256) — нужен для шифрования
+     *  offer/answer/ice; в брокерном конверте уходит и наш публичный ключ. */
+    pk?: string;
+    /** Принудительная маршрутизация (внутреннее поле движка):
+     *  "broker" — только брокер; "chat" — только чат (пир старой версии);
+     *  "both" — в оба канала (возможности пира неизвестны). */
+    _route?: "broker" | "chat" | "both";
 }
 
 const logger = new Logger("P2PStream:Signaling");
@@ -28,8 +52,8 @@ const MARKER = "```vcp2p\n";
 const TAIL = "\n```";
 /** максимальная длина полезной нагрузки в одном сообщении (лимит Discord 2000 с запасом) */
 const MAX_CHUNK = 1700;
-/** время жизни собственных служебных сообщений, мс */
-export const SELF_DESTRUCT_MS = 2500;
+/** время жизни собственных служебных сообщений (фолбэк), мс */
+export const SELF_DESTRUCT_MS = 1500;
 
 // region base64url
 function bytesToB64url(bytes: Uint8Array): string {
@@ -165,10 +189,61 @@ export function setCleanupEnabledGetter(fn: () => boolean): void {
     cleanupEnabled = fn;
 }
 
-/** Отправить сигнал в чат канала (фрагменты — строго последовательно, иначе соберутся не по порядку) */
-export function sendSignals(channelId: string, sig: Signal, onSent?: (messageId: string) => void): void {
+// region транспорт через брокер (основной путь, в чат ничего не попадает)
+/** Конверт брокера: { v:1, k, from, to?, s?, ch?, pk?, d? | e? } */
+async function tryBrokerSend(channelId: string, sig: Signal): Promise<boolean> {
+    switch (sig.t) {
+        case "announce":
+        case "query":
+        case "bye":
+            // широковещательные — в топик голосового канала
+            return brokerPublish(brokerChannelTopic(channelId), {
+                v: 1, k: sig.t, s: sig.s, from: sig.from, ch: channelId, d: sig.d ?? null
+            });
+        case "join":
+        case "leave": {
+            if (!sig.to) return false;
+            // join несёт только намерение смотреть — секретов нет;
+            // наш публичный ключ нужен хосту, чтобы шифровать offer/ice нам
+            const pk = sig.t === "join" ? await brokerPublicKey() : undefined;
+            return brokerPublish(`${TOPIC_PREFIX}/u/${sig.to}`, {
+                v: 1, k: sig.t, s: sig.s, from: sig.from, ch: channelId, pk
+            });
+        }
+        case "offer":
+        case "answer":
+        case "ice": {
+            if (!sig.to || !sig.pk) return false;
+            // SDP и ICE содержат IP — шифруем ECDH+AES-GCM ключом адресата
+            const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, sig.d ?? null), brokerPublicKey()]);
+            return brokerPublish(`${TOPIC_PREFIX}/u/${sig.to}`, {
+                v: 1, k: sig.t, s: sig.s, from: sig.from, ch: channelId, pk: myPk, e: sealed
+            });
+        }
+        default:
+            return false;
+    }
+}
+// endregion
+
+/** Отправить сигнал. Маршрут: _route="chat"/"both" (совместимость со старыми
+ *  версиями пира) или брокер-первым (по умолчанию). В чате при брокере НИЧЕГО
+ *  не появляется, кроме случая "chat"/"both" для старых версий пиров. */
+export function sendSignals(channelId: string, sig: Signal): void {
     void (async () => {
         try {
+            const route = sig._route;
+            if (route !== "chat") {
+                // если брокер сейчас подключается — даём ему шанс (первый announce уходит сразу после старта эфира)
+                if (brokerStatus() === "connecting") await brokerWaitConnected(1200);
+                const okBroker = await tryBrokerSend(channelId, sig);
+                if (okBroker && route !== "both") return;
+            }
+            if (route === "broker") return;
+            if (settings.store.chatFallback === false) {
+                if (route !== "both") logger.warn("Брокер недоступен, чат-фолбэк выключен — сигнал не отправлен:", sig.t);
+                return;
+            }
             const contents = await encodeSignal(sig);
             for (const content of contents) {
                 const ok = await sendMessageSafe(channelId, content);
@@ -197,7 +272,7 @@ function makeNonce(): string {
 }
 
 /**
- * Отправка одного сообщения. Возвращает true, если Discord принял вызов без ошибки.
+ * Отправка одного сообщения в чат (только фолбэк). Возвращает true, если Discord принял вызов без ошибки.
  *
  * ВАЖНО: в свежих сборках Discord сигнатура
  *   sendMessage(channelId, message, createLocally, options)
@@ -209,6 +284,8 @@ function makeNonce(): string {
 async function sendMessageSafe(channelId: string, content: string): Promise<boolean> {
     try {
         const nonce = makeNonce();
+        recentNonces.add(nonce);
+        setTimeout(() => recentNonces.delete(nonce), 30_000);
         const res: unknown = (MessageActions as any).sendMessage(
             channelId,
             { content, tts: false, nonce },
@@ -231,45 +308,72 @@ async function sendMessageSafe(channelId: string, content: string): Promise<bool
     }
 }
 
-// region самоуничтожение собственных сигналов
-/** nonce -> все известные id сообщения (локальное эхо + сообщение из шлюза) */
-const ownEchoes = new Map<string, { channelId: string; ids: Set<string>; done: boolean }>();
+// region самоуничтожение собственных сигналов (фолбэк)
+/** nonce -> все известные id сообщения. Удаляем ТОЛЬКО реальный id из шлюза:
+ *  optimistic-id серверу не знаком — попытка удалить его даёт 404,
+ *  а Discord сам подменяет optimistic-сообщение на реальное по nonce. */
+const ownEchoes = new Map<string, { channelId: string; realId: string | null; nonce: string }>();
+
+/** недавние свои nonce — по ним отличаем optimistic-эхо от реального сообщения */
+const recentNonces = new Set<string>();
+
+/** id-шники, которые мы уже пробовали удалять (защита от повторов/шторма 429) */
+const deletedIds = new Set<string>();
+
+/** очередь удалений: не чаще одного DELETE в ~1.1 с, иначе Discord отвечает 429 */
+const deleteQueue: Array<[string, string]> = [];
+let deleteDrain: NodeJS.Timeout | undefined;
+
+function drainDeletes(): void {
+    const item = deleteQueue.shift();
+    if (!item) {
+        if (deleteDrain) clearInterval(deleteDrain);
+        deleteDrain = undefined;
+        return;
+    }
+    try {
+        const p: unknown = (MessageActions as any).deleteMessage(item[0], item[1]);
+        // 404/429 здесь — норм (сообщение уже удалено/лимит): глушим rejection,
+        // иначе «Uncaught (in promise) HTTPResponseError» сыпется в консоль
+        Promise.resolve(p).catch(() => { /* ignore */ });
+    } catch { /* ignore */ }
+}
+
+function queueDelete(channelId: string, id: string): void {
+    if (!channelId || !id) return;
+    // только снежинки (17-20 цифр): optimistic/nonce-подобные id сервер не знает
+    if (!/^\d{15,22}$/.test(id)) return;
+    if (deletedIds.has(id)) return;
+    if (deletedIds.size > 400) deletedIds.clear();
+    deletedIds.add(id);
+    deleteQueue.push([channelId, id]);
+    if (!deleteDrain) deleteDrain = setInterval(drainDeletes, 1100);
+}
 
 /**
  * Учесть собственное служебное сообщение для удаления через SELF_DESTRUCT_MS.
- * Локальное эхо и сообщение из шлюза имеют разные id, но один nonce —
- * собираем оба и удаляем оба (иначе в чате остаётся «хвост»).
+ * Локальное (optimistic) эхо имеет тот же nonce, но другой id — удаляем только
+ * реальный id, пришедший из шлюза (payload.optimistic !== true). Если optimistic-
+ * флаг недоступен — удаляем оба id: лишний DELETE по optimistic-id тихо 404нет
+ * (rejection глушится, лимит соблюдает очередь).
  */
-export function handleOwnEcho(msg: { id?: string; channel_id?: string; nonce?: string }): void {
+export function handleOwnEcho(msg: { id?: string; channel_id?: string; nonce?: string; optimistic?: boolean }): void {
     if (!msg?.id || !msg.channel_id) return;
     const key = msg.nonce ? `n:${msg.nonce}` : `i:${msg.id}`;
     let entry = ownEchoes.get(key);
     if (!entry) {
-        entry = { channelId: msg.channel_id, ids: new Set(), done: false };
+        entry = { channelId: msg.channel_id, realId: null, nonce: msg.nonce ?? "" };
         ownEchoes.set(key, entry);
         setTimeout(() => {
-            entry!.done = true;
-            flushEcho(entry!);
-        }, SELF_DESTRUCT_MS + 400);
-        setTimeout(() => ownEchoes.delete(key), 20_000);
+            if (entry!.realId && cleanupEnabled()) queueDelete(entry!.channelId, entry!.realId);
+            ownEchoes.delete(key);
+        }, SELF_DESTRUCT_MS + 700);
     }
-    entry.ids.add(msg.id);
-    if (entry.done) flushEcho(entry); // позднее эхо — удаляем сразу
-}
-
-function flushEcho(entry: { channelId: string; ids: Set<string> }): void {
-    for (const id of entry.ids) {
-        deleteSignalMessage(entry.channelId, id);
-    }
+    if (msg.optimistic !== true) entry.realId = msg.id;
 }
 // endregion
 
-/** Удалить сообщение (используется для самоуничтожения служебных сообщений) */
+/** Удалить сообщение (фолбэк: самоуничтожение служебных сообщений) */
 export function deleteSignalMessage(channelId: string, messageId: string): void {
-    try {
-        void MessageActions.deleteMessage(channelId, messageId);
-    } catch (e) {
-        // нет прав на удаление чужих сообщений — не страшно, отправитель удалит своё эхо сам
-        logger.debug("Не удалось удалить сообщение:", e);
-    }
+    queueDelete(channelId, messageId);
 }

@@ -124,8 +124,19 @@ export const settings = definePluginSettings({
     },
     autoDeleteSignals: {
         type: OptionType.BOOLEAN,
-        description: "Автоудаление служебных сообщений соединения (живут ~2.5 сек, чат остаётся чистым)",
+        description: "Автоудаление служебных кодов из чата (работает только в аварийном фолбэке — в штатном режиме сигналинг идёт через брокер мимо чата)",
         default: true
+    },
+    chatFallback: {
+        type: OptionType.BOOLEAN,
+        description: "Аварийный фолбэк: если брокер сигналинга недоступен, слать служебные коды в чат (самоудаляются). Выключите — тогда без брокера соединение просто не установится",
+        default: true
+    },
+    brokerUrl: {
+        type: OptionType.STRING,
+        description: "Свой брокер сигналинга (WSS, MQTT). Пусто — публичные брокеры по умолчанию (emqx/hivemq/mosquitto)",
+        default: "",
+        placeholder: "wss://broker.emqx.io:8084/mqtt"
     },
     notifyLive: {
         type: OptionType.BOOLEAN,
@@ -139,7 +150,7 @@ export const settings = definePluginSettings({
     },
     discoverPings: {
         type: OptionType.BOOLEAN,
-        description: "Служебный пинг канала, если эфир не найден (хост отвечает анонсом — надёжнее при пропущенном объявлении)",
+        description: "Служебный пинг «есть эфиры?» после входа в голос (идёт через брокер; в чат — только в фолбэке)",
         default: true
     },
     nativeTiles: {

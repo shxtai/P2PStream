@@ -7,11 +7,20 @@
 import { Logger } from "@utils/Logger";
 import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
+import {
+    brokerEnsure,
+    brokerIdleCheck,
+    brokerLabel,
+    brokerOpen,
+    brokerSetChannel,
+    brokerShutdown,
+    brokerStatus,
+    setBrokerMessageHandler
+} from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
-    deleteSignalMessage,
     handleOwnEcho,
     isSignalContent,
     parseSignals,
@@ -40,6 +49,9 @@ export interface LiveHost {
     meta: StreamMeta;
     /** версия плагина хоста (если передана в анонсе) */
     hostVersion?: string;
+    /** транспорт, с которого пришёл анонс: "broker" | "chat" — по нему
+     *  зритель выбирает маршрут join (совместимость со старыми версиями) */
+    via?: "broker" | "chat";
 }
 
 export type WatchState = "connecting" | "live" | "reconnecting" | "ended" | "failed";
@@ -356,6 +368,8 @@ class HostPeer {
     private iceBuf: RTCIceCandidateInit[] = [];
     private iceTimer: NodeJS.Timeout | undefined;
     private restarted = false;
+    /** Публичный ECDH-ключ зрителя (пришёл в join) — им шифруем offer/ice ему */
+    peerPk: string | null = null;
     /** Канал превью (кадры для плиток, пока зритель не смотрит) */
     previewDc?: RTCDataChannel;
 
@@ -406,6 +420,8 @@ class HostPeer {
         this.iceBuf = [];
         sendSignals(this.host.channelId, {
             v: 1, t: "ice", s: this.host.streamId, from: myId(), to: this.userId,
+            pk: this.peerPk ?? undefined,
+            _route: this.host.mgr.routeFor(this.userId),
             d: { candidates }
         });
     }
@@ -422,6 +438,8 @@ class HostPeer {
             if (desc) {
                 sendSignals(this.host.channelId, {
                     v: 1, t: "offer", s: this.host.streamId, from: myId(), to: this.userId,
+                    pk: this.peerPk ?? undefined,
+                    _route: this.host.mgr.routeFor(this.userId),
                     d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type }
                 });
             }
@@ -516,9 +534,14 @@ export class HostSession {
         this.mgr.announce();
     }
 
-    createPeer(userId: string): HostPeer {
+    createPeer(userId: string, peerPk?: string): HostPeer {
+        // новая сессия с этим зрителем — транспорт определим заново по его join
+        this.mgr.resetPeerTransport(userId);
         const existing = this.peers.get(userId);
-        if (existing && !existing.closed) return existing;
+        if (existing && !existing.closed) {
+            if (peerPk && !existing.peerPk) existing.peerPk = peerPk;
+            return existing;
+        }
 
         if (this.peers.size >= MAX_VIEWERS) {
             toast(`Достигнут лимит зрителей (${MAX_VIEWERS})`, "critical");
@@ -527,6 +550,7 @@ export class HostSession {
 
         logger.info(`Зритель подключается: ${userId}`);
         const peer = new HostPeer(this, userId);
+        if (peerPk) peer.peerPk = peerPk;
         this.peers.set(userId, peer);
         this.mgr.bump();
         return peer;
@@ -581,6 +605,15 @@ export class WatchSession {
     private joinAttempts = 0;
     private pendingIce: RTCIceCandidateInit[] = [];
     private restarts = 0;
+    /** Публичный ECDH-ключ хоста (пришёл в offer) — им шифруем answer/ice ему */
+    hostPk: string | null = null;
+
+    /** Маршрут сигналов к хосту: по транспорту его анонса (совместимость со старыми версиями) */
+    private hostRoute(): "broker" | "chat" | "both" {
+        if (this.host.via === "chat") return "chat";
+        if (this.host.via === "broker") return "broker";
+        return "both";
+    }
 
     constructor(
         private mgr: P2PManager,
@@ -618,7 +651,8 @@ export class WatchSession {
 
     private sendJoin(): void {
         sendSignals(this.host.channelId, {
-            v: 1, t: "join", s: this.host.streamId, from: myId(), to: this.host.userId
+            v: 1, t: "join", s: this.host.streamId, from: myId(), to: this.host.userId,
+            _route: this.hostRoute()
         });
     }
 
@@ -628,8 +662,9 @@ export class WatchSession {
         this.mgr.bump();
     }
 
-    async handleOffer(d: { sdp: string; type: RTCSdpType }): Promise<void> {
+    async handleOffer(d: { sdp: string; type: RTCSdpType }, hostPk?: string): Promise<void> {
         try {
+            if (hostPk) this.hostPk = hostPk;
             if (!this.pc) this.setupPc();
             const pc = this.pc!;
             this.stopJoinLoop();
@@ -642,6 +677,8 @@ export class WatchSession {
 
             sendSignals(this.host.channelId, {
                 v: 1, t: "answer", s: this.host.streamId, from: myId(), to: this.host.userId,
+                pk: this.hostPk ?? undefined,
+                _route: this.hostRoute(),
                 d: { sdp: pc.localDescription!.sdp, type: pc.localDescription!.type }
             });
 
@@ -697,6 +734,8 @@ export class WatchSession {
             if (e.candidate) {
                 sendSignals(this.host.channelId, {
                     v: 1, t: "ice", s: this.host.streamId, from: myId(), to: this.host.userId,
+                    pk: this.hostPk ?? undefined,
+                    _route: this.hostRoute(),
                     d: { candidates: [e.candidate.toJSON()] }
                 });
             }
@@ -733,7 +772,8 @@ export class WatchSession {
         this.stopJoinLoop();
         if (sendLeave && this.state !== "ended") {
             sendSignals(this.host.channelId, {
-                v: 1, t: "leave", s: this.host.streamId, from: myId(), to: this.host.userId
+                v: 1, t: "leave", s: this.host.streamId, from: myId(), to: this.host.userId,
+                _route: this.hostRoute()
             });
         }
         try { this.pc?.close(); } catch { /* ignore */ }
@@ -747,6 +787,10 @@ export class P2PManager {
     host: HostSession | null = null;
     readonly watches = new Map<string, WatchSession>();
     readonly liveHosts = new Map<string, LiveHost>();
+
+    /** Транспорт, с которого последний раз приходили сигналы пира —
+     *  по нему адресуем ответные (совместимость v1.7 ↔ старые версии). */
+    private peerTransport = new Map<string, "broker" | "chat">();
 
     /** true пока startShare() сам ждёт gdm — пикер в этом случае не показывает
      *  кнопку «Обычный стрим Discord» (Discord своей поток не ждёт) */
@@ -785,9 +829,14 @@ export class P2PManager {
 
     start(): void {
         setCleanupEnabledGetter(() => settings.store.autoDeleteSignals);
+        // брокерный сигналинг: все сигналы (announce/query/join/offer/answer/ice)
+        // идут через публичный MQTT-брокер, в чат Discord ничего не попадает
+        setBrokerMessageHandler((msg, topic) => this.onBrokerMessage(msg, topic));
         this.pruneTimer = setInterval(() => {
             pruneFragments();
             this.pruneLiveHosts();
+            const active = !!this.host || this.watches.size > 0 || !!currentVoiceChannelId();
+            brokerIdleCheck(active);
         }, 5000);
         // discovery-пинг «есть эфиры?» шлём ТОЛЬКО по событию, а не по таймеру:
         //  - сразу после входа в голосовой канал (анонс мог быть пропущен);
@@ -814,7 +863,8 @@ export class P2PManager {
         logger.info("P2P-движок запущен");
     }
 
-    /** Вызывается из flux VOICE_STATE_UPDATES: фиксируем момент входа в голосовой канал */
+    /** Вызывается из flux VOICE_STATE_UPDATES: фиксируем момент входа в голосовой канал.
+     *  Здесь же обновляем подписку брокера на топик канала (discovery без чата). */
     onVoiceStateUpdate(): void {
         // читаем SelectedChannelStore ПОСЛЕ того, как сторы обработают диспетч — иначе увидим старый канал
         setTimeout(() => {
@@ -824,6 +874,7 @@ export class P2PManager {
                     this.lastVoiceJoinAt = Date.now();
                 }
                 this.lastVoiceChannelId = voice;
+                brokerSetChannel(voice); // подписка на announce/query топик канала
             } catch { /* ignore */ }
         }, 0);
     }
@@ -833,6 +884,28 @@ export class P2PManager {
         this.lastDiscoveryRequestAt = Date.now();
     }
 
+    /** Маршрут адресных сигналов к пиру (см. peerTransport) */
+    routeFor(userId: string): "broker" | "chat" | "both" {
+        return this.peerTransport.get(userId) ?? "both";
+    }
+
+    /** Сбросить знание о транспорте пира (новая сессия соединения) */
+    resetPeerTransport(userId: string): void {
+        this.peerTransport.delete(userId);
+    }
+
+    private rememberTransport(userId: string, via: "broker" | "chat"): void {
+        if (!userId || this.peerTransport.get(userId) === via) return;
+        // не откатываем "broker" на "chat" из-за дубликата join (both-маршрут):
+        // предпочитаем более тихий транспорт, пока он реально живой
+        const prev = this.peerTransport.get(userId);
+        if (prev === "broker" && via === "chat" && Date.now() - (this.transportSetAt.get(userId) ?? 0) < 4_000) return;
+        this.peerTransport.set(userId, via);
+        this.transportSetAt.set(userId, Date.now());
+    }
+
+    private transportSetAt = new Map<string, number>();
+
     /**
      * Полный сценарий «подключиться к эфиру в моём голосовом канале»:
      * если локально эфиров не знаем — шлём query и даём хосту ~3.5 с ответить,
@@ -841,6 +914,8 @@ export class P2PManager {
      */
     async watchInVoice(): Promise<void> {
         this.requestDiscovery();
+        // брокер мог быть ещё не подключён — даём ему до секунды (иначе первый query уйдёт в чат)
+        brokerEnsure();
         let list = [...this.liveHosts.values()];
         if (list.length === 0) {
             const voice = currentVoiceChannelId();
@@ -848,8 +923,17 @@ export class P2PManager {
                 toast("Сначала подключитесь к голосовому каналу", "critical");
                 return;
             }
+            await new Promise(r => setTimeout(r, 900)); // окно на подключение брокера
             sendSignals(voice, { v: 1, t: "query", s: "*", from: myId() });
-            await new Promise(r => setTimeout(r, 3500));
+            await new Promise(r => setTimeout(r, 2500));
+            list = [...this.liveHosts.values()];
+        }
+        // в канале могут сидеть хосты со старой версией (только чат) — один тихий
+        // чат-пинг (самоудаляется) даёт совместимость, ничего не ломая в брокере
+        if (list.length === 0 && currentVoiceChannelId() && settings.store.discoverPings !== false) {
+            const voice = currentVoiceChannelId()!;
+            sendSignals(voice, { v: 1, t: "query", s: "*", from: myId(), _route: "chat" });
+            await new Promise(r => setTimeout(r, 2500));
             list = [...this.liveHosts.values()];
         }
         if (list.length === 1) {
@@ -878,6 +962,7 @@ export class P2PManager {
         if (this.discoverTimer) clearInterval(this.discoverTimer);
         this.discoverTimer = undefined;
         this.stopHeartbeat();
+        brokerShutdown();
         this.bump();
         logger.info("P2P-движок остановлен");
     }
@@ -914,6 +999,7 @@ export class P2PManager {
      *  source: выбранный источник пикера (null — неизвестен/весь экран:
      *  нативный звук пойдёт как «система без Discord»). */
     async startShareWithCapture(capture: MediaStream, source: P2PSourceInfo | null = null): Promise<void> {
+        brokerEnsure(); // зрители должны найти нас через брокер, не через чат
         if (!this.checkCanStart()) {
             for (const t of capture.getTracks()) {
                 try { t.stop(); } catch { /* ignore */ }
@@ -1028,12 +1114,14 @@ export class P2PManager {
         logger.info("Эфир остановлен");
     }
 
-    /** Объявить всем в канале текущее состояние эфира (announce = heartbeat) */
-    announce(): void {
+    /** Объявить всем в канале текущее состояние эфира (announce = heartbeat).
+     *  route "chat" — ответ старому зрителю, запросившему через чат. */
+    announce(route?: "chat"): void {
         const { host } = this;
         if (!host) return;
         sendSignals(host.channelId, {
             v: 1, t: "announce", s: host.streamId, from: myId(),
+            _route: route,
             d: { ...this.host!.meta, av: PLUGIN_VERSION }
         });
     }
@@ -1063,6 +1151,7 @@ export class P2PManager {
         const existing = this.watches.get(streamId);
         if (existing) return existing;
 
+        brokerEnsure(); // join уйдёт адресно через брокер
         const host = this.liveHosts.get(streamId);
         if (!host) {
             toast("Эфир не найден — возможно, он уже завершился", "critical");
@@ -1073,6 +1162,7 @@ export class P2PManager {
             return null;
         }
 
+        this.resetPeerTransport(host.userId); // новый просмотр — транспорт заново
         const session = new WatchSession(this, host);
         this.watches.set(streamId, session);
         this.bump();
@@ -1090,9 +1180,10 @@ export class P2PManager {
     // endregion
 
     // region сигналы
-    handleSignal(sig: Signal, channelId: string): boolean {
+    handleSignal(sig: Signal, channelId: string, via: "broker" | "chat" = "chat"): boolean {
         const me = myId();
         if (!me || sig.from === me) return false;
+        this.rememberTransport(sig.from, via);
 
         switch (sig.t) {
             case "announce": {
@@ -1105,7 +1196,8 @@ export class P2PManager {
                     channelId,
                     lastSeen: Date.now(),
                     meta: sig.d ?? {},
-                    hostVersion: typeof sig.d?.av === "string" ? sig.d.av : undefined
+                    hostVersion: typeof sig.d?.av === "string" ? sig.d.av : undefined,
+                    via
                 });
 
                 if (!prev && channelId === voice) {
@@ -1120,12 +1212,13 @@ export class P2PManager {
                 return true;
             }
             case "query": {
-                // зритель спрашивает «есть эфиры?» — отвечаем анонсом (не чаще раза в 5 с)
+                // зритель спрашивает «есть эфиры?» — отвечаем анонсом (не чаще раза в 5 с).
+                // Спросили через чат (старая версия) — отвечаем тоже через чат.
                 if (this.host && (sig.s === "*" || sig.s === this.host.streamId)) {
                     const now = Date.now();
                     if (now - this.lastQueryReply > 5000) {
                         this.lastQueryReply = now;
-                        this.announce();
+                        this.announce(via === "chat" ? "chat" : undefined);
                     }
                 }
                 return true;
@@ -1139,13 +1232,13 @@ export class P2PManager {
             }
             case "join": {
                 if (this.host && sig.s === this.host.streamId) {
-                    this.host.createPeer(sig.from);
+                    this.host.createPeer(sig.from, sig.pk);
                 }
                 return true;
             }
             case "offer": {
                 if (sig.to === me) {
-                    void this.watches.get(sig.s)?.handleOffer(sig.d);
+                    void this.watches.get(sig.s)?.handleOffer(sig.d, sig.pk);
                 }
                 return true;
             }
@@ -1177,11 +1270,11 @@ export class P2PManager {
 
     /**
      * Обработчик MESSAGE_CREATE (регистрируется через flux-хендлер плагина).
+     * С v1.7 нужен ТОЛЬКО для чат-фолбэка (брокер недоступен): в штатном режиме
+     * сигналы ходят через MQTT-брокер и чат молчит.
      * ВАЖНО: flux-хендлер Vencord получает ВЕСЬ payload диспетчера, а само
      * сообщение лежит в payload.message (так же его читают плагины Vencord,
      * например xsOverlay: MESSAGE_CREATE({ message, optimistic })).
-     * Раньше мы читали content прямо с payload — всегда undefined, из-за чего
-     * не работали НИ чистка своих сигналов, НИ распознавание чужих анонсов.
      */
     onMessageCreate = (payload: any): void => {
         try {
@@ -1190,22 +1283,55 @@ export class P2PManager {
 
             const me = myId();
             if (msg.author?.id === me) {
-                // своё эхо: собираем id (локальное эхо + шлюз) и удаляем оба
-                if (settings.store.autoDeleteSignals) handleOwnEcho(msg);
+                // своё эхо (фолбэк): удаляем только реальный id из шлюза (не optimistic)
+                if (settings.store.autoDeleteSignals) {
+                    handleOwnEcho({ ...msg, optimistic: payload?.optimistic === true });
+                }
                 return;
             }
 
             void parseSignals(msg.content).then(sigs => {
-                let matched = false;
                 for (const sig of sigs) {
-                    matched = this.handleSignal(sig, msg.channel_id) || matched;
-                }
-                if (matched && settings.store.autoDeleteSignals && msg.channel_id && msg.id) {
-                    deleteSignalMessage(msg.channel_id, msg.id);
+                    // удаление чужих сигналов НЕ делаем: отправитель чистит своё сам —
+                    // двойное удаление давало 404 и шторм 429 у обоих клиентов
+                    this.handleSignal(sig, msg.channel_id, "chat");
                 }
             });
         } catch (e) {
             logger.debug("onMessageCreate error:", e);
+        }
+    };
+
+    /**
+     * Сигнал из брокера (основной транспорт с v1.7). Форма конверта — см. broker.ts:
+     * { v:1, k:тип, from, to?, s, ch?, pk?, d? | e? }, для offer/answer/ice — e
+     * зашифрован ECDH+AES-GCM ключом отправителя.
+     */
+    private onBrokerMessage = async (msg: any, _topic?: string): Promise<void> => {
+        try {
+            if (!msg || msg.v !== 1 || typeof msg.k !== "string" || typeof msg.from !== "string") return;
+            if (msg.from === myId()) return; // MQTT возвращает и свои публикации в подписанный топик
+            const me = myId();
+            if (msg.to && msg.to !== me) return;
+
+            let d = msg.d;
+            if (msg.k === "offer" || msg.k === "answer" || msg.k === "ice") {
+                if (!msg.e || !msg.pk) return;
+                d = await brokerOpen(msg.pk, msg.e);
+            }
+
+            const sig: Signal = {
+                v: 1,
+                t: msg.k as Signal["t"],
+                s: typeof msg.s === "string" ? msg.s : "*",
+                from: msg.from,
+                to: msg.to,
+                d
+            };
+            const channelId = typeof msg.ch === "string" && msg.ch ? msg.ch : currentVoiceChannelId();
+            this.handleSignal(sig, channelId ?? "", "broker");
+        } catch (e) {
+            logger.debug("onBrokerMessage error:", e);
         }
     };
 

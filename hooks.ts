@@ -222,15 +222,22 @@ export function isGoLiveHijackInstalled(): boolean {
 // region перехват КЛИКА по стоковой кнопке «Стримить» (слой 1)
 /**
  * Слушаем клики в capture-фазе на document: клик по кнопке начала стрима
- * в панели звонка открывает НАШ пикер (а не пикер Discord).
+ * открывает НАШ пикер (а не пикер Discord).
  *
- * Кнопку ищем без webpack (устойчиво к обновлениям Discord):
- *  - элемент — кнопка ([role=button]) в нижней панели звонка (класс panels_);
- *  - aria-label похож на «начать стрим» (EN/RU), но не на «остановить/смотреть».
+ * Кнопку ищем без webpack (устойчиво к обновлениям Discord). ВАЖНО (v1.7):
+ * раньше требовали closest('[class*="panels_"]') — это работает в панели
+ * аккаунта, но в ЛС-звонке кнопка живёт в контролах звонка с другими классами,
+ * и перехват молча не срабатывал. Теперь:
+ *  - кнопка иконочная (без текста) с aria-label «начать стрим» (EN/RU);
+ *  - НЕ в модалках/слоях/меню/настройках и не в нашем UI;
+ *  - активна (не disabled);
+ *  - мы в голосовом канале.
  * Побочные кнопки панели (микрофон, камера, звуковая панель, настройки) не
- * подходят под фильтр; чужие стримы не в panels; свой Discord-стрим — это
- * кнопка «Остановить» (исключается по слову и по hasDiscordStream).
+ * подходят под фильтр; свой Discord-стрим — кнопка «Остановить» (исключается
+ * по слову и по hasDiscordStream).
  */
+const EXCLUDED_ZONE_RE = '[class*="layerContainer"],[class*="modal"],[role="menu"],[class*="popout"],[class*="standardSidebarView"],[class*="chatLayer"],[class*="emojiPicker"],#vc-p2p-bars';
+
 let clickInterceptor: ((e: MouseEvent) => void) | null = null;
 let clickInterceptorInstalled = false;
 
@@ -264,11 +271,14 @@ function docClickCapture(e: MouseEvent): void {
         const target = e.target as Element | null;
         const btn = target?.closest?.("button, [role=button]") as Element | null;
         if (!btn) return;
-        // только панель звонка/аккаунта (снизу слева) — чужие плитки стримов живут в других зонах
-        if (!(btn as any).closest?.('[class*="panels_"]')) return;
 
         const label = btn.getAttribute("aria-label") ?? "";
         if (!label || !START_STREAM_LABEL_RE.test(label) || NOT_START_LABEL_RE.test(label)) return;
+        // только иконочные кнопки: у share-кнопок в embeds/профилях есть текст — отсекаем их
+        if (btn.textContent?.trim()) return;
+        // не в модалках/слоях/меню/настройках и не в нашем UI
+        if (btn.closest(EXCLUDED_ZONE_RE)) return;
+        if (btn.getAttribute("aria-disabled") === "true" || btn.hasAttribute("disabled")) return;
 
         const me = UserStore.getCurrentUser()?.id ?? "";
         if (me && manager.hasDiscordStream(me)) return; // это кнопка остановки своего Discord-стрима

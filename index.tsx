@@ -10,6 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 import { MessageActions, SelectedChannelStore } from "@webpack/common";
 
+import { brokerLabel, brokerStatus } from "./broker";
 import { manager } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
@@ -48,6 +49,10 @@ function collectDiagnostics(): string[] {
     } catch { push("видеокодеки", "ошибка"); }
     push("sendMessage доступен", typeof MessageActions.sendMessage === "function");
     push("сигналинг (усп/ошибок подряд)", `${signalingHealth.sent} / ${signalingHealth.consecutiveFailures}${signalingHealth.lastError ? ` (последняя: ${signalingHealth.lastError})` : ""}`);
+    push("брокер сигналинга", brokerStatus() === "connected"
+        ? `${brokerLabel()} — коды в чат НЕ пишутся`
+        : `не подключён (${brokerStatus()}) — фолбэк: ${settings.store.chatFallback ? "коды в чат с самоудалением" : "выключен"}`);
+    push("чат-фолбэк", settings.store.chatFallback);
     push("эфиров видно", manager.liveHosts.size);
     push("своих P2P-эфиров", manager.host ? 1 : 0);
     push("просмотров", manager.watches.size);
