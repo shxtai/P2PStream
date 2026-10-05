@@ -517,3 +517,116 @@
 .vc-p2p-picker-advanced {
     margin-bottom: 8px;
 }
+
+/* ===== Мини-плеер (компактная панель просмотра) ===== */
+.vc-p2p-mini-host {
+    position: relative;
+    z-index: 4600;
+}
+
+.vc-p2p-mini {
+    position: fixed;
+    width: 380px;
+    max-width: calc(100vw - 24px);
+    background: var(--background-floating, #111214);
+    border: 1px solid var(--background-modifier-accent, rgba(255, 255, 255, 0.08));
+    border-radius: 10px;
+    box-shadow: var(--shadow-high, 0 12px 24px rgba(0, 0, 0, 0.4));
+    overflow: hidden;
+    z-index: 4600;
+    user-select: none;
+    animation: vc-p2p-slide-in 180ms ease-out;
+}
+
+.vc-p2p-mini-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    cursor: grab;
+    background: var(--background-secondary-alt, #1b1c1f);
+    touch-action: none;
+}
+
+.vc-p2p-mini-header:active {
+    cursor: grabbing;
+}
+
+.vc-p2p-mini-name {
+    font-weight: 600;
+    font-size: 13px;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-normal, #dbdee1);
+}
+
+.vc-p2p-mini-btn {
+    background: transparent;
+    border: none;
+    color: var(--interactive-normal, #b5bac1);
+    min-width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 4px;
+    font-family: inherit;
+}
+
+.vc-p2p-mini-btn:hover {
+    background: var(--background-modifier-hover, rgba(255, 255, 255, 0.06));
+    color: var(--interactive-hover, #dcddde);
+}
+
+.vc-p2p-mini-btn.vc-p2p-danger:hover {
+    background: var(--button-danger-background, #da373c);
+    color: #fff;
+}
+
+.vc-p2p-mini-video-wrap {
+    position: relative;
+    background: #000;
+    aspect-ratio: 16 / 9;
+}
+
+.vc-p2p-mini-video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+}
+
+.vc-p2p-mini.collapsed .vc-p2p-mini-video-wrap,
+.vc-p2p-mini.collapsed .vc-p2p-mini-controls {
+    display: none;
+}
+
+.vc-p2p-mini-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    color: var(--text-muted, #949ba4);
+}
+
+.vc-p2p-mini-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--background-secondary-alt, #1b1c1f);
+}
+
+.vc-p2p-mini-controls .vc-p2p-volume {
+    flex: 1;
+}

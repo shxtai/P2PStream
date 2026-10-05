@@ -7,9 +7,10 @@
 import { Modal, openModal,React } from "@webpack/common";
 
 import { cl } from "../css";
-import { createStatsTracker, manager,type StreamStats, type WatchSession } from "../engine";
+import { createStatsTracker, manager, type StreamStats, type WatchSession } from "../engine";
 import { settings } from "../settings";
 import { toast } from "../utils";
+import { openMiniPlayer } from "./MiniPlayer";
 
 const readStats = createStatsTracker("in");
 
@@ -21,6 +22,12 @@ export function openViewerModal(session: WatchSession): void {
         {
             onCloseCallback: () => {
                 openSessions.delete(session.host.streamId);
+                // закрытие модалки НЕ останавливает просмотр — эфир продолжает
+                // играть в компактном мини-плеере («панелька где-то сбоку»)
+                if (manager.watches.get(session.host.streamId) === session
+                    && session.state !== "ended" && session.state !== "failed") {
+                    openMiniPlayer(session);
+                }
             }
         }
     );
@@ -171,6 +178,20 @@ function ViewerModal({
     };
     const onPointerUp = () => { dragRef.current = null; };
 
+    const minimize = () => {
+        // сессия продолжается — мини-плеер откроется в onCloseCallback
+        modalProps.onClose();
+    };
+
+    const disconnect = () => {
+        try {
+            session.stop(true);
+            manager.watches.delete(session.host.streamId);
+            manager.bump();
+        } catch { /* ignore */ }
+        modalProps.onClose();
+    };
+
     const toggleFullscreen = () => {
         const el = wrapRef.current;
         if (!el) return;
@@ -289,9 +310,10 @@ function ViewerModal({
                     <Chip>{zoom.s > 1 ? `Зум ${Math.round(zoom.s * 100)}%` : "Ctrl+колесо — зум"}</Chip>
                     <button className={cl("ctrl-btn")} onClick={() => setZoom({ s: 1, x: 0, y: 0 })} title="Сбросить зум (R)">Сброс</button>
                     <button className={cl("ctrl-btn")} onClick={() => setShowStats(v => !v)} title="Статистика">{showStats ? "Скрыть статы" : "Статы"}</button>
-                    <button className={cl("ctrl-btn")} onClick={togglePip} title="Мини-окно поверх игры">PiP</button>
+                    <button className={cl("ctrl-btn")} onClick={togglePip} title="Мини-окно поверх всего (поверх игры)">PiP</button>
                     <button className={cl("ctrl-btn")} onClick={toggleFullscreen} title="Во весь экран (F)">Фуллскрин</button>
-                    <button className={`${cl("ctrl-btn")} ${cl("danger")}`} onClick={close}>Закрыть</button>
+                    <button className={cl("ctrl-btn")} onClick={minimize} title="Свернуть в компактную панель — просмотр продолжится">Мини</button>
+                    <button className={`${cl("ctrl-btn")} ${cl("danger")}`} onClick={disconnect} title="Остановить просмотр">Отключиться</button>
                 </div>
             </div>
         </Modal>

@@ -132,11 +132,16 @@ export const settings = definePluginSettings({
         description: "Аварийный фолбэк: если брокер сигналинга недоступен, слать служебные коды в чат (самоудаляются). Выключите — тогда без брокера соединение просто не установится",
         default: true
     },
+    brokerEnabled: {
+        type: OptionType.BOOLEAN,
+        description: "Сигналинг через MQTT-брокер (мимо чата). Публичные брокеры у части сетей блокируются (WSS открыт — CONNACK не приходит); если у вас так — оставьте выключенным, чат-режим теперь шлёт всего 3-5 самоудаляющихся кодов на подключение",
+        default: false
+    },
     brokerUrl: {
         type: OptionType.STRING,
-        description: "Свой брокер сигналинга (WSS, MQTT). Пусто — публичные брокеры по умолчанию (emqx/hivemq/mosquitto)",
+        description: "Свой брокер сигналинга (WSS, MQTT). Работает только при включённом брокере",
         default: "",
-        placeholder: "wss://broker.emqx.io:8084/mqtt"
+        placeholder: "wss://мой-брокер:8084/mqtt"
     },
     notifyLive: {
         type: OptionType.BOOLEAN,
@@ -172,9 +177,14 @@ export const settings = definePluginSettings({
     },
     turnUrl: {
         type: OptionType.STRING,
-        description: "TURN-сервер — нужен только если P2P не подключается (симметричный NAT)",
+        description: "Свой TURN-сервер — нужен только если P2P не подключается (симметричный NAT)",
         default: "",
         placeholder: "turn:host:port?transport=udp"
+    },
+    emergencyTurn: {
+        type: OptionType.BOOLEAN,
+        description: "Аварийный публичный TURN (openrelay.metered.ca): включается, только если прямое соединение не собирается. Трафик идёт через чужой сервер — медленнее; выключите, если добавили свой TURN",
+        default: true
     },
     turnUser: {
         type: OptionType.STRING,

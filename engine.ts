@@ -106,6 +106,10 @@ function buildRtcConfig(): RTCConfiguration {
         .split(",")
         .map(s => s.trim())
         .filter(Boolean);
+    // сохранённые настройки не получают новые дефолты (у пользователя остался
+    // только Google-STUN) — Cloudflare добавляем всегда, если его нет:
+    // второй независимый STUN заметно повышает шанс получить srflx-кандидатов
+    if (!stuns.some(s => /cloudflare/i.test(s))) stuns.push("stun:stun.cloudflare.com:3478");
     for (const urls of stuns) iceServers.push({ urls });
 
     const turnUrl = String(settings.store.turnUrl ?? "").trim();
@@ -114,6 +118,19 @@ function buildRtcConfig(): RTCConfiguration {
             urls: turnUrl,
             username: String(settings.store.turnUser ?? ""),
             credential: String(settings.store.turnPassword ?? "")
+        });
+    } else if (settings.store.emergencyTurn !== false) {
+        // Аварийный публичный ретранслятор: спасает при симметричном NAT/CGNAT,
+        // когда прямые кандидаты не совпадаются (частая причина «стрим не грузит»).
+        // ICE сам предпочитает прямые пути — TURN используется только как последний вариант.
+        iceServers.push({
+            urls: [
+                "turn:openrelay.metered.ca:80",
+                "turn:openrelay.metered.ca:443?transport=udp",
+                "turn:openrelay.metered.ca:443?transport=tcp"
+            ],
+            username: "openrelayproject",
+            credential: "openrelayproject"
         });
     }
 
@@ -272,6 +289,26 @@ function logIceSummary(pc: RTCPeerConnection, label: string): void {
     } catch { /* ignore */ }
 }
 
+/** Дождаться полного сбора ICE-кандидатов (но не дольше ms) — для non-trickle отправки */
+function waitIceGathering(pc: RTCPeerConnection, ms: number): Promise<void> {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise(resolve => {
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            resolve();
+        };
+        const onChange = () => {
+            if (pc.iceGatheringState === "complete") finish();
+        };
+        const timer = setTimeout(finish, ms);
+        pc.addEventListener("icegatheringstatechange", onChange);
+    });
+}
+
 function applyReceiveLatency(pc: RTCPeerConnection): void {
     const target = Number(settings.store.jitterBuffer) || 0;
     for (const receiver of pc.getReceivers()) {
@@ -380,6 +417,8 @@ class HostPeer {
     private pendingIce: RTCIceCandidateInit[] = [];
     private iceBuf: RTCIceCandidateInit[] = [];
     private iceTimer: NodeJS.Timeout | undefined;
+    /** идёт сборка non-trickle сообщения (кандидаты уйдут вместе с offer/answer) */
+    private bundling = false;
     private restarted = false;
     /** Публичный ECDH-ключ зрителя (пришёл в join) — им шифруем offer/ice ему */
     peerPk: string | null = null;
@@ -405,7 +444,7 @@ class HostPeer {
         this.pc.onicecandidate = e => {
             if (e.candidate) {
                 this.iceBuf.push(e.candidate.toJSON());
-                if (!this.iceTimer) {
+                if (!this.bundling && !this.iceTimer) {
                     this.iceTimer = setTimeout(() => this.flushIce(), 120);
                 }
             }
@@ -434,6 +473,7 @@ class HostPeer {
 
     private flushIce(): void {
         this.iceTimer = undefined;
+        if (this.bundling) return; // кандидаты сейчас уйдут вместе с offer/answer
         if (!this.iceBuf.length) return;
         const candidates = this.iceBuf;
         this.iceBuf = [];
@@ -448,6 +488,7 @@ class HostPeer {
     private async negotiate(iceRestart: boolean): Promise<void> {
         if (this.closed || this.makingOffer) return;
         this.makingOffer = true;
+        this.bundling = true;
         try {
             const offer = await this.pc.createOffer({ iceRestart });
             await this.pc.setLocalDescription(offer);
@@ -455,25 +496,30 @@ class HostPeer {
             void applySendParameters(this.pc);
             const desc = this.pc.localDescription;
             if (desc) {
+                // NON-TRICKLE: все кандидаты едут ВМЕСТЕ с оффером — в чат-режиме
+                // это 1-2 кода на всю сессию вместо ливни отдельных сообщений
+                await waitIceGathering(this.pc, 1500);
+                const candidates = this.iceBuf.splice(0);
                 sendSignals(this.host.channelId, {
                     v: 1, t: "offer", s: this.host.streamId, from: myId(), to: this.userId,
                     pk: this.peerPk ?? undefined,
                     _route: this.host.mgr.routeFor(this.userId),
-                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type }
+                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates }
                 });
             }
         } catch (e) {
             logger.error("Ошибка оффера:", e);
         } finally {
             this.makingOffer = false;
+            this.bundling = false;
         }
     }
 
-    async handleAnswer(d: { sdp: string; type: RTCSdpType }): Promise<void> {
+    async handleAnswer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }): Promise<void> {
         try {
             if (this.pc.signalingState === "have-local-offer" && !this.pc.remoteDescription) {
                 await this.pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
-                const queue = this.pendingIce;
+                const queue = [...this.pendingIce, ...(d.candidates ?? [])];
                 this.pendingIce = [];
                 for (const c of queue) {
                     try { await this.pc.addIceCandidate(c); } catch { /* ignore */ }
@@ -635,6 +681,8 @@ export class WatchSession {
     /** буфер ICE-кандидатов (батчинг, как у хоста) — против спама по 1 сообщению на кандидата */
     private iceBuf: RTCIceCandidateInit[] = [];
     private iceTimer: NodeJS.Timeout | undefined;
+    /** идёт сборка non-trickle сообщения (кандидаты уйдут вместе с answer) */
+    private bundling = false;
     /** Публичный ECDH-ключ хоста (пришёл в offer) — им шифруем answer/ice ему */
     hostPk: string | null = null;
 
@@ -692,7 +740,7 @@ export class WatchSession {
         this.mgr.bump();
     }
 
-    async handleOffer(d: { sdp: string; type: RTCSdpType }, hostPk?: string): Promise<void> {
+    async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }, hostPk?: string): Promise<void> {
         try {
             if (hostPk) this.hostPk = hostPk;
             if (!this.pc) this.setupPc();
@@ -702,14 +750,27 @@ export class WatchSession {
             await pc.setRemoteDescription({ type: "offer", sdp: d.sdp });
             applyReceiveLatency(pc);
 
+            // кандидаты хоста, приехавшие вместе с оффером (non-trickle)
+            if (d.candidates?.length) {
+                for (const c of d.candidates) {
+                    try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+                }
+            }
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
+
+            // NON-TRICKLE: все наши кандидаты едут вместе с answer одним сообщением
+            this.bundling = true;
+            await waitIceGathering(pc, 1500);
+            const candidates = this.iceBuf.splice(0);
+            this.bundling = false;
 
             sendSignals(this.host.channelId, {
                 v: 1, t: "answer", s: this.host.streamId, from: myId(), to: this.host.userId,
                 pk: this.hostPk ?? undefined,
                 _route: this.hostRoute(),
-                d: { sdp: pc.localDescription!.sdp, type: pc.localDescription!.type }
+                d: { sdp: pc.localDescription!.sdp, type: pc.localDescription!.type, candidates }
             });
 
             const queue = this.pendingIce;
@@ -719,6 +780,8 @@ export class WatchSession {
             }
         } catch (e) {
             logger.error("Ошибка обработки оффера:", e);
+        } finally {
+            this.bundling = false;
         }
     }
 
@@ -736,6 +799,7 @@ export class WatchSession {
     /** Отправить накопленных кандидатов одной пачкой (батчинг как у хоста) */
     private flushIce(): void {
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
+        if (this.bundling) return; // кандидаты сейчас уйдут вместе с answer
         if (!this.iceBuf.length) return;
         const candidates = this.iceBuf;
         this.iceBuf = [];
@@ -779,7 +843,7 @@ export class WatchSession {
         pc.onicecandidate = e => {
             if (e.candidate) {
                 this.iceBuf.push(e.candidate.toJSON());
-                if (!this.iceTimer) {
+                if (!this.bundling && !this.iceTimer) {
                     this.iceTimer = setTimeout(() => this.flushIce(), 120);
                 }
             }
@@ -894,6 +958,8 @@ export class P2PManager {
             pruneFragments();
             this.pruneLiveHosts();
             const active = !!this.host || this.watches.size > 0 || !!currentVoiceChannelId();
+            // брокер выключили на лету — закрываем сокет
+            if (!settings.store.brokerEnabled && brokerIsConnected()) brokerShutdown();
             brokerIdleCheck(active);
         }, 5000);
         // discovery-пинг «есть эфиры?» шлём ТОЛЬКО по событию, а не по таймеру:

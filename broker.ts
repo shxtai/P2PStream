@@ -281,6 +281,11 @@ function nextUrl(): string {
 /** Убедиться, что соединение есть (идемпотентно, можно звать на каждый чих). */
 export function brokerEnsure(): void {
     lastIdleCheck = Date.now();
+    // Публичные MQTT-брокеры у части сетей молча режутся (WSS открыт, CONNECT
+    // дропнут — «таймаут, нет CONNACK» у всех трёх). По умолчанию выключены:
+    // чат-фолбэк после сжатия протокола шлёт 3-5 самоудаляющихся кодов на сессию.
+    // Включите brokerEnabled при своём брокере или если публичные у вас работают.
+    if (!settings.store.brokerEnabled) return;
     if (brokerIsConnected() || status === "connecting") return;
     void connect();
 }
