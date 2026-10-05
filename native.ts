@@ -12,7 +12,7 @@
 
 import { spawn } from "child_process";
 import { app, desktopCapturer, type IpcMainInvokeEvent } from "electron";
-import { mkdirSync, statSync, writeFileSync } from "fs";
+import { closeSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 
 export interface P2PSourceInfo {
@@ -65,7 +65,7 @@ export async function getSources(_e: IpcMainInvokeEvent, width = 384, height = 2
  *   exclude-*  — захват всей системы КРОМЕ дерева процесса (Discord).
  * stdout хелпера: float32 PCM 48000 Hz stereo. Рендерер опрашивает pullAudio.
  */
-const P2P_AUDIO_EXE_B64 = +
+const P2P_AUDIO_EXE_B64 =
     "TVp4AAEAAAAEAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAeAAAAA4fug4AtAnNIbgBTM0hVGhpcyBwcm9ncmFtIGNhbm5vdCBiZSBydW4gaW4gRE9TIG1vZGUuJAAAUEUAAGSGBgAqQsNqAAAAAAAAAADwACIACwIOAABO"
     + "AAAARAAAAAAAAFATAAAAEAAAAABAAAAAAAAAEAAAAAIAAAYAAAAAAAAABgAAAAAAAAAAAAEAAAQAAAAAAAADAGCBAAAAAQAAAAAAEAAAAAAAAAAAEAAAAAAAABAAAAAAAAAAAAAAEAAAAAAAAAAAAAAA+IwAAPAAAAAAAAAAAAAAAADQAAB8AgAAAAAAAAAAAAAA8AAA"
     + "eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOiIAAAoAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALnRleHQAAAAWTAAAABAAAABOAAAABAAAAAAAAAAAAAAAAAAAIAAAYC5yZGF0YQAAXDkAAABgAAAAOgAAAFIAAAAA"
@@ -329,8 +329,54 @@ let audioQueuedBytes = 0;
 /** ~0.5 с звука float32 стерео (384000 Б/с) — защита от переполнения */
 const AUDIO_QUEUE_CAP = 192_000;
 
+function audioHelperDir(): string {
+    return join(app.getPath("userData"), "p2pstream");
+}
+
+/** Распаковать хелпер. true — exe готов (валидный MZ-заголовок) */
+function extractAudioHelper(force = false): boolean {
+    try {
+        const dir = audioHelperDir();
+        mkdirSync(dir, { recursive: true });
+        const exePath = join(dir, "p2paudio.exe");
+        const buf = Buffer.from(P2P_AUDIO_EXE_B64, "base64");
+        let needWrite = force;
+        if (!needWrite) {
+            try {
+                const st = statSync(exePath);
+                needWrite = st.size !== buf.length;
+            } catch {
+                needWrite = true;
+            }
+        }
+        if (needWrite) writeFileSync(exePath, buf);
+        // контроль целостности: если файл начинается не с MZ — перезаписываем принудительно
+        const fd = statSync(exePath);
+        if (fd.size === buf.length) {
+            const head = readFileSyncRange(exePath, 2);
+            if (head !== "MZ") {
+                writeFileSync(exePath, buf);
+            }
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function readFileSyncRange(path: string, n: number): string {
+    try {
+        const fd = openSync(path, "r");
+        const buf = Buffer.alloc(n);
+        try { readSync(fd, buf, 0, n, 0); } finally { closeSync(fd); }
+        return buf.toString("latin1");
+    } catch {
+        return "";
+    }
+}
+
 function audioHelperPath(): string {
-    const dir = join(app.getPath("userData"), "p2pstream");
+    const dir = audioHelperDir();
     mkdirSync(dir, { recursive: true });
     const exePath = join(dir, "p2paudio.exe");
     const buf = Buffer.from(P2P_AUDIO_EXE_B64, "base64");
@@ -387,11 +433,26 @@ export async function startAudio(_e: IpcMainInvokeEvent, opts: { mode: string; i
         return { ok: false, error: `не удалось распаковать хелпер: ${e}` };
     }
 
-    let proc: ReturnType<typeof spawn>;
-    try {
-        proc = spawn(exePath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    } catch (e) {
-        return { ok: false, error: `не удалось запустить хелпер: ${e}` };
+    // спавн с ретраями: сразу после записи exe может быть залочен антивирусом
+    // (Windows Defender сканирует свежий exe) — ошибка UNKNOWN/EACCES/EPERM.
+    let proc: ReturnType<typeof spawn> | null = null;
+    let spawnError: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            proc = spawn(exePath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+            spawnError = null;
+            break;
+        } catch (e: any) {
+            spawnError = e;
+            if (attempt < 3) {
+                // перезаписываем exe (вдруг он битый от прошлой версии) и ждём снятия блокировки
+                try { extractAudioHelper(true); } catch { /* ignore */ }
+                await new Promise(r => setTimeout(r, 350));
+            }
+        }
+    }
+    if (!proc) {
+        return { ok: false, error: `не удалось запустить хелпер: ${spawnError}` };
     }
     audioProc = proc;
     audioQueue = [];
@@ -455,3 +516,9 @@ export async function stopAudio(): Promise<void> {
     stopAudioInternal();
 }
 // endregion
+
+// Распаковываем хелпер сразу при загрузке main-части: к моменту старта эфира
+// exe уже лежит на диске (антивирус успевает просканировать, спавн не ловит блокировку).
+try {
+    extractAudioHelper(false);
+} catch { /* при старте аудио повторим */ }

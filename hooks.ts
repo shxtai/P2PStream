@@ -5,12 +5,12 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { FluxDispatcher, UserStore } from "@webpack/common";
+import { FluxDispatcher, SelectedChannelStore, UserStore } from "@webpack/common";
 
 import { captureDesktopSource, listSources, type P2PSourceInfo } from "./capture";
 import { manager } from "./engine";
 import { settings } from "./settings";
-import { openSharePicker } from "./ui/SharePicker";
+import { isPickerOpen, openSharePicker } from "./ui/SharePicker";
 import { toast } from "./utils";
 
 const logger = new Logger("P2PStream:Hooks");
@@ -50,9 +50,12 @@ function makeWrapper(): (opts: DisplayMediaStreamOptions) => Promise<MediaStream
             }
             // Свой пикер: резолвится потоком для «обычного стрима»,
             // кидает NotAllowedError при отмене и после старта P2P.
+            // Если вызов пошёл от нас (/p2p-start) — кнопку «Обычный стрим Discord»
+            // скрываем: отданный поток вернулся бы в наш же startShare (получился бы P2P).
             const stream = await openSharePicker({
                 discordOptions: opts,
-                gdm: realGetDisplayMedia
+                gdm: realGetDisplayMedia,
+                fromDiscord: !manager.internalGdmCall
             });
             return stream;
         } catch (e) {
@@ -78,16 +81,30 @@ function assertWrapper(): void {
 /**
  * Десктопный Discord НЕ использует navigator.getDisplayMedia — его кнопка
  * «Стримить» открывает свой пикер, а подтверждение доходит до движка Flux-экшеном
- * MEDIA_ENGINE_SET_GO_LIVE_SOURCE (см. типы MediaEngineStore.setGoLiveSource).
- * Перехватываем экшен через FluxDispatcher.addInterceptor: в режиме p2p отменяем
- * Discord-эфир и запускаем наш P2P-движок с тем же источником.
- * Возврат false из интерцептора отменяет экшен — Discord-стрим не стартует.
+ * MEDIA_ENGINE_SET_GO_LIVE_SOURCE. Стратегия из двух слоёв:
+ *
+ *  1. ПЕРЕХВАТ КЛИКА (capture-фаза на document): клик по кнопке стрима в панели
+ *     звонка открывает НАШ пикер. Устойчив к переименованиям webpack-модулей —
+ *     ищем кнопку по aria-label в панели звонка (panels), а не по модулям.
+ *  2. Flux-интерцептор MEDIA_ENGINE_SET_GO_LIVE_SOURCE — страховка: если клик
+ *     перехватить не удалось (нестандартная метка кнопки, другой путь запуска),
+ *     то после подтверждения источника в стоковом пикере всё равно стартуем P2P.
  */
 const GO_LIVE_SOURCE_ACTION = "MEDIA_ENGINE_SET_GO_LIVE_SOURCE";
 const FALLBACK_FLAG = "__p2pstreamFallback";
 
+/** Метки кнопки начала стрима (EN/RU и близкие); матчим только «старт» */
+const START_STREAM_LABEL_RE = /(go[ ._-]?live|stream|screen[ ._-]?share|share|broadcast|стрим|трансляц|демонстрац|экран|поделиться|эфир)/i;
+/** Исключения: остановка стрима, просмотр чужого, участники и т.п. */
+const NOT_START_LABEL_RE = /(stop|end|leave|disconnect|watch|view|просмотр|смотр|останов|стоп|законч|заверш|отключ|выключ)/i;
+
 let goLiveInterceptor: ((payload: any) => boolean | void) | null = null;
 let goLiveHijackInstalled = false;
+
+/** Пользователь выбрал «Обычный стрим Discord» в нашем пикере — пропускаем один
+ *  Go Live-путь в Discord (клик по стоковой кнопке / экшен с источником). */
+let bypassToDiscordOnce = false;
+let bypassSetAt = 0;
 
 /** Достать Electron source id ("screen:0:0" / "window:pid:id") из полезной нагрузки экшена */
 function resolveGoLiveSourceId(payload: any): string | null {
@@ -155,6 +172,12 @@ function goLiveInterceptorImpl(payload: any): boolean | void {
     if (!payload || payload.type !== GO_LIVE_SOURCE_ACTION) return;
     if (String(settings.store.goliveMode) !== "p2p") return;
     if ((payload as any)?.[FALLBACK_FLAG]) return;
+    // «Обычный стрим Discord» выбран в нашем пикере — пропускаем экшен в Discord
+    if (bypassToDiscordOnce) {
+        bypassToDiscordOnce = false;
+        logger.info("Bypass: обычный стрим Discord запускается без перехвата");
+        return;
+    }
     if (manager.host) {
         toast("P2P-эфир уже идёт — сначала остановите его в панели внизу", "critical");
         return false;
@@ -196,9 +219,110 @@ export function isGoLiveHijackInstalled(): boolean {
 }
 // endregion
 
+// region перехват КЛИКА по стоковой кнопке «Стримить» (слой 1)
+/**
+ * Слушаем клики в capture-фазе на document: клик по кнопке начала стрима
+ * в панели звонка открывает НАШ пикер (а не пикер Discord).
+ *
+ * Кнопку ищем без webpack (устойчиво к обновлениям Discord):
+ *  - элемент — кнопка ([role=button]) в нижней панели звонка (класс panels_);
+ *  - aria-label похож на «начать стрим» (EN/RU), но не на «остановить/смотреть».
+ * Побочные кнопки панели (микрофон, камера, звуковая панель, настройки) не
+ * подходят под фильтр; чужие стримы не в panels; свой Discord-стрим — это
+ * кнопка «Остановить» (исключается по слову и по hasDiscordStream).
+ */
+let clickInterceptor: ((e: MouseEvent) => void) | null = null;
+let clickInterceptorInstalled = false;
+
+function inVoiceChannel(): boolean {
+    try {
+        return !!SelectedChannelStore.getVoiceChannelId?.();
+    } catch {
+        return false;
+    }
+}
+
+/** Пропустить один клик/экшен в Discord — там откроется свой пикер и пойдёт обычный стрим */
+function bypassOnceToDiscord(): void {
+    bypassToDiscordOnce = true;
+    bypassSetAt = Date.now();
+    // страховка: если Discord-путь так и не случился, снимаем флаг через 2 минуты
+    setTimeout(() => {
+        if (bypassToDiscordOnce && Date.now() - bypassSetAt >= 115_000) {
+            bypassToDiscordOnce = false;
+        }
+    }, 120_000);
+}
+
+function docClickCapture(e: MouseEvent): void {
+    try {
+        if (String(settings.store.goliveMode) !== "p2p") return;
+        if (bypassToDiscordOnce) return; // разрешили обычный стрим — не мешаем
+        if (isPickerOpen()) return; // наш пикер уже открыт
+        if (!inVoiceChannel()) return;
+
+        const target = e.target as Element | null;
+        const btn = target?.closest?.("button, [role=button]") as Element | null;
+        if (!btn) return;
+        // только панель звонка/аккаунта (снизу слева) — чужие плитки стримов живут в других зонах
+        if (!(btn as any).closest?.('[class*="panels_"]')) return;
+
+        const label = btn.getAttribute("aria-label") ?? "";
+        if (!label || !START_STREAM_LABEL_RE.test(label) || NOT_START_LABEL_RE.test(label)) return;
+
+        const me = UserStore.getCurrentUser()?.id ?? "";
+        if (me && manager.hasDiscordStream(me)) return; // это кнопка остановки своего Discord-стрима
+        if (manager.host) return; // наш P2P уже идёт — пусть Discord показывает свой UI
+
+        // перехватываем: Discord-пикер вообще не откроется
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        logger.info("Перехвачен клик по стоковой кнопке стрима — открываю пикер P2PStream");
+
+        void openSharePicker({
+            discordOptions: {},
+            gdm: realGetDisplayMedia,
+            fromDiscord: true,
+            onWantDiscordPicker: () => {
+                bypassOnceToDiscord();
+                // отдаём ход Discord: повторный клик по той же кнопке откроет его пикер
+                try {
+                    (btn as HTMLElement).click?.();
+                } catch (err) {
+                    logger.warn("Не удалось повторно кликнуть стоковую кнопку:", err);
+                }
+            }
+        });
+    } catch (err) {
+        logger.debug("docClickCapture error:", err);
+    }
+}
+
+function installClickInterceptor(): void {
+    if (clickInterceptorInstalled) return;
+    clickInterceptor = docClickCapture;
+    document.addEventListener("click", clickInterceptor, true);
+    clickInterceptorInstalled = true;
+    logger.info("Клик по стоковой кнопке «Стримить» открывает пикер P2PStream");
+}
+
+function uninstallClickInterceptor(): void {
+    if (!clickInterceptorInstalled || !clickInterceptor) return;
+    document.removeEventListener("click", clickInterceptor, true);
+    clickInterceptor = null;
+    clickInterceptorInstalled = false;
+}
+
+export function isClickInterceptorInstalled(): boolean {
+    return clickInterceptorInstalled;
+}
+// endregion
+
 export function installShareHook(): void {
     assertWrapper();
     installGoLiveHijack();
+    installClickInterceptor();
     if (!reassertTimer) {
         // если другой плагин (например, WebScreenShare) подменяет getDisplayMedia
         // после нас — тихо перекрываем обратно
@@ -209,6 +333,7 @@ export function installShareHook(): void {
 
 export function uninstallShareHook(): void {
     uninstallGoLiveHijack();
+    uninstallClickInterceptor();
     if (reassertTimer) {
         clearInterval(reassertTimer);
         reassertTimer = undefined;

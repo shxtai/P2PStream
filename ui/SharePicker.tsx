@@ -25,6 +25,17 @@ export interface PickerOptions {
     /** true — gdm вызвал Discord (есть смысл в «Обычном стриме Discord»);
      *  false — вызов из плагина (/p2p-start): Discord-кнопка скрыта */
     fromDiscord?: boolean;
+    /** Пользователь выбрал «Обычный стрим Discord», но пикер открыт НЕ из gdm-цепочки
+     *  (перехват клика по стоковой кнопке) — вместо резолва потока отдаём управление
+     *  наружу (пропускаем один клик в Discord, чтобы он открыл свой пикер). */
+    onWantDiscordPicker?: () => void;
+}
+
+let openPickerCount = 0;
+
+/** Пикер уже открыт? (чтобы клик по стоковой кнопке не наслоял модалок) */
+export function isPickerOpen(): boolean {
+    return openPickerCount > 0;
 }
 
 /**
@@ -51,6 +62,11 @@ export function openSharePicker(options: PickerOptions): Promise<MediaStream> {
             reject(notAllowed());
         };
 
+        openPickerCount++;
+        const settleAndCloseCount = () => {
+            openPickerCount = Math.max(0, openPickerCount - 1);
+        };
+
         const key = openModal(
             props => (
                 <SharePickerModal
@@ -65,7 +81,10 @@ export function openSharePicker(options: PickerOptions): Promise<MediaStream> {
                     fail();
                     closeModal(key);
                 },
-                onCloseCallback: () => { fail(); }
+                onCloseCallback: () => {
+                    fail();
+                    settleAndCloseCount();
+                }
             }
         );
     });
@@ -260,6 +279,13 @@ function SharePickerModal({
         if (busy) return;
         setBusy(true);
         try {
+            // Пикер открыт перехватом стоковой кнопки: отдаём ход Discord —
+            // он откроет свой пикер и запустит обычный стрим сам
+            if (options.onWantDiscordPicker) {
+                modalProps.onClose();
+                options.onWantDiscordPicker();
+                return;
+            }
             // Нативный захват уже есть — отдаём его Discord'у, лишний пикер не показываем
             if (preview && !previewIsGdm) {
                 const s = preview;

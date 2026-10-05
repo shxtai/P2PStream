@@ -765,6 +765,9 @@ export class P2PManager {
     private lastQuerySent = 0;
     private lastQueryReply = 0;
     private signalingWarned = false;
+    private lastVoiceJoinAt = 0;
+    private lastVoiceChannelId: string | null = null;
+    private lastDiscoveryRequestAt = 0;
 
     // region подписка для React
     subscribe = (fn: () => void): (() => void) => {
@@ -786,16 +789,20 @@ export class P2PManager {
             pruneFragments();
             this.pruneLiveHosts();
         }, 5000);
-        // discovery-пинги: если анонс пропущен (зашли в канал позже хоста, ретрай),
-        // спрашиваем канат «есть эфиры?» — хост отвечает анонсом. Джиттер против
-        // синхронного спама от всех клиентов.
+        // discovery-пинг «есть эфиры?» шлём ТОЛЬКО по событию, а не по таймеру:
+        //  - сразу после входа в голосовой канал (анонс мог быть пропущен);
+        //  - при явном запросе (команда /p2p-watch, открытие окна просмотра).
+        // Пока просто сидишь в канале — никаких служебных сообщений не уходит.
         this.discoverTimer = setInterval(() => {
             if (this.host || this.liveHosts.size > 0) return;
             if (settings.store.discoverPings === false) return;
             const voice = currentVoiceChannelId();
             if (!voice) return;
             const now = Date.now();
-            if (now - this.lastQuerySent < 11_000) return;
+            const recentJoin = now - this.lastVoiceJoinAt < 9_000;
+            const recentRequest = now - this.lastDiscoveryRequestAt < 7_000;
+            if (!recentJoin && !recentRequest) return;
+            if (now - this.lastQuerySent < 8_000) return;
             this.lastQuerySent = now;
             setTimeout(() => {
                 if (this.host || this.liveHosts.size > 0) return;
@@ -803,8 +810,62 @@ export class P2PManager {
                 if (!v) return;
                 sendSignals(v, { v: 1, t: "query", s: "*", from: myId() });
             }, (myId().charCodeAt(0) % 5) * 700);
-        }, 13_000);
+        }, 3_000);
         logger.info("P2P-движок запущен");
+    }
+
+    /** Вызывается из flux VOICE_STATE_UPDATES: фиксируем момент входа в голосовой канал */
+    onVoiceStateUpdate(): void {
+        // читаем SelectedChannelStore ПОСЛЕ того, как сторы обработают диспетч — иначе увидим старый канал
+        setTimeout(() => {
+            try {
+                const voice = currentVoiceChannelId();
+                if (voice && voice !== this.lastVoiceChannelId) {
+                    this.lastVoiceJoinAt = Date.now();
+                }
+                this.lastVoiceChannelId = voice;
+            } catch { /* ignore */ }
+        }, 0);
+    }
+
+    /** Явный запрос discovery (команда /p2p-watch, открытие окна просмотра) */
+    requestDiscovery(): void {
+        this.lastDiscoveryRequestAt = Date.now();
+    }
+
+    /**
+     * Полный сценарий «подключиться к эфиру в моём голосовом канале»:
+     * если локально эфиров не знаем — шлём query и даём хосту ~3.5 с ответить,
+     * и только потом честно сообщаем, что эфиров нет (с подсказкой про обычные
+     * Discord-стримы, если они есть).
+     */
+    async watchInVoice(): Promise<void> {
+        this.requestDiscovery();
+        let list = [...this.liveHosts.values()];
+        if (list.length === 0) {
+            const voice = currentVoiceChannelId();
+            if (!voice) {
+                toast("Сначала подключитесь к голосовому каналу", "critical");
+                return;
+            }
+            sendSignals(voice, { v: 1, t: "query", s: "*", from: myId() });
+            await new Promise(r => setTimeout(r, 3500));
+            list = [...this.liveHosts.values()];
+        }
+        if (list.length === 1) {
+            this.watch(list[0].streamId);
+            return;
+        }
+        if (list.length > 1) {
+            toast(`Несколько эфиров (${list.map(h => h.name).join(", ")}) — выберите пилюлю внизу экрана`);
+            return;
+        }
+        const native = this.nativeStreamsInVoice();
+        if (native.length > 0) {
+            toast(`P2P-эфиров нет, но ${native.map(n => n.name).join(", ")} стримит через обычный Discord — смотрите плиткой в звонке`);
+        } else {
+            toast("Активных P2P-эфиров в канале нет");
+        }
     }
 
     shutdown(): void {
@@ -1114,9 +1175,17 @@ export class P2PManager {
         return false;
     }
 
-    /** Обработчик MESSAGE_CREATE (регистрируется через flux-хендлер плагина) */
-    onMessageCreate = (msg: any): void => {
+    /**
+     * Обработчик MESSAGE_CREATE (регистрируется через flux-хендлер плагина).
+     * ВАЖНО: flux-хендлер Vencord получает ВЕСЬ payload диспетчера, а само
+     * сообщение лежит в payload.message (так же его читают плагины Vencord,
+     * например xsOverlay: MESSAGE_CREATE({ message, optimistic })).
+     * Раньше мы читали content прямо с payload — всегда undefined, из-за чего
+     * не работали НИ чистка своих сигналов, НИ распознавание чужих анонсов.
+     */
+    onMessageCreate = (payload: any): void => {
         try {
+            const msg = payload?.message ?? payload;
             if (!msg || !isSignalContent(msg.content)) return;
 
             const me = myId();
@@ -1146,6 +1215,27 @@ export class P2PManager {
             return !!ApplicationStreamingStore.getStreamForUser?.(userId);
         } catch {
             return false;
+        }
+    }
+
+    /** Обычные (нативные) Discord-стримы в текущем голосовом канале — для подсказок в UI */
+    nativeStreamsInVoice(): Array<{ userId: string; name: string }> {
+        const voice = currentVoiceChannelId();
+        if (!voice) return [];
+        try {
+            const all: any[] = (ApplicationStreamingStore as any).getAllActiveStreams?.() ?? [];
+            const out: Array<{ userId: string; name: string }> = [];
+            for (const st of all) {
+                try {
+                    if (String(st?.channelId ?? st?.channel_id ?? "") !== voice) continue;
+                    const uid = String(st?.userId ?? st?.ownerId ?? "");
+                    if (!uid || uid === myId()) continue;
+                    out.push({ userId: uid, name: userNameSafe(uid) });
+                } catch { /* ignore */ }
+            }
+            return out;
+        } catch {
+            return [];
         }
     }
     // endregion

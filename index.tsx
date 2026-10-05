@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import { MessageActions, SelectedChannelStore } from "@webpack/common";
 
 import { manager } from "./engine";
-import { installShareHook, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
+import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
 import { signalingHealth } from "./signaling";
@@ -34,6 +34,7 @@ function collectDiagnostics(): string[] {
     push("режим кнопки стрима", settings.store.goliveMode);
     push("getDisplayMedia перехвачен", isShareHookInstalled());
     push("стоковая кнопка (Go Live → P2P)", isGoLiveHijackInstalled());
+    push("клик по кнопке «Стримить» → наш пикер", isClickInterceptorInstalled());
 
     const helpers = (globalThis as any).VencordNative?.pluginHelpers?.P2PStream;
     push("native-каналы (getSources/звук)", helpers ? Object.keys(helpers).join(", ") : "НЕТ — плагин без native-части (однофайловая сборка?)");
@@ -104,16 +105,8 @@ export default definePlugin({
             description: "Подключиться к P2P-эфиру в этом голосовом канале",
             inputType: ApplicationCommandInputType.BUILT_IN,
             execute: () => {
-                const list = [...manager.liveHosts.values()];
-                if (list.length === 0) {
-                    toast("Активных P2P-эфиров в канале нет");
-                    return;
-                }
-                if (list.length === 1) {
-                    manager.watch(list[0].streamId);
-                    return;
-                }
-                toast(`Несколько эфиров (${list.map(h => h.name).join(", ")}) — выберите пилюлю внизу экрана`);
+                // если локально эфиров не знаем — спросит канал (query) и подождёт ответ хоста
+                void manager.watchInVoice();
             }
         },
         {
@@ -129,8 +122,8 @@ export default definePlugin({
     ],
 
     flux: {
-        MESSAGE_CREATE: (msg: any) => manager.onMessageCreate(msg),
-        VOICE_STATE_UPDATES: () => manager.bump()
+        MESSAGE_CREATE: (payload: any) => manager.onMessageCreate(payload),
+        VOICE_STATE_UPDATES: () => manager.onVoiceStateUpdate()
     },
 
     patches: [
