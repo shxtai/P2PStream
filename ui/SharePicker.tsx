@@ -19,6 +19,9 @@ export interface PickerOptions {
     discordOptions: DisplayMediaStreamOptions;
     /** Оригинальный (нетронутый) getDisplayMedia для обычного стрима и веб-фолбэка */
     gdm: (opts: DisplayMediaStreamOptions) => Promise<MediaStream>;
+    /** true — gdm вызвал Discord (есть смысл в «Обычном стриме Discord»);
+     *  false — вызов из плагина (/p2p-start): Discord-кнопка скрыта */
+    fromDiscord?: boolean;
 }
 
 /**
@@ -143,7 +146,8 @@ function SharePickerModal({
     const captureOpts = () => ({
         fps: Number(settings.store.fps) || 60,
         height: String(settings.store.resolution) === "native" ? null : Number(settings.store.resolution),
-        audio: settings.store.audioMode === "system"
+        // «native»: берём и системный loopback — он станет фолбэком, если нативный per-app звук не заведётся
+        audio: String(settings.store.audioMode) !== "off"
     });
 
     async function selectSource(src: P2PSourceInfo): Promise<void> {
@@ -156,11 +160,14 @@ function SharePickerModal({
         try {
             const stream = await captureDesktopSource(src.id, captureOpts());
             if (!stream) {
-                toast("Не удалось захватить источник", "critical");
-                setSelected(null);
+                // прямой захват не удался — честный путь через системный пикер (Vesktop)
+                toast("Прямой захват не удался — открываю системный пикер", "critical");
+                await pickSourceWeb();
                 return;
             }
-            setAudioWarn(settings.store.audioMode === "system" && stream.getAudioTracks().length === 0);
+            setAudioWarn(
+                String(settings.store.audioMode) !== "off" && stream.getAudioTracks().length === 0
+            );
             setPreviewIsGdm(false);
             setPreview(stream);
 
@@ -183,14 +190,18 @@ function SharePickerModal({
             if (res !== "native") video.height = Number(res);
             const stream = await gdm({
                 video,
-                audio: settings.store.audioMode === "system" ? { restrictOwnAudio: true } as MediaTrackConstraints : false,
+                audio: String(settings.store.audioMode) !== "off"
+                    ? { restrictOwnAudio: true } as MediaTrackConstraints
+                    : false,
                 systemAudio: "include",
                 surfaceSwitching: "include",
                 selfBrowserSurface: "exclude",
                 monitorTypeSurfaces: "include"
             } as DisplayMediaStreamOptions);
             stopPreview(preview);
-            setAudioWarn(settings.store.audioMode === "system" && stream.getAudioTracks().length === 0);
+            setAudioWarn(
+                String(settings.store.audioMode) !== "off" && stream.getAudioTracks().length === 0
+            );
             setPreviewIsGdm(true);
             setPreview(stream);
             setSelected({ id: "", name: stream.getVideoTracks()[0]?.label || "Источник", thumb: null, isScreen: false });
@@ -222,10 +233,13 @@ function SharePickerModal({
             const track = preview.getVideoTracks()[0];
             if (track) await liveApplyTrackConstraints(track);
             modalProps.onClose();
-            // владение потоком передаётся движку; локальную ссылку не гасим
+            // владение потоком передаётся движку; локальную ссылку не гасим.
+            // Для gdm-источника selected фиктивный (id "") — передаём null:
+            // нативный звук пойдёт как «система без Discord»
+            const src = previewIsGdm ? null : selected;
             setPreview(null);
             setSelected(null);
-            await manager.startShareWithCapture(preview);
+            await manager.startShareWithCapture(preview, src);
             onCancel(); // Discord'у сообщаем «отмену захвата» — его Go Live не стартует
         } finally {
             setBusy(false);
@@ -329,7 +343,7 @@ function SharePickerModal({
                         )}
                         {audioWarn && (
                             <span className={cl("picker-hint")}>
-                                Системный звук недоступен для этого источника — стрим пойдёт без звука
+                                Системный звук недоступен для этого источника — если и нативный звук не заработает, эфир пойдёт без звука
                             </span>
                         )}
                     </>
@@ -368,9 +382,18 @@ function SharePickerModal({
                 <div className={cl("picker-row")}>
                     <FormSwitch
                         title="Звук трансляции"
-                        description="Системный звук; звук самого Discord в эфир не попадает"
-                        value={settings.store.audioMode === "system"}
-                        onChange={(v: boolean) => { settings.store.audioMode = v ? "system" : "off"; force(); }}
+                        description={
+                            settings.store.audioMode === "off"
+                                ? "Звук отключён"
+                                : settings.store.audioMode === "native"
+                                    ? "Умный звук (Windows): окно — звук только этого приложения; экран — вся система, кроме Discord"
+                                    : "Системный звук; звук самого Discord в эфир не попадает"
+                        }
+                        value={String(settings.store.audioMode) !== "off"}
+                        onChange={(v: boolean) => {
+                            settings.store.audioMode = v ? "native" : "off";
+                            force();
+                        }}
                         hideBorder={false}
                     />
                 </div>
@@ -415,14 +438,16 @@ function SharePickerModal({
                 </span>
 
                 <div className={cl("picker-footer")}>
-                    <Button
-                        size={Button.Sizes?.MEDIUM ?? "medium"}
-                        color={Button.Colors?.PRIMARY ?? "brand"}
-                        disabled={busy}
-                        onClick={() => void startDefaultStream()}
-                    >
-                        Обычный стрим Discord
-                    </Button>
+                    {options.fromDiscord !== false && (
+                        <Button
+                            size={Button.Sizes?.MEDIUM ?? "medium"}
+                            color={Button.Colors?.PRIMARY ?? "brand"}
+                            disabled={busy}
+                            onClick={() => void startDefaultStream()}
+                        >
+                            Обычный стрим Discord
+                        </Button>
+                    )}
                     <Button
                         size={Button.Sizes?.LARGE ?? "large"}
                         color={Button.Colors?.GREEN ?? "green"}

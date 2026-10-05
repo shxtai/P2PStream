@@ -39,19 +39,20 @@ function makeWrapper(): (opts: DisplayMediaStreamOptions) => Promise<MediaStream
         }
         try {
             const me = UserStore.getCurrentUser()?.id ?? "";
-            if (manager.hasDiscordStream(me)) {
-                toast("Сначала остановите Discord-стрим", "critical");
-                throw notAllowedError();
-            }
             if (manager.host) {
                 toast("P2P-эфир уже идёт — панель остановки внизу экрана", "critical");
                 throw notAllowedError();
             }
-            // Свой пикер: резолвится потоком для «обычного стрима»,
-            // кидает NotAllowedError при отмене и после старта P2P.
+            if (manager.hasDiscordStream(me)) {
+                toast("Сначала остановите Discord-стрим", "critical");
+                throw notAllowedError();
+            }
+            // Свой пикер: резолвится потоком для «обычного стрима» (только когда
+            // gdm вызвал сам Discord), кидает NotAllowedError при отмене и после старта P2P.
             const stream = await openSharePicker({
                 discordOptions: opts,
-                gdm: realGetDisplayMedia
+                gdm: realGetDisplayMedia,
+                fromDiscord: !manager.internalGdmCall
             });
             return stream;
         } catch (e) {

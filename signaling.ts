@@ -171,19 +171,80 @@ export function sendSignals(channelId: string, sig: Signal, onSent?: (messageId:
         try {
             const contents = await encodeSignal(sig);
             for (const content of contents) {
-                const ok = MessageActions.sendMessage(channelId, {
-                    content,
-                    tts: false,
-                    allowedMentions: { parse: [] }
-                } as any);
-                // локальное эхо: попробуем поймать id через return-значение (не гарантируется)
-                void ok;
+                sendMessageSafe(channelId, content);
             }
         } catch (e) {
             logger.error("Ошибка отправки сигнала:", e);
         }
     })();
 }
+
+/** Числовой nonce в духе Discord (произвольная строка, сервер возвращает её в эхе) */
+function makeNonce(): string {
+    let s = String(Date.now());
+    while (s.length < 18) s += Math.floor(Math.random() * 10);
+    return s;
+}
+
+/**
+ * Отправка одного сообщения.
+ *
+ * ВАЖНО: в свежих сборках Discord сигнатура
+ *   sendMessage(channelId, message, createLocally, options)
+ * — nonce и allowedMentions живут в options (4-й аргумент). Вызов с двумя
+ * аргументами падает с «TypeError: Cannot read properties of undefined
+ * (reading 'nonce')» внутри Discord. Для совместимости со старыми сборками
+ * дублируем nonce в message — лишние аргументы/поля старые версии игнорируют.
+ */
+function sendMessageSafe(channelId: string, content: string): void {
+    try {
+        const nonce = makeNonce();
+        const res = (MessageActions as any).sendMessage(
+            channelId,
+            { content, tts: false, nonce },
+            true,
+            { nonce, allowedMentions: { parse: [] } }
+        );
+        if (res && typeof res.catch === "function") {
+            res.catch((e: any) => logger.debug("sendMessage отклонён:", e?.message ?? e));
+        }
+    } catch (e) {
+        logger.error("sendMessage не удался:", e);
+    }
+}
+
+// region самоуничтожение собственных сигналов
+/** nonce -> все известные id сообщения (локальное эхо + сообщение из шлюза) */
+const ownEchoes = new Map<string, { channelId: string; ids: Set<string>; done: boolean }>();
+
+/**
+ * Учесть собственное служебное сообщение для удаления через SELF_DESTRUCT_MS.
+ * Локальное эхо и сообщение из шлюза имеют разные id, но один nonce —
+ * собираем оба и удаляем оба (иначе в чате остаётся «хвост»).
+ */
+export function handleOwnEcho(msg: { id?: string; channel_id?: string; nonce?: string }): void {
+    if (!msg?.id || !msg.channel_id) return;
+    const key = msg.nonce ? `n:${msg.nonce}` : `i:${msg.id}`;
+    let entry = ownEchoes.get(key);
+    if (!entry) {
+        entry = { channelId: msg.channel_id, ids: new Set(), done: false };
+        ownEchoes.set(key, entry);
+        setTimeout(() => {
+            entry!.done = true;
+            flushEcho(entry!);
+        }, SELF_DESTRUCT_MS + 400);
+        setTimeout(() => ownEchoes.delete(key), 20_000);
+    }
+    entry.ids.add(msg.id);
+    if (entry.done) flushEcho(entry); // позднее эхо — удаляем сразу
+}
+
+function flushEcho(entry: { channelId: string; ids: Set<string> }): void {
+    for (const id of entry.ids) {
+        deleteSignalMessage(entry.channelId, id);
+    }
+}
+// endregion
 
 /** Удалить сообщение (используется для самоуничтожения служебных сообщений) */
 export function deleteSignalMessage(channelId: string, messageId: string): void {

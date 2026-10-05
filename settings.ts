@@ -11,7 +11,7 @@ export type GoliveMode = "p2p" | "boost" | "off";
 export type Profile = "games" | "movies" | "manual";
 export type Codec = "auto" | "h264" | "vp9" | "av1";
 export type ContentHint = "motion" | "detail";
-export type AudioMode = "system" | "off";
+export type AudioMode = "native" | "system" | "off";
 
 /** Обработчик переключения «нативных плиток» (регистрируется в nativeTiles, чтобы избежать цикла импортов) */
 export let onNativeTilesChange: ((enabled: boolean) => void) | null = null;
@@ -115,9 +115,10 @@ export const settings = definePluginSettings({
     },
     audioMode: {
         type: OptionType.SELECT,
-        description: "Звук трансляции: системный loopback (звук самого Discord в эфир не попадает) или без звука",
+        description: "Звук трансляции. «Умный» (Windows 10 2004+): окно — звук только этого приложения; экран — вся система без Discord. Недоступен — автоматически системный",
         options: [
-            { label: "Системный звук (без Discord)", value: "system", default: true },
+            { label: "Умный: звук приложения / система без Discord", value: "native", default: true },
+            { label: "Системный звук всегда", value: "system" },
             { label: "Без звука", value: "off" },
         ] as const
     },

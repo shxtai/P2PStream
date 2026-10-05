@@ -34,7 +34,7 @@ function migrateLegacyAudio(): void {
 
 export default definePlugin({
     name: "P2PStream",
-    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Нативный пикер с выбором P2P/обычного стрима, плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя.",
+    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Свой пикер с выбором P2P/обычного стрима, умный звук приложения (WASAPI Process Loopback — как у Discord: окно → звук приложения, экран → система без Discord), плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя.",
     searchTerms: ["p2p", "stream", "quality", "bitrate", "webrtc", "golive", "стрим", "качество"],
     tags: ["Voice", "Media", "Utility"],
     authors: [{ name: "Super Z", id: 0n }],
@@ -129,6 +129,16 @@ export default definePlugin({
         manager.onWatchCreated = session => openViewerModal(session);
         migrateLegacyAudio();
 
+        // v1.4: старый дефолт «system» -> новый дефолт «native» (умный звук).
+        // Один раз: флаг audioModeMigrated14 не даёт перекрыть явный выбор пользователя.
+        try {
+            const s = settings.store as any;
+            if (!s.audioModeMigrated14) {
+                if (s.audioMode === "system") s.audioMode = "native";
+                s.audioModeMigrated14 = true;
+            }
+        } catch { /* ignore */ }
+
         if (settings.store.nativeTiles) installNativeTiles();
 
         this.unmountBars = mountBars();
@@ -138,7 +148,7 @@ export default definePlugin({
         // устойчив к переименованиям модулей Discord).
         installShareHook();
 
-        logger.info("Плагин запущен");
+        logger.info("P2PStream v1.4 запущен (пикер v2 + нативный звук)");
     },
 
     stop() {

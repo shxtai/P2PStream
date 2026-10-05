@@ -10,15 +10,17 @@ import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStor
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     deleteSignalMessage,
+    handleOwnEcho,
     isSignalContent,
     parseSignals,
     pruneFragments,
-    SELF_DESTRUCT_MS,
     sendSignals,
     setCleanupEnabledGetter,
     type Signal
 } from "./signaling";
+import { startNativeAudio, type NativeAudioHandle } from "./nativeAudio";
 import { myId, randomId, toast } from "./utils";
+import type { P2PSourceInfo } from "./capture";
 
 const logger = new Logger("P2PStream:Engine");
 
@@ -177,9 +179,14 @@ export function buildDisplayConstraints(): DisplayMediaStreamOptions {
     const video: MediaTrackConstraints = { frameRate: fps };
     if (res !== "native") video.height = Number(res);
 
-    const audio = settings.store.audioMode === "system"
-        ? { restrictOwnAudio: true } as MediaTrackConstraints
-        : false;
+    // «native»: просим и системный звук — он станет фолбэком, если нативный
+    // per-app звук недоступен; движок заменит его при успехе
+    const mode = String(settings.store.audioMode);
+    const audio = mode === "off"
+        ? false
+        : mode === "system"
+            ? { restrictOwnAudio: true } as MediaTrackConstraints
+            : true;
 
     return {
         video,
@@ -470,6 +477,8 @@ class HostPeer {
 export class HostSession {
     readonly streamId: string;
     readonly peers = new Map<string, HostPeer>();
+    /** Нативный аудио-хелпер (v1.4): хранится здесь, чтобы stop() всё закрыл */
+    nativeAudio: NativeAudioHandle | null = null;
 
     constructor(
         readonly mgr: P2PManager,
@@ -553,6 +562,8 @@ export class HostSession {
         for (const track of this.capture.getTracks()) {
             try { track.stop(); } catch { /* ignore */ }
         }
+        this.nativeAudio?.stop();
+        this.nativeAudio = null;
     }
 }
 // endregion
@@ -735,6 +746,10 @@ export class P2PManager {
     readonly watches = new Map<string, WatchSession>();
     readonly liveHosts = new Map<string, LiveHost>();
 
+    /** true пока startShare() сам ждёт gdm — пикер в этом случае не показывает
+     *  кнопку «Обычный стрим Discord» (Discord своей поток не ждёт) */
+    internalGdmCall = false;
+
     version = 0;
     /** вызывается UI-слоем: открывает окно просмотра для новой сессии */
     onWatchCreated: ((session: WatchSession) => void) | null = null;
@@ -808,8 +823,10 @@ export class P2PManager {
         return true;
     }
 
-    /** Старт эфира из собственного пикера (источник уже захвачен) */
-    async startShareWithCapture(capture: MediaStream): Promise<void> {
+    /** Старт эфира из собственного пикера (источник уже захвачен).
+     *  source: выбранный источник пикера (null — неизвестен/весь экран:
+     *  нативный звук пойдёт как «система без Discord»). */
+    async startShareWithCapture(capture: MediaStream, source: P2PSourceInfo | null = null): Promise<void> {
         if (!this.checkCanStart()) {
             for (const t of capture.getTracks()) {
                 try { t.stop(); } catch { /* ignore */ }
@@ -829,7 +846,35 @@ export class P2PManager {
         } catch { /* ignore */ }
         void applyCaptureConstraints(video);
 
+        // region звук (v1.4: нативный per-app с фолбэком на системный loopback)
+        const sysAudio = capture.getAudioTracks()[0] ?? null;
+        let nativeAudioHandle: NativeAudioHandle | null = null;
+        if (String(settings.store.audioMode) === "off") {
+            if (sysAudio) {
+                try { sysAudio.stop(); } catch { /* ignore */ }
+                capture.removeTrack(sysAudio);
+            }
+        } else if (String(settings.store.audioMode) === "native") {
+            nativeAudioHandle = await startNativeAudio({
+                mode: source && !source.isScreen ? "include-window" : "exclude-tree",
+                sourceId: source?.id
+            });
+            if (nativeAudioHandle) {
+                // системный loopback больше не нужен — в эфире только звук приложения/системы без Discord
+                if (sysAudio) {
+                    try { sysAudio.stop(); } catch { /* ignore */ }
+                    capture.removeTrack(sysAudio);
+                }
+                try { capture.addTrack(nativeAudioHandle.track); } catch { /* ignore */ }
+            } else if (!sysAudio) {
+                toast("Нативный звук недоступен — эфир пойдёт без звука", "critical");
+            }
+            // если native недоступен, а sysAudio есть — прозрачно работаем как раньше (system)
+        }
+        // endregion
+
         this.host = new HostSession(this, currentVoiceChannelId()!, capture);
+        this.host.nativeAudio = nativeAudioHandle;
         this.startHeartbeat();
         this.bump();
 
@@ -853,7 +898,12 @@ export class P2PManager {
         const constraints = buildDisplayConstraints();
         let capture: MediaStream;
         try {
-            capture = await gdm.call(navigator.mediaDevices, constraints);
+            this.internalGdmCall = true;
+            try {
+                capture = await gdm.call(navigator.mediaDevices, constraints);
+            } finally {
+                this.internalGdmCall = false;
+            }
         } catch (e: any) {
             const name = e?.name ?? "";
             if (name === "NotAllowedError") return; // пользователь отменил — молча
@@ -866,7 +916,7 @@ export class P2PManager {
             return;
         }
 
-        await this.startShareWithCapture(capture);
+        await this.startShareWithCapture(capture, null);
     }
 
     stopShare(sendBye = true): void {
@@ -1020,10 +1070,8 @@ export class P2PManager {
 
             const me = myId();
             if (msg.author?.id === me) {
-                // своё эхо: самоуничтожение
-                if (settings.store.autoDeleteSignals && msg.channel_id && msg.id) {
-                    setTimeout(() => deleteSignalMessage(msg.channel_id, msg.id), SELF_DESTRUCT_MS);
-                }
+                // своё эхо: собираем id (локальное эхо + шлюз) и удаляем оба
+                if (settings.store.autoDeleteSignals) handleOwnEcho(msg);
                 return;
             }
 
