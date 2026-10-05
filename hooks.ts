@@ -113,10 +113,14 @@ let bypassSetAt = 0;
 
 /** Достать Electron source id ("screen:0:0" / "window:pid:id") из полезной нагрузки экшена */
 function resolveGoLiveSourceId(payload: any): string | null {
-    const candidates = [payload, payload?.source, payload?.goLiveSource, payload?.options];
+    // новые сборки Discord: { settings: { desktopSettings: { sourceId, sound }, qualityOptions } }
+    const candidates = [
+        payload, payload?.source, payload?.goLiveSource, payload?.options,
+        payload?.settings, payload?.settings?.desktopSettings
+    ];
     for (const c of candidates) {
-        const id = c?.desktopSource?.id ?? (typeof c?.id === "string" ? c.id : null);
-        if (typeof id === "string" && id) return id;
+        const id = c?.desktopSource?.id ?? c?.sourceId ?? (typeof c?.id === "string" ? c.id : null);
+        if (typeof id === "string" && /^(screen|window):/.test(id)) return id;
     }
     return null;
 }
@@ -142,7 +146,7 @@ async function startP2PFromDiscordSource(sourceId: string, payload: any): Promis
     // уважим качество, выбранное в стоковом пикере
     // (только значения, которые есть в настройках: Discord шлёт resolution 0 = «источник»
     // и FPS вроде 5/15 — раньше они записывались как есть и ломали селекты/захват)
-    const quality = payload?.quality ?? payload?.source?.quality;
+    const quality = payload?.quality ?? payload?.source?.quality ?? payload?.settings?.qualityOptions;
     try {
         const fps = Number(quality?.frameRate);
         if ([30, 48, 60, 72, 90, 120, 144, 240].includes(fps)) (settings.store as any).fps = String(fps);
@@ -181,6 +185,9 @@ function goLiveInterceptorImpl(payload: any): boolean | void {
     if (!payload || payload.type !== GO_LIVE_SOURCE_ACTION) return;
     if (String(settings.store.goliveMode) !== "p2p") return;
     if ((payload as any)?.[FALLBACK_FLAG]) return;
+    // settings: null — это ОСТАНОВКА Go Live (кнопка «Остановить стрим»), а не старт:
+    // раньше перехватчик ловил её и писал «не понял источник — запускаю обычный стрим»
+    if (payload.settings === null || (!resolveGoLiveSourceId(payload) && !payload.source && !payload.settings)) return;
     // «Обычный стрим Discord» выбран в нашем пикере — пропускаем экшен в Discord
     if (bypassToDiscordOnce) {
         bypassToDiscordOnce = false;

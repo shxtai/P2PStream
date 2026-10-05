@@ -4,13 +4,35 @@ import { settings } from "@p2p/settings";
 
 import { fluxHandlers, ME } from "./stubs/common.js";
 
-const role = new URLSearchParams(location.search).get("role");
+const q = new URLSearchParams(location.search);
+const role = q.get("role");
+const relay = q.get("relay");
 settings.store.audioMode = "off"; // нативного хелпера в браузере нет
+if (relay) {
+    if (role === "host") {
+        // TURN есть только у хоста — зритель должен получить его в оффере
+        settings.store.turnUrl = relay;
+        settings.store.turnUser = "devtest";
+        settings.store.turnPassword = "devtest";
+    } else {
+        settings.store.relayOnly = true; // прямые пути запрещены
+    }
+}
 
 fluxHandlers.push(manager.onMessageCreate);
 manager.start();
 
 function status(text) { parent.postMessage({ kind: "status", from: ME, text }, "*"); }
+
+/** тип выбранной пары кандидатов: host / srflx / relay */
+async function pathOf(pc) {
+    try {
+        const r = await pc.getStats();
+        let pair = null;
+        r.forEach(s => { if (s.type === "transport" && s.selectedCandidatePairId) pair = r.get(s.selectedCandidatePairId); });
+        return pair ? `${r.get(pair.localCandidateId)?.candidateType}↔${r.get(pair.remoteCandidateId)?.candidateType}` : "?";
+    } catch { return "?"; }
+}
 
 if (role === "host") {
     // «экран» хоста — анимированный canvas
@@ -39,7 +61,8 @@ if (role === "host") {
             }
             if (w.state === "live" && video.videoWidth > 0 && video.currentTime > 1) {
                 clearInterval(tick);
-                status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${((Date.now() - t0) / 1000).toFixed(1)} с`);
+                const secs = ((Date.now() - t0) / 1000).toFixed(1);
+                void pathOf(w.pc).then(p => status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${secs} с, путь ${p}`));
                 return;
             }
         }

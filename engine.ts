@@ -105,7 +105,88 @@ export function currentMeta(): StreamMeta {
 
 // region RTC helpers
 
-function buildRtcConfig(): RTCConfiguration {
+// region ретранслятор (TURN)
+/** Учётки Cloudflare TURN (временные, ~24 ч) — получает хост, зрителю приходят в оффере */
+let relayCache: { servers: RTCIceServer[]; exp: number; } | null = null;
+let relayError: string | null = null;
+let relayInflight: Promise<RTCIceServer[]> | null = null;
+
+/** Привести ответ Cloudflare к RTCIceServer[]: только TURN (с учёткой), без порта 53
+ *  (его режут браузеры — Cloudflare сам советует выкидывать) */
+function normalizeIce(raw: unknown): RTCIceServer[] {
+    const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    const out: RTCIceServer[] = [];
+    for (const s of list as any[]) {
+        if (!s?.username || !s?.credential) continue;
+        const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u: unknown) =>
+            typeof u === "string" && /^turns?:/.test(u) && !/:53(\?|$)/.test(u));
+        if (urls.length) out.push({ urls, username: String(s.username), credential: String(s.credential) });
+    }
+    return out;
+}
+
+/** Получить/обновить учётки TURN (хост). Пустой массив — TURN не настроен или недоступен. */
+export function ensureRelayServers(): Promise<RTCIceServer[]> {
+    const keyId = String(settings.store.cfTurnKeyId ?? "").trim();
+    const token = String(settings.store.cfTurnToken ?? "").trim();
+    if (!keyId || !token) { relayCache = null; return Promise.resolve([]); }
+    if (relayCache && relayCache.exp - Date.now() > 30 * 60_000) return Promise.resolve(relayCache.servers);
+    if (relayInflight) return relayInflight;
+    relayInflight = (async () => {
+        try {
+            const helpers = (globalThis as any).VencordNative?.pluginHelpers?.P2PStream;
+            let res: { ok: boolean; iceServers?: unknown; error?: string; };
+            if (helpers?.cfTurnIce) {
+                res = await helpers.cfTurnIce(keyId, token);
+            } else {
+                // без native-части — из рендерера (может упереться в CSP Discord)
+                const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`, {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+                    body: JSON.stringify({ ttl: 86400 })
+                });
+                res = r.ok ? { ok: true, iceServers: (await r.json())?.iceServers } : { ok: false, error: `HTTP ${r.status}` };
+            }
+            const servers = res.ok ? normalizeIce(res.iceServers) : [];
+            if (!servers.length) {
+                relayError = res.error ?? "Cloudflare не вернул TURN-серверы";
+                logger.warn("Cloudflare TURN недоступен:", relayError);
+                toast(`Cloudflare TURN: ${relayError}`, "critical");
+                return [];
+            }
+            relayError = null;
+            relayCache = { servers, exp: Date.now() + 23 * 3600_000 };
+            logger.info(`Cloudflare TURN: получено ${servers.length} сервер(а), действует ~24 ч`);
+            return servers;
+        } catch (e: any) {
+            relayError = String(e?.message ?? e);
+            logger.warn("Cloudflare TURN: ошибка запроса учёток:", relayError);
+            return [];
+        } finally {
+            relayInflight = null;
+        }
+    })();
+    return relayInflight;
+}
+
+/** Состояние TURN для /p2p-doctor */
+export function relayStatus(): string {
+    if (String(settings.store.turnUrl ?? "").trim()) return `свой: ${settings.store.turnUrl}`;
+    if (!String(settings.store.cfTurnKeyId ?? "").trim()) return "нет — если ICE failed между разными сетями, задайте Cloudflare TURN в настройках";
+    if (relayCache) return `Cloudflare: ${relayCache.servers.length} сервер(а), учётки до ${new Date(relayCache.exp).toLocaleTimeString()}`;
+    return `Cloudflare: учёток нет${relayError ? ` (${relayError})` : " (ещё не запрашивались)"}`;
+}
+
+/** TURN-серверы, которыми хост делится со зрителем (в зашифрованном оффере) */
+function sharedRelayServers(): RTCIceServer[] {
+    const out: RTCIceServer[] = [...(relayCache?.servers ?? [])];
+    const turnUrl = String(settings.store.turnUrl ?? "").trim();
+    if (turnUrl) out.push({ urls: turnUrl, username: String(settings.store.turnUser ?? ""), credential: String(settings.store.turnPassword ?? "") });
+    return out;
+}
+// endregion
+
+function buildRtcConfig(extra: RTCIceServer[] = []): RTCConfiguration {
     const iceServers: RTCIceServer[] = [];
     const stuns = String(settings.store.stunServers ?? "")
         .split(",")
@@ -129,8 +210,15 @@ function buildRtcConfig(): RTCConfiguration {
     // «400 TURN allocate error» на всех адресах (бесплатные учётки отключены).
     // Relay он не давал никогда, а сбор кандидатов из-за него висел 15+ с.
 
+    // (v1.13) Cloudflare TURN хоста + TURN, присланные хостом в оффере (у зрителя)
+    for (const s of [...(relayCache?.servers ?? []), ...extra]) {
+        const key = JSON.stringify(s.urls);
+        if (!iceServers.some(x => JSON.stringify(x.urls) === key)) iceServers.push(s);
+    }
+
     return {
         iceServers,
+        iceTransportPolicy: settings.store.relayOnly ? "relay" : "all",
         bundlePolicy: "max-bundle",
         // без пула: кандидаты (в т.ч. TURN-аллокации) не собираются заранее
         // впустую — сбор всё равно стартует с setLocalDescription
@@ -566,7 +654,9 @@ class HostPeer {
                     v: 1, t: "offer", s: this.host.streamId, from: myId(), to: this.userId,
                     pk: this.peerPk ?? undefined,
                     _route: this.host.mgr.routeFor(this.userId),
-                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates }
+                    // ice: TURN хоста — зрителю за симметричным NAT/фильтром провайдера
+                    // без них не собраться (ключи настраивает только стример)
+                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates, ice: sharedRelayServers() }
                 };
                 this.lastOffer = sig;
                 this.lastOfferAt = Date.now();
@@ -696,6 +786,7 @@ export class HostSession {
         }
 
         logger.info(`Зритель подключается: ${userId}`);
+        void ensureRelayServers(); // обновить учётки TURN, если истекают
         const peer = new HostPeer(this, userId);
         if (peerPk) peer.peerPk = peerPk;
         this.peers.set(userId, peer);
@@ -812,7 +903,7 @@ export class WatchSession {
         this.mgr.bump();
     }
 
-    async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }, hostPk?: string): Promise<void> {
+    async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[]; ice?: RTCIceServer[] }, hostPk?: string): Promise<void> {
         try {
             // шифруем answer/ice хосту только если его сторона распечатает:
             // старые хосты в чат-режиме ждут plain-d — шифрование их сломало бы
@@ -824,7 +915,7 @@ export class WatchSession {
                 logger.info(`Хост ${this.host.name} начал новую сессию — пересоздаю соединение`);
                 this.resetPc();
             }
-            if (!this.pc) this.setupPc();
+            if (!this.pc) this.setupPc(Array.isArray(d.ice) ? d.ice : []);
             const pc = this.pc!;
             this.stopJoinLoop();
             // оффер пришёл уже ПОСЛЕ таймаута ожидания: раньше сессия оставалась
@@ -908,8 +999,9 @@ export class WatchSession {
         this.setState("ended");
     }
 
-    private setupPc(): void {
-        const pc = new RTCPeerConnection(buildRtcConfig());
+    private setupPc(hostRelays: RTCIceServer[] = []): void {
+        if (hostRelays.length) logger.info(`Хост прислал TURN (${hostRelays.length}) — ретранслятор доступен, если прямой путь не пройдёт`);
+        const pc = new RTCPeerConnection(buildRtcConfig(hostRelays));
         this.pc = pc;
 
         pc.ondatachannel = e => {
@@ -1236,6 +1328,7 @@ export class P2PManager {
      *  нативный звук пойдёт как «система без Discord»). */
     async startShareWithCapture(capture: MediaStream, source: P2PSourceInfo | null = null): Promise<void> {
         brokerEnsure(); // зрители должны найти нас через брокер, не через чат
+        void ensureRelayServers(); // учётки TURN — заранее, к первому зрителю
         if (!this.checkCanStart()) {
             for (const t of capture.getTracks()) {
                 try { t.stop(); } catch { /* ignore */ }

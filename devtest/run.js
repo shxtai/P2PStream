@@ -18,9 +18,32 @@ const path = require("path");
 const esbuild = require("esbuild");
 
 const ROOT = path.resolve(__dirname, "..");
+/** «relay» в сценарии: поднимается локальный TURN, зритель ходит ТОЛЬКО через него */
 const SCENARIOS = process.argv.slice(2).length
     ? process.argv.slice(2)
-    : ["delay=300", "delay=800&loss=0.3", "delay=1000&loss=0.5"];
+    : ["delay=300", "delay=800&loss=0.3", "delay=1000&loss=0.5", "delay=300&relay"];
+
+function lanIp() {
+    for (const list of Object.values(os.networkInterfaces())) {
+        for (const a of list ?? []) if (a.family === "IPv4" && !a.internal) return a.address;
+    }
+    return null;
+}
+
+/** Локальный TURN (node-turn) для сценариев с relay */
+function startTurn(ip) {
+    const Turn = require("node-turn");
+    const server = new Turn({
+        authMech: "long-term",
+        credentials: { devtest: "devtest" },
+        listeningIps: [ip],
+        relayIps: [ip],
+        listeningPort: 3479,
+        debugLevel: "OFF"
+    });
+    server.start();
+    return server;
+}
 const VERBOSE = !!process.env.VERBOSE;
 
 function findChrome() {
@@ -109,10 +132,21 @@ async function runScenario(chromePath, query, port) {
     });
     let failed = 0;
     let port = 9400;
-    for (const q of SCENARIOS) {
+    for (const scenario of SCENARIOS) {
+        let q = scenario;
+        let turn = null;
+        if (/(^|&)relay(&|$)/.test(q)) {
+            const ip = lanIp();
+            if (!ip) { console.log(`✘ [${scenario}] нет LAN-адреса для TURN`); failed++; continue; }
+            turn = startTurn(ip);
+            q = q.replace(/(^|&)relay(?=&|$)/, `$1relay=${encodeURIComponent(`turn:${ip}:3479`)}`);
+        }
         const res = await runScenario(chromePath, q, port++);
-        if (!res.startsWith("OK")) failed++;
-        console.log(`${res.startsWith("OK") ? "✔" : "✘"} [${q}] ${res}`);
+        turn?.stop();
+        // в relay-сценарии успех засчитывается, только если путь реально через TURN
+        const ok = res.startsWith("OK") && (!turn || /relay/.test(res));
+        if (!ok) failed++;
+        console.log(`${ok ? "✔" : "✘"} [${scenario}] ${res}`);
     }
     process.exit(failed ? 1 : 0);
 })();

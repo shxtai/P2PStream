@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
 import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
-import { manager, probeNat } from "./engine";
+import { manager, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
@@ -60,9 +60,7 @@ function collectDiagnostics(): string[] {
     try {
         const stuns = String(settings.store.stunServers ?? "").split(",").map(s => s.trim()).filter(Boolean);
         push("STUN", stuns.join(", ") || "НЕТ — P2P между разными сетями не соберётся");
-        push("TURN", settings.store.turnUrl
-            ? String(settings.store.turnUrl)
-            : "нет (нужен, только если у обоих «плохой» NAT — см. строку NAT ниже)");
+        push("TURN", relayStatus());
     } catch { /* ignore */ }
     push("эфиров видно", manager.liveHosts.size);
     push("своих P2P-эфиров", manager.host ? 1 : 0);

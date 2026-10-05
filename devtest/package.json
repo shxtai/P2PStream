@@ -6,6 +6,7 @@
     "test": "node run.js"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "node-turn": "^0.0.6"
   }
 }

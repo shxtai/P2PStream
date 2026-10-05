@@ -805,6 +805,28 @@ export async function pullAudio(): Promise<Uint8Array | null> {
 export async function stopAudio(): Promise<void> {
     stopAudioInternal();
 }
+
+/**
+ * Временные учётные данные Cloudflare TURN. Запрос идёт из main-процесса:
+ * в рендерере Discord он упёрся бы в CSP (connect-src).
+ */
+export async function cfTurnIce(_e: IpcMainInvokeEvent, keyId: string, token: string): Promise<{ ok: boolean; iceServers?: unknown; error?: string; }> {
+    try {
+        const id = String(keyId ?? "").trim();
+        const tok = String(token ?? "").trim();
+        if (!id || !tok) return { ok: false, error: "не заданы Key ID / API token" };
+        const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(id)}/credentials/generate-ice-servers`, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${tok}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ ttl: 86400 })
+        });
+        const text = await res.text();
+        if (!res.ok) return { ok: false, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+        return { ok: true, iceServers: JSON.parse(text)?.iceServers };
+    } catch (e: any) {
+        return { ok: false, error: String(e?.message ?? e) };
+    }
+}
 // endregion
 
 // Распаковываем хелпер сразу при загрузке main-части: к моменту старта эфира

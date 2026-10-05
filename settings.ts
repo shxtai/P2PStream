@@ -195,6 +195,23 @@ export const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "TURN password",
         default: ""
+    },
+    cfTurnKeyId: {
+        type: OptionType.STRING,
+        description: "Cloudflare TURN — Key ID. Нужен, если прямое соединение не собирается (ICE failed): dash.cloudflare.com → Realtime → TURN Server → Create. Бесплатно до 1000 ГБ/мес. Достаточно ТОЛЬКО у стримера — зрителям ключи передаются сами (в зашифрованном оффере)",
+        default: "",
+        placeholder: "Key ID"
+    },
+    relayOnly: {
+        type: OptionType.BOOLEAN,
+        description: "Отладка: соединяться ТОЛЬКО через TURN (проверить, что ретранслятор работает). Обычно выключено",
+        default: false
+    },
+    cfTurnToken: {
+        type: OptionType.STRING,
+        description: "Cloudflare TURN — API token (показывается один раз при создании ключа)",
+        default: "",
+        placeholder: "API token"
     }
 });
 
