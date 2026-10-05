@@ -1401,7 +1401,9 @@ export class P2PManager {
             }
             case "offer": {
                 if (sig.to === me) {
-                    void this.watches.get(sig.s)?.handleOffer(sig.d, sig.pk);
+                    const w = this.watches.get(sig.s);
+                    if (!w) logger.warn(`Оффер для ${sig.s}, но просмотра нет (окно закрыто/таймаут?)`);
+                    void w?.handleOffer(sig.d, sig.pk);
                 }
                 return true;
             }

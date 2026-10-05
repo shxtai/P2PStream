@@ -190,19 +190,35 @@ export async function parseSignals(content: string): Promise<Signal[]> {
         if (wire.e && wire.pk) {
             // запечатанный payload (offer/answer/ice) — распечатываем
             try {
-                sig.d = await brokerOpen(wire.pk, wire.e as Sealed);
+                sig.d = await unpackSealed(await brokerOpen(wire.pk, wire.e as Sealed));
             } catch (e) {
-                logger.debug("Не удалось распечатать сигнал (чужой/битый ключ?):", e);
+                logger.warn(`Не удалось распечатать ${sig.t} от ${sig.from} (чужой/битый ключ?):`, e);
                 return [];
             }
         } else {
             sig.d = wire.d;
         }
+        logger.info(`← ${sig.t} от ${sig.from}${sig.to ? ` для ${sig.to}` : ""}`);
         return [sig];
     } catch (e) {
-        logger.debug("Не удалось разобрать сигнал:", e);
+        logger.warn("Не удалось разобрать сигнал:", e);
         return [];
     }
+}
+
+/** Сжать payload ПЕРЕД шифрованием: шифротекст не сжимается, и без этого
+ *  оффер (SDP+ICE ~12 КБ) раздувался до ~11 сообщений — упирался в лимит Discord
+ *  5 сообщений / 5 с (429), уходил в видимый фолбэк и не успевал к зрителю. */
+async function packForSeal(d: unknown): Promise<{ z: string }> {
+    return { z: bytesToB64url(await deflate(JSON.stringify(d ?? null))) };
+}
+
+/** Обратное к packForSeal (старый формат без z пропускаем как есть) */
+async function unpackSealed(d: any): Promise<unknown> {
+    if (d && typeof d === "object" && typeof d.z === "string" && Object.keys(d).length === 1) {
+        return JSON.parse(await inflate(b64urlToBytes(d.z)));
+    }
+    return d;
 }
 
 /**
@@ -224,7 +240,7 @@ export async function encodeSignal(sig: Signal, voiceChannelId?: string): Promis
     if (sig.to) wire.to = sig.to;
 
     if (sig.d !== undefined && sig.pk) {
-        const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, sig.d), brokerPublicKey()]);
+        const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, await packForSeal(sig.d)), brokerPublicKey()]);
         wire.e = sealed;
         wire.pk = myPk;
     } else {
@@ -375,29 +391,38 @@ export function silentRestAvailable(): boolean {
 async function sendSilentMessage(channelId: string, content: string): Promise<string | null> {
     if (!silentRestAvailable()) return null;
     const nonce = makeNonce();
-    try {
-        const res: any = await RestAPI.post({
-            url: `/channels/${channelId}/messages`,
-            body: {
-                content,
-                flags: SUPPRESS_NOTIFICATIONS,
-                tts: false,
-                nonce,
-                allowedMentions: { parse: [] }
+    for (let attempt = 0; ; attempt++) {
+        try {
+            const res: any = await RestAPI.post({
+                url: `/channels/${channelId}/messages`,
+                body: {
+                    content,
+                    flags: SUPPRESS_NOTIFICATIONS,
+                    tts: false,
+                    nonce,
+                    allowedMentions: { parse: [] }
+                }
+            });
+            const id: string | undefined = res?.body?.id;
+            if (!id) throw new Error("REST-ответ без id сообщения");
+            healthOk();
+            return id;
+        } catch (e: any) {
+            const status = e?.status ?? e?.body?.code;
+            if (status === 429 && attempt < 3) {
+                // лимит Discord: ждём сколько просят и повторяем — фолбэк отправил бы
+                // ВСЕ фрагменты заново и только усугубил лимит
+                const retryAfter = Number(e?.body?.retry_after ?? e?.headers?.["retry-after"] ?? 1);
+                await new Promise(r => setTimeout(r, Math.min(Math.max(retryAfter, 0.3), 8) * 1000 + 100));
+                continue;
             }
-        });
-        const id: string | undefined = res?.body?.id;
-        if (!id) throw new Error("REST-ответ без id сообщения");
-        healthOk();
-        return id;
-    } catch (e: any) {
-        healthFail(e);
-        const status = e?.status ?? e?.body?.code;
-        if (!status) {
-            silentRestBrokenUntil = Date.now() + SILENT_REST_COOLDOWN_MS;
+            healthFail(e);
+            if (!status) {
+                silentRestBrokenUntil = Date.now() + SILENT_REST_COOLDOWN_MS;
+            }
+            logger.warn(`Тихая отправка в ${channelId} не удалась (${status ?? e?.message}): перехожу на обычную`);
+            return null;
         }
-        logger.warn(`Тихая отправка в ${channelId} не удалась (${status ?? e?.message}): перехожу на обычную`);
-        return null;
     }
 }
 
@@ -460,6 +485,7 @@ export function sendSignals(channelId: string, sig: Signal): void {
             }
 
             const contents = await encodeSignal(sig, channelId);
+            logger.info(`→ ${sig.t}${sig.to ? ` для ${sig.to}` : ""}: ${contents.length} сообщ.${sig.pk && sig.d !== undefined ? " (зашифровано)" : ""}`);
 
             // 1) адресные сигналы — в ЛС с получателем (никто не видит), тихо
             if (sig.to && settings.store.silentDm !== false && silentRestAvailable()) {
