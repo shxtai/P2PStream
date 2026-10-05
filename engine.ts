@@ -20,6 +20,8 @@ import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
+    acceptReliable,
+    cancelPending,
     handleOwnEcho,
     isSignalContent,
     parseSignals,
@@ -122,20 +124,10 @@ function buildRtcConfig(): RTCConfiguration {
             username: String(settings.store.turnUser ?? ""),
             credential: String(settings.store.turnPassword ?? "")
         });
-    } else if (settings.store.emergencyTurn !== false) {
-        // Аварийный публичный ретранслятор: спасает при симметричном NAT/CGNAT,
-        // когда прямые кандидаты не совпадаются (частая причина «стрим не грузит»).
-        // ICE сам предпочитает прямые пути — TURN используется только как последний вариант.
-        iceServers.push({
-            urls: [
-                "turn:openrelay.metered.ca:80",
-                "turn:openrelay.metered.ca:443?transport=udp",
-                "turn:openrelay.metered.ca:443?transport=tcp"
-            ],
-            username: "openrelayproject",
-            credential: "openrelayproject"
-        });
     }
+    // (v1.11.1) Аварийный openrelay.metered.ca убран: проверено в Chrome —
+    // «400 TURN allocate error» на всех адресах (бесплатные учётки отключены).
+    // Relay он не давал никогда, а сбор кандидатов из-за него висел 15+ с.
 
     return {
         iceServers,
@@ -292,10 +284,66 @@ function logIceSummary(pc: RTCPeerConnection, label: string): void {
         const srflx = (sdp.match(/typ srflx/g) ?? []).length;
         const relay = (sdp.match(/typ relay/g) ?? []).length;
         const host_ = (sdp.match(/typ host/g) ?? []).length;
-        logger.info(`ICE [${label}]: сбор завершён — host=${host_}, srflx=${srflx}, relay=${relay}`);
+        logger.info(`ICE [${label}]: кандидаты host=${host_}, srflx=${srflx}, relay=${relay}`);
         if (!srflx && !relay) {
             logger.warn(`ICE [${label}]: внешних кандидатов нет — STUN недоступен или UDP заблокирован; между разными сетями без TURN соединения не будет`);
         }
+    } catch { /* ignore */ }
+}
+
+/**
+ * Тип NAT одной кнопкой (/p2p-doctor). ОДИН сокет опрашивается двумя STUN-серверами:
+ * при «хорошем» NAT внешний адрес у них совпадает (Chrome даёт один srflx на сокет),
+ * при симметричном — разные порты (два srflx с одним rport). Отдельные соединения
+ * сравнивать нельзя: у них разные локальные порты и внешние порты разные всегда.
+ */
+export async function probeNat(ms = 4000): Promise<string> {
+    const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }]
+    });
+    /** локальный порт (rport) -> набор внешних адресов */
+    const byLocal = new Map<string, Set<string>>();
+    try {
+        pc.createDataChannel("probe");
+        const done = new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, ms);
+            pc.onicegatheringstatechange = () => {
+                if (pc.iceGatheringState === "complete") { clearTimeout(timer); resolve(); }
+            };
+        });
+        pc.onicecandidate = e => {
+            const c = e.candidate?.candidate ?? "";
+            const m = / ([\d.]+) (\d+) typ srflx raddr \S+ rport (\d+)/.exec(c);
+            if (!m) return;
+            const set = byLocal.get(m[3]) ?? new Set<string>();
+            set.add(`${m[1]}:${m[2]}`);
+            byLocal.set(m[3], set);
+        };
+        await pc.setLocalDescription(await pc.createOffer());
+        await done;
+    } catch { /* ниже — по тому, что успели собрать */ } finally {
+        pc.close();
+    }
+    if (!byLocal.size) return "UDP наружу не проходит (STUN недоступен) — прямое P2P невозможно, нужен TURN по TCP/TLS";
+    const sets = [...byLocal.values()];
+    const symmetric = sets.find(s => s.size > 1);
+    if (symmetric) return `СИММЕТРИЧНЫЙ (${[...symmetric].join(" / ")}) — прямое P2P только если у собеседника NAT хороший; если у обоих симметричный — нужен свой TURN`;
+    return `хороший (один внешний адрес ${[...sets[0]][0]} для разных серверов) — прямое P2P собирается`;
+}
+
+/** Диагностика: каким путём реально пошёл трафик (host/srflx — напрямую, relay — через TURN) */
+async function logSelectedPair(pc: RTCPeerConnection, label: string): Promise<void> {
+    try {
+        const report = await pc.getStats();
+        let pair: any = null;
+        report.forEach((r: any) => {
+            if (r.type === "transport" && r.selectedCandidatePairId) pair = report.get(r.selectedCandidatePairId);
+        });
+        if (!pair) report.forEach((r: any) => { if (r.type === "candidate-pair" && r.nominated && r.state === "succeeded") pair = r; });
+        if (!pair) return;
+        const l: any = report.get(pair.localCandidateId);
+        const r: any = report.get(pair.remoteCandidateId);
+        logger.info(`ICE [${label}]: соединено ${l?.candidateType ?? "?"}/${l?.protocol ?? "?"} ↔ ${r?.candidateType ?? "?"}, RTT ${Math.round((pair.currentRoundTripTime ?? 0) * 1000)} мс`);
     } catch { /* ignore */ }
 }
 
@@ -432,6 +480,9 @@ class HostPeer {
     private restarted = false;
     /** Публичный ECDH-ключ зрителя (пришёл в join) — им шифруем offer/ice ему */
     peerPk: string | null = null;
+    /** Последний отправленный оффер — перепосылаем, если зритель его не получил */
+    private lastOffer: Signal | null = null;
+    private lastOfferAt = 0;
 
     constructor(
         private host: HostSession,
@@ -455,6 +506,9 @@ class HostPeer {
                 }
             }
         };
+        this.pc.oniceconnectionstatechange = () => {
+            logger.info(`ICE [эфир → ${userId}]: ${this.pc.iceConnectionState}`);
+        };
         this.pc.onicegatheringstatechange = () => {
             if (this.pc.iceGatheringState === "complete") {
                 logIceSummary(this.pc, `эфир → ${userId}`);
@@ -464,6 +518,7 @@ class HostPeer {
         this.pc.onconnectionstatechange = () => {
             const st = this.pc.connectionState;
             logger.info(`Пир ${userId}: ${st}`);
+            if (st === "connected") void logSelectedPair(this.pc, `эфир → ${userId}`);
             if (st === "failed" && !this.restarted) {
                 this.restarted = true;
                 void this.negotiate(true);
@@ -506,12 +561,16 @@ class HostPeer {
                 // это 1-2 кода на всю сессию вместо ливни отдельных сообщений
                 await waitIceGathering(this.pc, 1500);
                 const candidates = this.iceBuf.splice(0);
-                sendSignals(this.host.channelId, {
+                logIceSummary(this.pc, `оффер → ${this.userId}`);
+                const sig: Signal = {
                     v: 1, t: "offer", s: this.host.streamId, from: myId(), to: this.userId,
                     pk: this.peerPk ?? undefined,
                     _route: this.host.mgr.routeFor(this.userId),
                     d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates }
-                });
+                };
+                this.lastOffer = sig;
+                this.lastOfferAt = Date.now();
+                sendSignals(this.host.channelId, sig);
             }
         } catch (e) {
             logger.error("Ошибка оффера:", e);
@@ -519,6 +578,18 @@ class HostPeer {
             this.makingOffer = false;
             this.bundling = false;
         }
+    }
+
+    /** Зритель снова прислал join, а ответа на оффер так и нет — значит, оффер
+     *  потерялся по дороге (сообщение не дошло/не собралось). Раньше хост молча
+     *  ждал вечно, а зритель — пока не истечёт таймаут. */
+    resendOfferIfStuck(): void {
+        if (this.closed || this.makingOffer || !this.lastOffer) return;
+        if (this.pc.signalingState !== "have-local-offer") return;
+        if (Date.now() - this.lastOfferAt < 4000) return;
+        this.lastOfferAt = Date.now();
+        logger.info(`Оффер для ${this.userId} не подтверждён — отправляю повторно`);
+        sendSignals(this.host.channelId, { ...this.lastOffer, pk: this.peerPk ?? undefined });
     }
 
     async handleAnswer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[] }): Promise<void> {
@@ -608,6 +679,7 @@ export class HostSession {
             if (!keyChanged && (st === "new" || st === "connecting" || st === "connected")) {
                 // живая сессия — обновляем ключ, если он впервые пришёл
                 if (peerPk && !existing.peerPk) existing.peerPk = peerPk;
+                existing.resendOfferIfStuck();
                 return existing;
             }
             // МЁРТВАЯ сессия (disconnected/failed/closed): зритель прислал свежий join —
@@ -634,6 +706,7 @@ export class HostSession {
     removePeer(userId: string, notify = true): void {
         const peer = this.peers.get(userId);
         if (!peer) return;
+        cancelPending(sig => sig.to === userId && sig.s === this.streamId);
         peer.close();
         this.peers.delete(userId);
         if (notify) {
@@ -672,7 +745,6 @@ export class WatchSession {
     host: LiveHost;
 
     private joinTimer: NodeJS.Timeout | undefined;
-    private joinAttempts = 0;
     private pendingIce: RTCIceCandidateInit[] = [];
     private restarts = 0;
     /** буфер ICE-кандидатов (батчинг, как у хоста) — против спама по 1 сообщению на кандидата */
@@ -705,33 +777,24 @@ export class WatchSession {
         this.startJoinLoop();
     }
 
+    /** Один join (его и оффер в ответ доставляет надёжный слой с повторами) и
+     *  ожидание оффера до 45 с. Раньше: 3 join'а за 18 с без подтверждений —
+     *  потеря одного сообщения стоила всей попытки. */
     private startJoinLoop(): void {
-        this.joinAttempts = 0;
+        this.stopJoinLoop();
         this.sendJoin();
-        this.joinTimer = setInterval(() => {
-            // ждём оффер и при первом подключении, и при переподключении
-            if (this.state !== "connecting" && this.state !== "reconnecting") {
-                this.stopJoinLoop();
-                return;
-            }
-            if (this.pc?.remoteDescription) { // оффер уже получен — ждать нечего
-                this.stopJoinLoop();
-                return;
-            }
-            this.joinAttempts++;
-            if (this.joinAttempts > 2) { // 1 отправка + 2 повтора — раньше 6 join'ов подряд заливали чат
-                this.stopJoinLoop();
-                this.setState("failed");
-                toast("Не удалось подключиться к P2P-эфиру (хост недоступен?)", "critical");
-                return;
-            }
-            this.sendJoin();
-        }, 6000); // ~18 с на ответ: оффер в фолбэке — несколько сообщений подряд, 9 с не хватало
+        this.joinTimer = setTimeout(() => {
+            this.joinTimer = undefined;
+            if (this.state !== "connecting" && this.state !== "reconnecting") return;
+            if (this.pc?.remoteDescription) return; // оффер получен — дальше решает ICE
+            this.setState("failed");
+            toast("Не удалось подключиться к P2P-эфиру: хост не ответил (нет плагина или нет связи с Discord)", "critical");
+        }, 45_000);
     }
 
     private stopJoinLoop(): void {
         if (this.joinTimer) {
-            clearInterval(this.joinTimer);
+            clearTimeout(this.joinTimer);
             this.joinTimer = undefined;
         }
     }
@@ -764,32 +827,44 @@ export class WatchSession {
             if (!this.pc) this.setupPc();
             const pc = this.pc!;
             this.stopJoinLoop();
+            // оффер пришёл уже ПОСЛЕ таймаута ожидания: раньше сессия оставалась
+            // "failed", окно само закрывалось и слало leave — хост рвал соединение,
+            // которое как раз устанавливалось
+            if (this.state === "failed") this.setState("connecting");
 
             await pc.setRemoteDescription({ type: "offer", sdp: d.sdp });
             applyReceiveLatency(pc);
 
-            // кандидаты хоста, приехавшие вместе с оффером (non-trickle)
-            if (d.candidates?.length) {
-                for (const c of d.candidates) {
-                    try { await pc.addIceCandidate(c); } catch { /* ignore */ }
-                }
-            }
+            // Кандидаты хоста добавляем ПОСЛЕ сбора своих (ниже). Проверено в Chrome:
+            // если удалённые кандидаты добавлены до createAnswer, отвечающая сторона
+            // завершает сбор за ~4 мс БЕЗ srflx (своего внешнего адреса) — ответ
+            // уходил только с локальным 192.168.x.x, и NAT хоста отбрасывал проверки
+            // зрителя: соединение между разными сетями не собиралось никогда.
+            const hostCandidates = d.candidates ?? [];
 
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
-            // NON-TRICKLE: все наши кандидаты едут вместе с answer одним сообщением
+            // NON-TRICKLE: все наши кандидаты едут вместе с answer одним сообщением.
+            // localDescription после сбора уже содержит их строками a=candidate —
+            // отдельный массив был дублем и раздувал ответ до 3 сообщений
             this.bundling = true;
             await waitIceGathering(pc, 1500);
-            const candidates = this.iceBuf.splice(0);
+            this.iceBuf = [];
+            logIceSummary(pc, `ответ → ${this.host.name}`);
             this.bundling = false;
 
-            sendSignals(this.host.channelId, {
+            const answerSig: Signal = {
                 v: 1, t: "answer", s: this.host.streamId, from: myId(), to: this.host.userId,
                 pk: this.hostPk ?? undefined,
                 _route: this.hostRoute(),
-                d: { sdp: pc.localDescription!.sdp, type: pc.localDescription!.type, candidates }
-            });
+                d: { sdp: pc.localDescription!.sdp, type: pc.localDescription!.type, candidates: [] }
+            };
+            sendSignals(this.host.channelId, answerSig);
+
+            for (const c of hostCandidates) {
+                try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+            }
 
             const queue = this.pendingIce;
             this.pendingIce = [];
@@ -866,6 +941,9 @@ export class WatchSession {
                 }
             }
         };
+        pc.oniceconnectionstatechange = () => {
+            logger.info(`ICE [просмотр ${this.host.name}]: ${pc.iceConnectionState}`);
+        };
         pc.onicegatheringstatechange = () => {
             if (pc.iceGatheringState === "complete") {
                 logIceSummary(pc, `просмотр ${this.host.name}`);
@@ -876,6 +954,7 @@ export class WatchSession {
             const st = pc.connectionState;
             logger.info(`Просмотр ${this.host.name}: ${st}`);
             if (st === "connected") {
+                void logSelectedPair(pc, `просмотр ${this.host.name}`);
                 this.setState("live");
             } else if (st === "disconnected") {
                 this.setState("reconnecting");
@@ -915,6 +994,8 @@ export class WatchSession {
 
     stop(sendLeave = true): void {
         this.stopJoinLoop();
+        // недоставленные join/answer/ice этому хосту больше не нужны
+        cancelPending(sig => sig.to === this.host.userId && sig.s === this.host.streamId && sig.t !== "leave");
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
         this.iceBuf = [];
         if (sendLeave && this.state !== "ended") {
@@ -1483,7 +1564,10 @@ export class P2PManager {
                 for (const sig of sigs) {
                     // (v1.10) тихий транспорт: конверт несёт голосовой канал (ch) —
                     // в ЛС msg.channel_id это ЛС, а не канал эфира
-                    this.handleSignal(sig, sig.ch ?? msg.channel_id, "chat");
+                    const ch = sig.ch ?? msg.channel_id;
+                    // надёжная доставка: подтверждаем, дубли/ack дальше не идут
+                    if (!acceptReliable(sig, ch)) continue;
+                    this.handleSignal(sig, ch, "chat");
                 }
             });
         } catch (e) {

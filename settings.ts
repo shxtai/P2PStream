@@ -186,11 +186,6 @@ export const settings = definePluginSettings({
         default: "",
         placeholder: "turn:host:port?transport=udp"
     },
-    emergencyTurn: {
-        type: OptionType.BOOLEAN,
-        description: "Аварийный публичный TURN (openrelay.metered.ca): включается, только если прямое соединение не собирается. Трафик идёт через чужой сервер — медленнее; выключите, если добавили свой TURN",
-        default: true
-    },
     turnUser: {
         type: OptionType.STRING,
         description: "TURN username",

@@ -1,0 +1,11 @@
+{
+  "name": "p2pstream-devtest",
+  "private": true,
+  "description": "Сквозной тест P2PStream без Discord (headless Chrome)",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

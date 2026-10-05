@@ -38,9 +38,9 @@ import {
     TOPIC_PREFIX
 } from "./broker";
 import { settings } from "./settings";
-import { PLUGIN_VERSION } from "./utils";
+import { myId, PLUGIN_VERSION, randomId } from "./utils";
 
-export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave" | "query";
+export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave" | "query" | "ack";
 
 export interface Signal {
     v: 1;
@@ -60,6 +60,8 @@ export interface Signal {
     ch?: string;
     /** версия плагина отправителя (join — чтобы хост знал, можно ли шифровать ему) */
     av?: string;
+    /** id сообщения надёжной доставки (адресные сигналы): получатель подтверждает ack-ом */
+    m?: string;
     /** Принудительная маршрутизация (внутреннее поле движка):
      *  "broker" — только брокер; "chat" — только Discord-транспорт (пир старой версии);
      *  "both" — в оба канала (возможности пира неизвестны). */
@@ -119,6 +121,10 @@ function payloadOf(content: string): string {
 
 // region фрагментация
 const fragBufs = new Map<string, { parts: (string | null)[]; total: number; ts: number }>();
+/** уже собранные сообщения: поздние дубли их фрагментов (повторы) игнорируем */
+const doneFrags = new Map<string, number>();
+/** буфер недособранного сообщения живёт дольше самой длинной паузы между повторами (25 с) */
+const FRAG_TTL_MS = 60_000;
 
 function collectFragment(body: string): string | null {
     // F|sid|idx|total|chunk
@@ -134,6 +140,7 @@ function collectFragment(body: string): string | null {
     const total = parseInt(rest.slice(0, sep4), 10);
     const chunk = rest.slice(sep4 + 1);
     if (!sid || !Number.isFinite(idx) || !Number.isFinite(total) || total < 1 || total > 32) return null;
+    if (doneFrags.has(sid)) return null;
 
     let buf = fragBufs.get(sid);
     if (!buf) {
@@ -147,6 +154,7 @@ function collectFragment(body: string): string | null {
 
     const joined = buf.parts.join("");
     fragBufs.delete(sid);
+    doneFrags.set(sid, Date.now());
     return joined;
 }
 
@@ -154,7 +162,17 @@ function collectFragment(body: string): string | null {
 export function pruneFragments(): void {
     const now = Date.now();
     for (const [sid, buf] of fragBufs) {
-        if (now - buf.ts > 10_000) fragBufs.delete(sid);
+        if (now - buf.ts > FRAG_TTL_MS) {
+            const got = buf.parts.filter(p => p !== null).length;
+            logger.warn(`Сигнал ${sid} потерян: дошло ${got}/${buf.total} фрагментов`);
+            fragBufs.delete(sid);
+        }
+    }
+    for (const [sid, ts] of doneFrags) {
+        if (now - ts > 5 * 60_000) doneFrags.delete(sid);
+    }
+    for (const [mid, ts] of seenIds) {
+        if (now - ts > 10 * 60_000) seenIds.delete(mid);
     }
 }
 // endregion
@@ -185,7 +203,8 @@ export async function parseSignals(content: string): Promise<Signal[]> {
             to: typeof wire.to === "string" ? wire.to : undefined,
             ch: typeof wire.ch === "string" ? wire.ch : undefined,
             pk: typeof wire.pk === "string" ? wire.pk : undefined,
-            av: typeof wire.av === "string" ? wire.av : undefined
+            av: typeof wire.av === "string" ? wire.av : undefined,
+            m: typeof wire.m === "string" ? wire.m : undefined
         };
         if (wire.e && wire.pk) {
             // запечатанный payload (offer/answer/ice) — распечатываем
@@ -198,7 +217,7 @@ export async function parseSignals(content: string): Promise<Signal[]> {
         } else {
             sig.d = wire.d;
         }
-        logger.info(`← ${sig.t} от ${sig.from}${sig.to ? ` для ${sig.to}` : ""}`);
+        if (sig.t !== "ack") logger.info(`← ${sig.t} от ${sig.from}${sig.to ? ` для ${sig.to}` : ""}`);
         return [sig];
     } catch (e) {
         logger.warn("Не удалось разобрать сигнал:", e);
@@ -238,6 +257,7 @@ export async function encodeSignal(sig: Signal, voiceChannelId?: string): Promis
         ch: voiceChannelId ?? sig.ch
     };
     if (sig.to) wire.to = sig.to;
+    if (sig.m) wire.m = sig.m;
 
     if (sig.d !== undefined && sig.pk) {
         const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, await packForSeal(sig.d)), brokerPublicKey()]);
@@ -258,7 +278,9 @@ export async function encodeSignal(sig: Signal, voiceChannelId?: string): Promis
         return [MARKER + body + TAIL];
     }
     const total = Math.ceil(body.length / MAX_CHUNK);
-    const sid = `${sig.s}-${sig.t}-${Math.random().toString(36).slice(2, 8)}`;
+    // у надёжных сигналов id фрагментов = id сообщения: повторы шлют ТЕ ЖЕ байты,
+    // и получатель собирает сообщение из кусков разных попыток
+    const sid = sig.m ? `${sig.t}-${sig.m}` : `${sig.s}-${sig.t}-${Math.random().toString(36).slice(2, 8)}`;
     const out: string[] = [];
     for (let i = 0; i < total; i++) {
         out.push(MARKER + `F|${sid}|${i}|${total}|` + body.slice(i * MAX_CHUNK, (i + 1) * MAX_CHUNK) + TAIL);
@@ -469,6 +491,101 @@ function scheduleSelfDelete(channelId: string, messageId: string): void {
  *  адресные сигналы — в ЛС с получателем, broadcast — в голосовой канал.
  *  Если REST не удался — старый путь MessageActions (видимые коды с самоудалением). */
 export function sendSignals(channelId: string, sig: Signal): void {
+    if (sig.to && RELIABLE_TYPES.has(sig.t) && !sig.m && sig._route !== "broker") {
+        sig = { ...sig, m: randomId(10) };
+        transmit(channelId, sig, trackReliable(channelId, sig));
+        return;
+    }
+    transmit(channelId, sig);
+}
+
+// region надёжная доставка (ack + повторы + дедупликация)
+/**
+ * Discord-сообщения как канал сигналинга ТЕРЯЮТСЯ (сеть, 429, фрагменты, порядок).
+ * Раньше каждая потеря стоила всей сессии: оффер или ответ не доходил — и всё.
+ * Теперь адресные сигналы доставляются как в TCP: у каждого id (m), получатель
+ * отвечает ack, отправитель повторяет до подтверждения, дубли отбрасываются.
+ * Проверено на стенде с потерей 30% сообщений.
+ */
+const RELIABLE_TYPES = new Set<SignalType>(["join", "offer", "answer", "ice", "leave"]);
+/** паузы перед повторами: суммарно ~56 с */
+const RETRY_DELAYS_MS = [2500, 5000, 9000, 15000, 25000];
+
+interface PendingSignal {
+    sig: Signal;
+    channelId: string;
+    tries: number;
+    timer: NodeJS.Timeout | undefined;
+    /** закодированные сообщения первой отправки — повторы шлют их же (тот же IV/фрагменты) */
+    contents?: string[];
+}
+const pendingReliable = new Map<string, PendingSignal>();
+/** id уже обработанных входящих сигналов (защита от повторов) */
+const seenIds = new Map<string, number>();
+
+function trackReliable(channelId: string, sig: Signal): PendingSignal {
+    // новый offer/answer тому же адресату по тому же эфиру отменяет недоставленный старый
+    if (sig.t === "offer" || sig.t === "answer") {
+        cancelPending(p => p.t === sig.t && p.to === sig.to && p.s === sig.s);
+    }
+    const entry: PendingSignal = { sig, channelId, tries: 0, timer: undefined };
+    pendingReliable.set(sig.m!, entry);
+    scheduleRetry(entry);
+    return entry;
+}
+
+function scheduleRetry(entry: PendingSignal): void {
+    const delay = RETRY_DELAYS_MS[entry.tries];
+    if (delay === undefined) {
+        pendingReliable.delete(entry.sig.m!);
+        logger.warn(`${entry.sig.t} для ${entry.sig.to} так и не подтверждён — собеседник не в сети или без плагина`);
+        return;
+    }
+    entry.timer = setTimeout(() => {
+        if (!pendingReliable.has(entry.sig.m!)) return;
+        entry.tries++;
+        logger.info(`↻ повтор ${entry.sig.t} для ${entry.sig.to} (#${entry.tries}) — нет подтверждения`);
+        transmit(entry.channelId, entry.sig, entry);
+        scheduleRetry(entry);
+    }, delay);
+}
+
+/** Отменить недоставленные сигналы (сессия закрыта / заменена новой) */
+export function cancelPending(match: (sig: Signal) => boolean): void {
+    for (const [mid, entry] of pendingReliable) {
+        if (match(entry.sig)) {
+            if (entry.timer) clearTimeout(entry.timer);
+            pendingReliable.delete(mid);
+        }
+    }
+}
+
+/**
+ * Обработка надёжности входящего сигнала. true — сигнал нужно обработать;
+ * false — служебный ack или повтор уже обработанного (только подтверждаем).
+ */
+export function acceptReliable(sig: Signal, channelId: string): boolean {
+    const me = myId();
+    if (sig.t === "ack") {
+        if (sig.to === me && typeof sig.d?.m === "string") {
+            const entry = pendingReliable.get(sig.d.m);
+            if (entry) {
+                if (entry.timer) clearTimeout(entry.timer);
+                pendingReliable.delete(sig.d.m);
+            }
+        }
+        return false;
+    }
+    if (!sig.m || sig.to !== me) return true;
+    // подтверждаем ВСЕГДА (в т.ч. повтор: наш прошлый ack мог потеряться)
+    transmit(channelId, { v: 1, t: "ack", s: sig.s, from: me, to: sig.from, d: { m: sig.m }, _route: "chat" });
+    if (seenIds.has(sig.m)) return false;
+    seenIds.set(sig.m, Date.now());
+    return true;
+}
+// endregion
+
+function transmit(channelId: string, sig: Signal, entry?: PendingSignal): void {
     void (async () => {
         try {
             const route = sig._route;
@@ -484,8 +601,11 @@ export function sendSignals(channelId: string, sig: Signal): void {
                 return;
             }
 
-            const contents = await encodeSignal(sig, channelId);
-            logger.info(`→ ${sig.t}${sig.to ? ` для ${sig.to}` : ""}: ${contents.length} сообщ.${sig.pk && sig.d !== undefined ? " (зашифровано)" : ""}`);
+            const contents = entry?.contents ?? await encodeSignal(sig, channelId);
+            if (entry && !entry.contents) entry.contents = contents;
+            if (sig.t !== "ack" && !entry?.tries) {
+                logger.info(`→ ${sig.t}${sig.to ? ` для ${sig.to}` : ""}: ${contents.length} сообщ.${sig.pk && sig.d !== undefined ? " (зашифровано)" : ""}`);
+            }
 
             // 1) адресные сигналы — в ЛС с получателем (никто не видит), тихо
             if (sig.to && settings.store.silentDm !== false && silentRestAvailable()) {

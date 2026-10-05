@@ -1,0 +1,29 @@
+<!doctype html>
+<html><body>
+<iframe id="host" src="peer.html?me=111111111111111111&role=host"></iframe>
+<iframe id="viewer" src="peer.html?me=222222222222222222&role=viewer"></iframe>
+<script>
+// «Discord»: пересылает сообщения с задержкой (?delay=мс) и теряет долю (?loss=0..1)
+const q = new URLSearchParams(location.search);
+const LOSS = Number(q.get("loss") || 0);
+const DELAY = Number(q.get("delay") || 300);
+const frames = { "111111111111111111": document.getElementById("host"), "222222222222222222": document.getElementById("viewer") };
+let sent = 0, dropped = 0;
+window.addEventListener("message", e => {
+    const m = e.data;
+    if (m.kind === "send") {
+        sent++;
+        for (const [id, fr] of Object.entries(frames)) {
+            if (id === m.from) continue;
+            if (Math.random() < LOSS) { dropped++; console.log(`[discord] ПОТЕРЯНО сообщение от ${m.from.slice(0, 3)}`); continue; }
+            setTimeout(() => fr.contentWindow.postMessage({ ...m, kind: "deliver" }, "*"), DELAY + Math.random() * DELAY);
+        }
+    } else if (m.kind === "log") {
+        console.log(m.text);
+    } else if (m.kind === "status") {
+        console.log(`[status ${m.from.slice(0, 3)}] ${m.text}`);
+        if (m.text.startsWith("OK") || m.text.startsWith("FAIL")) window.__result = `${m.text} | сообщений: ${sent}, потеряно: ${dropped}`;
+    }
+});
+</script>
+</body></html>

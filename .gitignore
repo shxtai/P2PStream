@@ -4,3 +4,5 @@ dist/
 *.log
 .DS_Store
 native/p2paudio.exe
+devtest/bundle.js
+devtest/package-lock.json

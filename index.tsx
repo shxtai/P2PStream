@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
 import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
-import { manager } from "./engine";
+import { manager, probeNat } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
@@ -62,7 +62,7 @@ function collectDiagnostics(): string[] {
         push("STUN", stuns.join(", ") || "НЕТ — P2P между разными сетями не соберётся");
         push("TURN", settings.store.turnUrl
             ? String(settings.store.turnUrl)
-            : (settings.store.emergencyTurn !== false ? "аварийный публичный (openrelay.metered.ca)" : "нет (нужен при симметричном NAT)"));
+            : "нет (нужен, только если у обоих «плохой» NAT — см. строку NAT ниже)");
     } catch { /* ignore */ }
     push("эфиров видно", manager.liveHosts.size);
     push("своих P2P-эфиров", manager.host ? 1 : 0);
@@ -138,8 +138,12 @@ export default definePlugin({
             inputType: ApplicationCommandInputType.BUILT_IN,
             execute: () => {
                 for (const ln of collectDiagnostics()) logger.info(ln);
-                logger.info("P2P-DOC | Скопируйте эти строки и отправьте разработчику");
-                toast("Диагностика P2PStream записана в консоль (Ctrl+Shift+I → Console)", "success");
+                toast("Диагностика P2PStream: проверяю сеть (~4 с)…");
+                void probeNat().then(res => {
+                    logger.info(`P2P-DOC | NAT: ${res}`);
+                    logger.info("P2P-DOC | Скопируйте эти строки и отправьте разработчику");
+                    toast("Диагностика P2PStream записана в консоль (Ctrl+Shift+I → Console)", "success");
+                });
             }
         }
     ],
