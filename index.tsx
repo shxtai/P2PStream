@@ -8,18 +8,51 @@ import { ApplicationCommandInputType } from "@api/Commands";
 import { Settings as AppSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
+import { MessageActions, SelectedChannelStore } from "@webpack/common";
 
 import { manager } from "./engine";
-import { installShareHook, uninstallShareHook } from "./hooks";
+import { installShareHook, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
+import { signalingHealth } from "./signaling";
 import managedStyle from "./styles.css?managed";
 import { AboutCard } from "./ui/AboutCard";
 import { mountBars } from "./ui/Bars";
 import { openViewerModal } from "./ui/ViewerModal";
-import { toast } from "./utils";
+import { PLUGIN_VERSION, toast } from "./utils";
 
 const logger = new Logger("P2PStream");
+
+/** Собрать снимок состояния плагина — для /p2p-doctor и стартового баннера */
+function collectDiagnostics(): string[] {
+    const lines: string[] = [];
+    const push = (k: string, v: unknown) => lines.push(`P2P-DOC | ${k}: ${String(v)}`);
+
+    push("версия", PLUGIN_VERSION);
+    push("клиент", navigator.userAgent);
+    push("голосовой канал", (() => { try { return SelectedChannelStore.getVoiceChannelId?.() ?? "нет"; } catch { return "нет"; } })());
+    push("режим кнопки стрима", settings.store.goliveMode);
+    push("getDisplayMedia перехвачен", isShareHookInstalled());
+
+    const helpers = (globalThis as any).VencordNative?.pluginHelpers?.P2PStream;
+    push("native-каналы (getSources/звук)", helpers ? Object.keys(helpers).join(", ") : "НЕТ — плагин без native-части (однофайловая сборка?)");
+
+    push("CompressionStream", typeof CompressionStream === "function");
+    try {
+        const codecs = RTCRtpSender.getCapabilities?.("video")?.codecs
+            ?.map(c => c.mimeType.split("/")[1]?.toUpperCase())
+            .filter((v, i, a) => v && a.indexOf(v) === i);
+        push("видеокодеки", codecs?.join(", ") ?? "неизвестно");
+    } catch { push("видеокодеки", "ошибка"); }
+    push("sendMessage доступен", typeof MessageActions.sendMessage === "function");
+    push("сигналинг (усп/ошибок подряд)", `${signalingHealth.sent} / ${signalingHealth.consecutiveFailures}${signalingHealth.lastError ? ` (последняя: ${signalingHealth.lastError})` : ""}`);
+    push("эфиров видно", manager.liveHosts.size);
+    push("своих P2P-эфиров", manager.host ? 1 : 0);
+    push("просмотров", manager.watches.size);
+    push("нативные плитки", settings.store.nativeTiles);
+    push("звук", settings.store.audioMode);
+    return lines;
+}
 
 /** Допускает UI-слой к открытию окна просмотра при создании сессии просмотра */
 manager.onWatchCreated = session => openViewerModal(session);
@@ -80,6 +113,16 @@ export default definePlugin({
                     return;
                 }
                 toast(`Несколько эфиров (${list.map(h => h.name).join(", ")}) — выберите пилюлю внизу экрана`);
+            }
+        },
+        {
+            name: "p2p-doctor",
+            description: "Диагностика P2PStream в консоль (для проверки установки и тестов)",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            execute: () => {
+                for (const ln of collectDiagnostics()) logger.info(ln);
+                logger.info("P2P-DOC | Скопируйте эти строки и отправьте разработчику");
+                toast("Диагностика P2PStream записана в консоль (Ctrl+Shift+I → Console)", "success");
             }
         }
     ],
@@ -148,7 +191,9 @@ export default definePlugin({
         // устойчив к переименованиям модулей Discord).
         installShareHook();
 
-        logger.info("P2PStream v1.4 запущен (пикер v2 + нативный звук)");
+        // стартовый баннер: сразу видно версию и доступность нативных каналов
+        logger.info(`P2PStream v${PLUGIN_VERSION} запущен`);
+        for (const ln of collectDiagnostics()) logger.info(ln);
     },
 
     stop() {

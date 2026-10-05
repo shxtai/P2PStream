@@ -11,11 +11,9 @@
  */
 
 import { spawn } from "child_process";
+import { app, desktopCapturer, type IpcMainInvokeEvent } from "electron";
 import { mkdirSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
-
-import { app, desktopCapturer } from "electron";
-import type { IpcMainInvokeEvent } from "electron";
 
 export interface P2PSourceInfo {
     /** Electron source id, например "screen:0:0" или "window:131076:0" */
@@ -59,7 +57,7 @@ export async function getSources(width = 384, height = 216): Promise<P2PSourceIn
  *   exclude-*  — захват всей системы КРОМЕ дерева процесса (Discord).
  * stdout хелпера: float32 PCM 48000 Hz stereo. Рендерер опрашивает pullAudio.
  */
-const P2P_AUDIO_EXE_B64 =  +
+const P2P_AUDIO_EXE_B64 = +
     "TVp4AAEAAAAEAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAeAAAAA4fug4AtAnNIbgBTM0hVGhpcyBwcm9ncmFtIGNhbm5vdCBiZSBydW4gaW4gRE9TIG1vZGUuJAAAUEUAAGSGBgAqQsNqAAAAAAAAAADwACIACwIOAABO"
     + "AAAARAAAAAAAAFATAAAAEAAAAABAAAAAAAAAEAAAAAIAAAYAAAAAAAAABgAAAAAAAAAAAAEAAAQAAAAAAAADAGCBAAAAAQAAAAAAEAAAAAAAAAAAEAAAAAAAABAAAAAAAAAAAAAAEAAAAAAAAAAAAAAA+IwAAPAAAAAAAAAAAAAAAADQAAB8AgAAAAAAAAAAAAAA8AAA"
     + "eAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOiIAAAoAAAAAAAAAAAAAAAAAAAAAAAAAACQAAAYAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALnRleHQAAAAWTAAAABAAAABOAAAABAAAAAAAAAAAAAAAAAAAIAAAYC5yZGF0YQAAXDkAAABgAAAAOgAAAFIAAAAA"

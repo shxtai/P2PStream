@@ -7,12 +7,12 @@
 import { Logger } from "@utils/Logger";
 import { MessageActions } from "@webpack/common";
 
-export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave";
+export type SignalType = "announce" | "bye" | "join" | "offer" | "answer" | "ice" | "leave" | "query";
 
 export interface Signal {
     v: 1;
     t: SignalType;
-    /** streamId */
+    /** streamId (для query — "*") */
     s: string;
     /** userId отправителя */
     from: string;
@@ -165,19 +165,29 @@ export function setCleanupEnabledGetter(fn: () => boolean): void {
     cleanupEnabled = fn;
 }
 
-/** Отправить сигнал в чат канала */
+/** Отправить сигнал в чат канала (фрагменты — строго последовательно, иначе соберутся не по порядку) */
 export function sendSignals(channelId: string, sig: Signal, onSent?: (messageId: string) => void): void {
     void (async () => {
         try {
             const contents = await encodeSignal(sig);
             for (const content of contents) {
-                sendMessageSafe(channelId, content);
+                const ok = await sendMessageSafe(channelId, content);
+                if (!ok) break; // сигналинг лежит — не спамим остальными фрагментами
             }
         } catch (e) {
             logger.error("Ошибка отправки сигнала:", e);
         }
     })();
 }
+
+/** Здоровье сигналинга — движок по нему предупреждает, если эфир видят только мы */
+export const signalingHealth = {
+    sent: 0,
+    failed: 0,
+    consecutiveFailures: 0,
+    lastError: null as string | null,
+    lastSuccess: 0
+};
 
 /** Числовой nonce в духе Discord (произвольная строка, сервер возвращает её в эхе) */
 function makeNonce(): string {
@@ -187,7 +197,7 @@ function makeNonce(): string {
 }
 
 /**
- * Отправка одного сообщения.
+ * Отправка одного сообщения. Возвращает true, если Discord принял вызов без ошибки.
  *
  * ВАЖНО: в свежих сборках Discord сигнатура
  *   sendMessage(channelId, message, createLocally, options)
@@ -196,20 +206,28 @@ function makeNonce(): string {
  * (reading 'nonce')» внутри Discord. Для совместимости со старыми сборками
  * дублируем nonce в message — лишние аргументы/поля старые версии игнорируют.
  */
-function sendMessageSafe(channelId: string, content: string): void {
+async function sendMessageSafe(channelId: string, content: string): Promise<boolean> {
     try {
         const nonce = makeNonce();
-        const res = (MessageActions as any).sendMessage(
+        const res: unknown = (MessageActions as any).sendMessage(
             channelId,
             { content, tts: false, nonce },
             true,
             { nonce, allowedMentions: { parse: [] } }
         );
-        if (res && typeof res.catch === "function") {
-            res.catch((e: any) => logger.debug("sendMessage отклонён:", e?.message ?? e));
+        if (res && typeof (res as Promise<unknown>).catch === "function") {
+            await (res as Promise<unknown>);
         }
-    } catch (e) {
+        signalingHealth.sent++;
+        signalingHealth.consecutiveFailures = 0;
+        signalingHealth.lastSuccess = Date.now();
+        return true;
+    } catch (e: any) {
+        signalingHealth.failed++;
+        signalingHealth.consecutiveFailures++;
+        signalingHealth.lastError = e?.message ?? String(e);
         logger.error("sendMessage не удался:", e);
+        return false;
     }
 }
 

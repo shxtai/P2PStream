@@ -6,13 +6,16 @@
 
 import { Divider } from "@components/Divider";
 import { FormSwitch } from "@components/FormSwitch";
+import { Logger } from "@utils/Logger";
 import { Button, closeModal, Forms, Modal, openModal, React, Select, SelectedChannelStore, Slider } from "@webpack/common";
 
-import { captureDesktopSource, listSources, liveApplyTrackConstraints, type P2PSourceInfo } from "../capture";
+import { captureDesktopSource, listSourcesDetailed, liveApplyTrackConstraints, type P2PSourceInfo, type SourceListState } from "../capture";
 import { cl } from "../css";
 import { manager } from "../engine";
 import { applyProfile, settings } from "../settings";
 import { toast } from "../utils";
+
+const logger = new Logger("P2PStream:Picker");
 
 export interface PickerOptions {
     /** Опции, с которыми Discord сам вызвал getDisplayMedia */
@@ -110,7 +113,8 @@ function SharePickerModal({
     onCancel(): void;
 }) {
     const [, force] = React.useReducer((x: number) => x + 1, 0);
-    const [sources, setSources] = React.useState<P2PSourceInfo[] | null | undefined>(undefined);
+    const [srcState, setSrcState] = React.useState<SourceListState | null>(null); // null = ещё грузится
+    const sources = srcState?.status === "ok" ? srcState.sources : null;
     const [selected, setSelected] = React.useState<P2PSourceInfo | null>(null);
     const [preview, setPreview] = React.useState<MediaStream | null>(null);
     const [previewIsGdm, setPreviewIsGdm] = React.useState(false);
@@ -123,11 +127,17 @@ function SharePickerModal({
 
     React.useEffect(() => {
         let alive = true;
-        listSources().then(res => {
-            if (alive) setSources(res); // null — нативного канала нет (веб), undefined — ещё грузится
+        listSourcesDetailed().then(res => {
+            if (alive) setSrcState(res);
+            if (res.status !== "ok") logger.warn("Источники:", res.status, res.message ?? "");
         });
         return () => { alive = false; };
     }, []);
+
+    function refreshSources(): void {
+        setSrcState(null);
+        void listSourcesDetailed().then(res => setSrcState(res));
+    }
 
     React.useEffect(() => {
         const v = videoRef.current;
@@ -293,29 +303,36 @@ function SharePickerModal({
             )}
         >
             <div className={cl("picker-body")}>
-                {sources === undefined && (
+                {srcState === null && (
                     <div className={cl("picker-preview-empty")}><span>Загружаем источники…</span></div>
                 )}
 
-                {sources !== undefined && (
+                {srcState !== null && (
                     <>
-                        {sources === null ? (
-                            // веб-режим: нативного канала нет — берём источник системным пикером
+                        {srcState.status !== "ok" ? (
+                            // нативный канал недоступен/пуст — конкретная причина + запасные пути (без тупиков)
                             <div className={cl("picker-row")}>
-                                <Button
-                                    size={Button.Sizes?.SMALL ?? "small"}
-                                    color={Button.Colors?.PRIMARY ?? "brand"}
-                                    onClick={() => void pickSourceWeb()}
-                                >
-                                    {preview ? "Сменить источник" : "Выбрать экран или окно"}
-                                </Button>
+                                <span className={cl("picker-hint")}>{srcState.message}</span>
+                                <div style={{ display: "flex", gap: "8px" }}>
+                                    <Button
+                                        size={Button.Sizes?.SMALL ?? "small"}
+                                        color={Button.Colors?.PRIMARY ?? "brand"}
+                                        onClick={refreshSources}
+                                    >
+                                        Обновить список
+                                    </Button>
+                                    <Button
+                                        size={Button.Sizes?.SMALL ?? "small"}
+                                        color={Button.Colors?.GREEN ?? "green"}
+                                        onClick={() => void pickSourceWeb()}
+                                    >
+                                        {preview ? "Сменить источник" : "Выбрать экран или окно"}
+                                    </Button>
+                                </div>
                             </div>
                         ) : (
                             <div className={cl("picker-sources")}>
-                                {sources.length === 0 && (
-                                    <span className={cl("picker-hint")}>Источники не найдены</span>
-                                )}
-                                {sources.map(src => (
+                                {srcState.sources.map(src => (
                                     <div
                                         key={src.id}
                                         className={cl("picker-source")}

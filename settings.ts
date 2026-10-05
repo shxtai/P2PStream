@@ -137,6 +137,11 @@ export const settings = definePluginSettings({
         description: "Автоматически подключаться к P2P-эфиру (как у нативного стрима Discord)",
         default: false
     },
+    discoverPings: {
+        type: OptionType.BOOLEAN,
+        description: "Служебный пинг канала, если эфир не найден (хост отвечает анонсом — надёжнее при пропущенном объявлении)",
+        default: true
+    },
     nativeTiles: {
         type: OptionType.BOOLEAN,
         description: "Показывать P2P-эфир в звонке как обычный стрим: плитка с LIVE, меткой P2P, превью и зрителями (экспериментально)",

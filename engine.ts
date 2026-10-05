@@ -7,6 +7,8 @@
 import { Logger } from "@utils/Logger";
 import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
+import type { P2PSourceInfo } from "./capture";
+import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     deleteSignalMessage,
@@ -16,11 +18,9 @@ import {
     pruneFragments,
     sendSignals,
     setCleanupEnabledGetter,
-    type Signal
-} from "./signaling";
-import { startNativeAudio, type NativeAudioHandle } from "./nativeAudio";
-import { myId, randomId, toast } from "./utils";
-import type { P2PSourceInfo } from "./capture";
+    type Signal,
+    signalingHealth } from "./signaling";
+import { myId, PLUGIN_VERSION, randomId, toast } from "./utils";
 
 const logger = new Logger("P2PStream:Engine");
 
@@ -38,6 +38,8 @@ export interface LiveHost {
     channelId: string;
     lastSeen: number;
     meta: StreamMeta;
+    /** версия плагина хоста (если передана в анонсе) */
+    hostVersion?: string;
 }
 
 export type WatchState = "connecting" | "live" | "reconnecting" | "ended" | "failed";
@@ -759,6 +761,10 @@ export class P2PManager {
     private listeners = new Set<() => void>();
     private heartbeatTimer: NodeJS.Timeout | undefined;
     private pruneTimer: NodeJS.Timeout | undefined;
+    private discoverTimer: NodeJS.Timeout | undefined;
+    private lastQuerySent = 0;
+    private lastQueryReply = 0;
+    private signalingWarned = false;
 
     // region подписка для React
     subscribe = (fn: () => void): (() => void) => {
@@ -780,6 +786,24 @@ export class P2PManager {
             pruneFragments();
             this.pruneLiveHosts();
         }, 5000);
+        // discovery-пинги: если анонс пропущен (зашли в канал позже хоста, ретрай),
+        // спрашиваем канат «есть эфиры?» — хост отвечает анонсом. Джиттер против
+        // синхронного спама от всех клиентов.
+        this.discoverTimer = setInterval(() => {
+            if (this.host || this.liveHosts.size > 0) return;
+            if (settings.store.discoverPings === false) return;
+            const voice = currentVoiceChannelId();
+            if (!voice) return;
+            const now = Date.now();
+            if (now - this.lastQuerySent < 11_000) return;
+            this.lastQuerySent = now;
+            setTimeout(() => {
+                if (this.host || this.liveHosts.size > 0) return;
+                const v = currentVoiceChannelId();
+                if (!v) return;
+                sendSignals(v, { v: 1, t: "query", s: "*", from: myId() });
+            }, (myId().charCodeAt(0) % 5) * 700);
+        }, 13_000);
         logger.info("P2P-движок запущен");
     }
 
@@ -790,6 +814,8 @@ export class P2PManager {
         this.liveHosts.clear();
         if (this.pruneTimer) clearInterval(this.pruneTimer);
         this.pruneTimer = undefined;
+        if (this.discoverTimer) clearInterval(this.discoverTimer);
+        this.discoverTimer = undefined;
         this.stopHeartbeat();
         this.bump();
         logger.info("P2P-движок остановлен");
@@ -880,10 +906,22 @@ export class P2PManager {
 
         // мгновенное объявление (не ждём первого тика heartbeat)
         this.announce();
+        void this.checkSignalingAlive();
 
         const meta = currentMeta();
         toast(`P2P-эфир начат: ${meta.res} ${meta.fps} FPS, ${meta.bitrate} Мбит/с`, "success");
         logger.info("Эфир начат", meta);
+    }
+
+    /** Через несколько секунд убедиться, что анонс реально ушёл (иначе зрители не увидят эфир) */
+    private async checkSignalingAlive(): Promise<void> {
+        await new Promise(r => setTimeout(r, 4500));
+        if (!this.host || this.signalingWarned) return;
+        if (signalingHealth.consecutiveFailures > 0) {
+            this.signalingWarned = true;
+            logger.error("Сигналинг не работает:", signalingHealth.lastError);
+            toast("Сигналинг не работает — зрители не увидят эфир. Наберите /p2p-doctor", "critical");
+        }
     }
 
     async startShare(): Promise<void> {
@@ -934,7 +972,8 @@ export class P2PManager {
         const { host } = this;
         if (!host) return;
         sendSignals(host.channelId, {
-            v: 1, t: "announce", s: host.streamId, from: myId(), d: this.host!.meta
+            v: 1, t: "announce", s: host.streamId, from: myId(),
+            d: { ...this.host!.meta, av: PLUGIN_VERSION }
         });
     }
 
@@ -1004,7 +1043,8 @@ export class P2PManager {
                     name: userNameSafe(sig.from),
                     channelId,
                     lastSeen: Date.now(),
-                    meta: sig.d ?? {}
+                    meta: sig.d ?? {},
+                    hostVersion: typeof sig.d?.av === "string" ? sig.d.av : undefined
                 });
 
                 if (!prev && channelId === voice) {
@@ -1016,6 +1056,17 @@ export class P2PManager {
                     }
                 }
                 this.bump();
+                return true;
+            }
+            case "query": {
+                // зритель спрашивает «есть эфиры?» — отвечаем анонсом (не чаще раза в 5 с)
+                if (this.host && (sig.s === "*" || sig.s === this.host.streamId)) {
+                    const now = Date.now();
+                    if (now - this.lastQueryReply > 5000) {
+                        this.lastQueryReply = now;
+                        this.announce();
+                    }
+                }
                 return true;
             }
             case "bye": {

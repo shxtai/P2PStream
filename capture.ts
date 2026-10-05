@@ -41,6 +41,60 @@ export async function listSources(): Promise<P2PSourceInfo[] | null> {
     }
 }
 
+export type SourceListState =
+    | { status: "ok"; sources: P2PSourceInfo[] }
+    | { status: "no-native"; sources: []; message: string }
+    | { status: "empty"; sources: []; message: string }
+    | { status: "error"; sources: []; message: string };
+
+/**
+ * Подробное состояние списка источников — пикер показывает конкретную причину
+ * вместо тихой пустоты, а «веб-фолбэк» остаётся доступен всегда.
+ */
+export async function listSourcesDetailed(): Promise<SourceListState> {
+    const helpers = (globalThis as any).VencordNative?.pluginHelpers?.P2PStream;
+    if (!helpers?.getSources) {
+        return {
+            status: "no-native",
+            sources: [],
+            message:
+                "Нативный канал источников недоступен: плагин установлен без native-части (однофайловая сборка или старый билд). " +
+                "Установи плагин ПАПКОЙ из Git-источника (VencForge или veskforge) — тогда появится сетка источников с превью."
+        };
+    }
+
+    // desktopCapturer иногда отдаёт пустой список сразу после старта — пробуем дважды
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const res: unknown = await helpers.getSources(384, 216);
+            if (Array.isArray(res) && res.length > 0) {
+                return { status: "ok", sources: res as P2PSourceInfo[] };
+            }
+            if (attempt === 1) {
+                await new Promise(r => setTimeout(r, 400));
+                continue;
+            }
+            return {
+                status: "empty",
+                sources: [],
+                message: "Система не вернула ни экранов, ни окон (попытка 2). Обнови список или выбери источник системным пикером."
+            };
+        } catch (e) {
+            logger.warn("listSources:", e);
+            if (attempt === 1) {
+                await new Promise(r => setTimeout(r, 400));
+                continue;
+            }
+            return {
+                status: "error",
+                sources: [],
+                message: `Не удалось получить источники: ${(e as Error)?.message ?? e}`
+            };
+        }
+    }
+    return { status: "empty", sources: [], message: "Источники не найдены" };
+}
+
 function legacyConstraints(sourceId: string, opts: CaptureOptions, withAudio: boolean): any {
     const video: any = {
         mandatory: {
