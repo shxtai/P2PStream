@@ -164,6 +164,29 @@ function fakeStream(host: LiveHost): any {
         }
     });
 }
+/** Участник-стрим для плиток звонка. У Discord пользователь и его стрим — ДВА
+ *  разных участника: у стрима id = streamKey и ссылка на ApplicationStream в stream.
+ *  (Раньше фейк имел id = userId и подменял участника-пользователя — иконка
+ *  стримера пропадала из звонка, будто его там нет.) */
+function fakeParticipant(host: LiveHost): any {
+    const stream = fakeStream(host);
+    const key = streamKeyFor(host);
+    return new Proxy({ id: key, stream, __vcP2PFake: true }, {
+        get(t: any, p) {
+            if (p in t) return t[p];
+            return stream[p];
+        },
+        has(t: any, p) {
+            return p in t || p in stream;
+        }
+    });
+}
+
+function isOurStreamParticipant(channelId: any, participantId: any): LiveHost | null {
+    if (participantId == null) return null;
+    const id = String(participantId);
+    return hostsInChannel(channelId).find(h => streamKeyFor(h) === id) ?? null;
+}
 // endregion
 
 // region обёртки сторов
@@ -263,34 +286,31 @@ function wrapChannelRTCStore(): void {
         const res = orig(channelId) ?? [];
         const hosts = hostsInChannel(channelId);
         if (!hosts.length) return res;
-        const list = [...res];
+        // участника-пользователя НЕ трогаем — плитку стрима добавляем рядом
+        const list = [...res].filter((p: any) => !p?.__vcP2PFake);
         for (const host of hosts) {
-            const fake = fakeStream(host);
-            const idx = list.findIndex((p: any) =>
-                p && !p.__vcP2PFake &&
-                (String(p.id) === host.userId || (p.user && String(p.user.id) === host.userId))
-            );
-            if (idx >= 0) list[idx] = fake;
-            else list.push(fake);
+            const key = streamKeyFor(host);
+            if (list.some((p: any) => p && String(p.id) === key)) continue;
+            list.push(fakeParticipant(host));
         }
         return list;
     });
 
     override(store, "getParticipant", (orig, channelId, participantId) => {
-        const host = hostsInChannel(channelId).find(h => String(participantId) === h.userId);
-        return host ? fakeStream(host) : orig(channelId, participantId);
+        const host = isOurStreamParticipant(channelId, participantId);
+        return host ? fakeParticipant(host) : orig(channelId, participantId);
     });
 
     override(store, "getStreamParticipants", (orig, channelId) => {
         const res = orig(channelId) ?? [];
-        const fakes = hostsInChannel(channelId).map(fakeStream);
+        const fakes = hostsInChannel(channelId).map(fakeParticipant);
         if (!fakes.length) return res;
         const list = [...res].filter((p: any) => !p?.__vcP2PFake);
         return [...list, ...fakes];
     });
 
     override(store, "isParticipantPoppedOut", (orig, channelId, participantId) => {
-        if (hostsInChannel(channelId).some(h => String(participantId) === h.userId)) return false;
+        if (isOurStreamParticipant(channelId, participantId)) return false;
         return orig(channelId, participantId);
     });
 }

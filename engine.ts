@@ -727,7 +727,7 @@ export class WatchSession {
                 return;
             }
             this.sendJoin();
-        }, 3000);
+        }, 6000); // ~18 с на ответ: оффер в фолбэке — несколько сообщений подряд, 9 с не хватало
     }
 
     private stopJoinLoop(): void {

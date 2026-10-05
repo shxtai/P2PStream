@@ -360,8 +360,20 @@ async function dmChannelFor(userId: string): Promise<string | null> {
     }
 }
 
+/** Тихая REST-отправка упала на СЕТЕВОМ уровне (ERR_CONNECTION_CLOSED, «Request has
+ *  been terminated» — без HTTP-статуса): до этого момента не пытаемся её повторять.
+ *  Иначе каждый сигнал тратил секунды на две заведомо мёртвые попытки (ЛС + канал),
+ *  оффер не успевал дойти, и зритель сдавался раньше, чем хост ответит. */
+let silentRestBrokenUntil = 0;
+const SILENT_REST_COOLDOWN_MS = 5 * 60_000;
+
+export function silentRestAvailable(): boolean {
+    return Date.now() >= silentRestBrokenUntil;
+}
+
 /** Отправить ОДНО тихое сообщение REST-ом; возвращает messageId или null */
 async function sendSilentMessage(channelId: string, content: string): Promise<string | null> {
+    if (!silentRestAvailable()) return null;
     const nonce = makeNonce();
     try {
         const res: any = await RestAPI.post({
@@ -381,6 +393,9 @@ async function sendSilentMessage(channelId: string, content: string): Promise<st
     } catch (e: any) {
         healthFail(e);
         const status = e?.status ?? e?.body?.code;
+        if (!status) {
+            silentRestBrokenUntil = Date.now() + SILENT_REST_COOLDOWN_MS;
+        }
         logger.warn(`Тихая отправка в ${channelId} не удалась (${status ?? e?.message}): перехожу на обычную`);
         return null;
     }
@@ -388,6 +403,7 @@ async function sendSilentMessage(channelId: string, content: string): Promise<st
 
 /** Отправить сигнал адресно через ЛС (@silent, самоудаление). true — ушло. */
 async function sendViaDm(voiceChannelId: string, sig: Signal, contents: string[]): Promise<boolean> {
+    if (!silentRestAvailable()) return false;
     const dm = await dmChannelFor(sig.to!);
     // ЛС закрыто — падаем в тихий канал голосового чата
     const target = dm ?? voiceChannelId;
@@ -446,11 +462,13 @@ export function sendSignals(channelId: string, sig: Signal): void {
             const contents = await encodeSignal(sig, channelId);
 
             // 1) адресные сигналы — в ЛС с получателем (никто не видит), тихо
-            if (sig.to && settings.store.silentDm !== false) {
+            if (sig.to && settings.store.silentDm !== false && silentRestAvailable()) {
                 if (await sendViaDm(channelId, sig, contents)) return;
             }
-            // 2) broadcast (или ЛС не вышло) — тихое сообщение в голосовой канал
-            if (settings.store.silentDm !== false) {
+            // 2) broadcast (или ЛС не вышло) — тихое сообщение в голосовой канал.
+            // В звонке в ЛС голосовой канал = ЛС: повторять ту же попытку бессмысленно.
+            const dmIsVoice = !!sig.to && existingDm(sig.to) === channelId;
+            if (settings.store.silentDm !== false && silentRestAvailable() && !dmIsVoice) {
                 if (await sendViaVoiceChannel(channelId, contents)) return;
             }
             // 3) последний фолбэк — старый путь (видимые коды с автоудалением)
@@ -488,9 +506,9 @@ async function sendMessageSafe(channelId: string, content: string): Promise<bool
         setTimeout(() => recentNonces.delete(nonce), 30_000);
         const res: unknown = (MessageActions as any).sendMessage(
             channelId,
-            { content, tts: false, nonce },
+            { content, tts: false, nonce, flags: SUPPRESS_NOTIFICATIONS },
             true,
-            { nonce, allowedMentions: { parse: [] } }
+            { nonce, allowedMentions: { parse: [] }, flags: SUPPRESS_NOTIFICATIONS }
         );
         if (res && typeof (res as Promise<unknown>).catch === "function") {
             await (res as Promise<unknown>);
