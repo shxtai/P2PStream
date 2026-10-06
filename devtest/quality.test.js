@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -55,6 +55,20 @@ const MAX = 30e6;
     let st = initSendState(MAX, 0);
     for (let i = 1; i <= 20; i++) st = nextCap(st, { loss: 0, pli: 6, rttMs: 100, now: i * 2000 }, MAX).state;
     check("PLI без потерь (реальный лог: ×6 каждые 2 с) — битрейт НЕ режется", st.capBps === MAX, `${(st.capBps / 1e6).toFixed(1)} Мбит/с`);
+}
+// 3a. реальный лог 1.15: в настройках 100 Мбит/с, оценка канала 36 -> итог сразу ≤ 32.4
+{
+    const st = initSendState(100e6, 0);
+    check("100 Мбит/с при оценке канала 36 -> итоговый потолок ≤ 32.4", effectiveCap(st, 36e6, 100e6) <= 32.4e6, `${(effectiveCap(st, 36e6, 100e6) / 1e6).toFixed(1)} Мбит/с`);
+    // старт: оценка разгоняется 3 -> 40 Мбит/с за ~10 с — итог идёт следом без медленного +15%/10 с
+    let s2 = initSendState(30e6, 0), eff = 0;
+    [3e6, 6e6, 12e6, 20e6, 30e6, 40e6].forEach((b, i) => { s2 = nextCap(s2, { loss: 0, pli: 0, rttMs: 100, bweBps: b, now: (i + 1) * 2000 }, 30e6).state; eff = effectiveCap(s2, b, 30e6); });
+    check("на старте итог следует за разгоном оценки канала (за 12 с до максимума)", eff === 30e6, `${(eff / 1e6).toFixed(1)} Мбит/с`);
+    // потери режут независимо от оценки
+    let s3 = initSendState(30e6, 0);
+    for (let i = 1; i <= 4; i++) s3 = nextCap(s3, { loss: 0.15, pli: 5, rttMs: 140, bweBps: 36e6, now: i * 2000 }, 30e6).state;
+    check("при потерях 15% итог ниже оценки канала", effectiveCap(s3, 36e6, 30e6) < 25e6, `${(effectiveCap(s3, 36e6, 30e6) / 1e6).toFixed(1)} Мбит/с`);
+    check("PLI при NACK — это сеть, а не декодер", nextDecodeTrouble(2, { pli: 13, loss: 0, nack: 1227 }) === 0);
 }
 // 3b. «декодер не справляется»: 3 интервала PLI без потерь подряд -> смена кодека
 {

@@ -18,7 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { DECODE_TROUBLE_LIMIT, fallbackCodec, type FpsState, initFpsState, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
+import { DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, type FpsState, initFpsState, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -797,7 +797,7 @@ class HostPeer {
         if (this.aqTimer || settings.store.autoQuality === false) return;
         const userMax = () => Math.round(Number(settings.store.videoBitrate) * 1_000_000);
         this.aqState = initSendState(userMax(), Date.now());
-        let prevPli = -1, prevSrc = -1, prevEnc = -1;
+        let prevPli = -1, prevSrc = -1, prevEnc = -1, prevLost = -1, prevSent = -1, prevNack = -1;
         this.aqTimer = setInterval(async () => {
             if (this.closed || !this.aqState) return;
             if (settings.store.autoQuality === false) {
@@ -807,22 +807,42 @@ class HostPeer {
             try {
                 let loss: number | null = null, rttMs: number | null = null, pliTotal = 0, codecId = "";
                 let srcTotal = 0, encTotal = 0, encFps = 0, cpuLimited = false;
+                let lostTotal = 0, sentTotal = 0, nackTotal = 0, bweBps: number | null = null, fraction: number | null = null;
                 const report = await this.pc.getStats();
                 report.forEach((r: any) => {
                     if (r.kind !== "video") return;
                     if (r.type === "remote-inbound-rtp") {
-                        if (r.fractionLost != null) loss = r.fractionLost;
+                        if (r.fractionLost != null) fraction = r.fractionLost;
+                        lostTotal = Math.max(0, r.packetsLost ?? 0);
                         if (r.roundTripTime != null) rttMs = r.roundTripTime * 1000;
                     } else if (r.type === "outbound-rtp") {
                         pliTotal = r.pliCount ?? 0;
                         codecId = r.codecId ?? "";
                         encTotal = r.framesEncoded ?? 0;
                         encFps = r.framesPerSecond ?? 0;
+                        sentTotal = r.packetsSent ?? 0;
+                        nackTotal = r.nackCount ?? 0;
                         cpuLimited = r.qualityLimitationReason === "cpu";
                     } else if (r.type === "media-source") {
                         srcTotal = r.frames ?? 0; // кадров, поданных захватом в энкодер
                     }
                 });
+                // оценка канала от самого WebRTC (у выбранной пары кандидатов)
+                report.forEach((r: any) => {
+                    if (r.type === "transport" && r.selectedCandidatePairId) {
+                        const pair: any = report.get(r.selectedCandidatePairId);
+                        if (pair?.availableOutgoingBitrate) bweBps = pair.availableOutgoingBitrate;
+                    }
+                });
+                // Потери — по НАКОПЛЕННЫМ счётчикам за интервал (потеряно / отправлено),
+                // а не по мгновенному fractionLost: тот часто 0 между отчётами зрителя —
+                // в реальном логе «канал чистый» при фактических 15% потерь.
+                const dLost = prevLost < 0 ? 0 : Math.max(0, lostTotal - prevLost);
+                const dSent = prevSent < 0 ? 0 : Math.max(0, sentTotal - prevSent);
+                const nack = prevNack < 0 ? 0 : Math.max(0, nackTotal - prevNack);
+                prevLost = lostTotal; prevSent = sentTotal; prevNack = nackTotal;
+                if (dSent > 0) loss = Math.max(dLost / dSent, fraction ?? 0);
+                else loss = fraction;
                 const srcFrames = prevSrc < 0 ? 0 : Math.max(0, srcTotal - prevSrc);
                 const encFrames = prevEnc < 0 ? 0 : Math.max(0, encTotal - prevEnc);
                 prevSrc = srcTotal;
@@ -835,7 +855,7 @@ class HostPeer {
                 // Кодек сломан для этой пары — меняем ЭТОМУ зрителю:
                 //  - декодер зрителя не справляется: запросы ключевых кадров без потерь;
                 //  - энкодер завис: захват подаёт кадры, а закодировано ~0.
-                this.decodeTrouble = nextDecodeTrouble(this.decodeTrouble, { pli, loss });
+                this.decodeTrouble = nextDecodeTrouble(this.decodeTrouble, { pli, loss, nack });
                 this.encoderStall = nextEncoderStall(this.encoderStall, { srcFrames, encFrames });
                 if (this.decodeTrouble || this.encoderStall) {
                     logger.info(`Кодек ${this.codecName.toUpperCase()} → ${this.userId}: захват ${srcFrames} кадр., закодировано ${encFrames}, PLI ${pli}, потери ${loss != null ? (loss * 100).toFixed(1) + "%" : "?"} (подозрение ${Math.max(this.decodeTrouble, this.encoderStall)}/${DECODE_TROUBLE_LIMIT})`);
@@ -849,7 +869,7 @@ class HostPeer {
                 }
                 const max = userMax();
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
-                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, now: Date.now() }, max);
+                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now() }, max);
                 this.aqState = state;
                 // ровный FPS вместо скачущего, когда энкодер упирается в процессор
                 const userFps = Number(settings.store.fps) || 60;
@@ -861,17 +881,25 @@ class HostPeer {
 
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
                 const fps = Math.min(fpsCap || userFps, Number(src.frameRate) || 60);
-                const scale = scaleFor(state.capBps, Number(src.height) || 0, Number(src.width) || 0, fps);
-                if (state.capBps !== this.aqCapBps || scale !== this.aqScale || fpsCap !== this.aqFps) {
+                // итог: min(потолок по потерям, 90% оценки канала WebRTC, максимум из настроек)
+                const eff = effectiveCap(state, bweBps, max);
+                // разрешение — только по потолку потерь: оценка канала на старте низкая и
+                // колеблется, а смена разрешения = ключевой кадр (WebRTC сам ужмёт при нехватке)
+                const scale = scaleFor(Math.min(state.capBps, max), Number(src.height) || 0, Number(src.width) || 0, fps);
+                const capMoved = this.aqCapBps === 0 || Math.abs(eff - this.aqCapBps) > this.aqCapBps * 0.05;
+                if (capMoved || scale !== this.aqScale || fpsCap !== this.aqFps) {
                     const first = this.aqCapBps === 0;
-                    this.aqCapBps = state.capBps;
+                    const prev = this.aqCapBps;
+                    this.aqCapBps = eff;
                     this.aqScale = scale;
                     this.aqFps = fpsCap;
-                    (this.pc as any).__aq = { capBps: state.capBps, scale, fps: fpsCap || undefined };
+                    (this.pc as any).__aq = { capBps: eff, scale, fps: fpsCap || undefined };
                     await applySendParameters(this.pc);
-                    if (!first || reason) {
+                    const bweNote = bweBps && eff < Math.min(state.capBps, max) ? `оценка канала ${(bweBps / 1e6).toFixed(1)} Мбит/с` : null;
+                    // в лог — только заметные изменения (оценка канала колеблется постоянно)
+                    if (reason || (!first && Math.abs(eff - prev) > prev * 0.25) || scale !== 1) {
                         const h = Number(src.height) || 0;
-                        logger.info(`Авто-качество → ${this.userId}: ${(state.capBps / 1e6).toFixed(1)} Мбит/с${scale > 1 && h ? `, ~${Math.round(h / scale)}p` : ""}${reason ? ` — ${reason}` : ""}`);
+                        logger.info(`Авто-качество → ${this.userId}: ${(eff / 1e6).toFixed(1)} Мбит/с${scale > 1 && h ? `, ~${Math.round(h / scale)}p` : ""}${reason ? ` — ${reason}` : bweNote ? ` — ${bweNote}` : ""}`);
                     }
                     this.host.mgr.bump();
                 }

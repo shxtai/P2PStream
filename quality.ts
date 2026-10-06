@@ -22,6 +22,8 @@ export interface SendSample {
     pli: number;
     /** RTT, мс (null — нет данных) */
     rttMs: number | null;
+    /** оценка пропускной способности канала от самого WebRTC (бит/с), null — нет */
+    bweBps?: number | null;
     /** время замера, мс */
     now: number;
 }
@@ -53,6 +55,18 @@ export function initSendState(userMaxBps: number, now: number): SendState {
  * Следующий потолок битрейта. Снижение — мультипликативное и быстрое (канал
  * «захлёбывается» прямо сейчас), рост — плавный и только после 10 с чистоты.
  */
+/**
+ * Итоговый потолок = min(потолок по потерям, 90% оценки канала WebRTC).
+ * Реальный случай 1.15: в настройках 100 Мбит/с, канал ~36, энкодер выдавал 63 —
+ * потери 15%, сотни NACK и заморозки. Потолки независимы: за оценкой канала идём
+ * сразу (в т.ч. на старте, пока она разгоняется), а по потерям — режем быстро,
+ * возвращаем осторожно (nextCap).
+ */
+export function effectiveCap(st: SendState, bweBps: number | null | undefined, userMaxBps: number): number {
+    const bweCap = bweBps && bweBps > 0 ? Math.max(MIN_CAP_BPS, Math.round(bweBps * 0.9)) : Infinity;
+    return Math.min(st.capBps, bweCap, userMaxBps);
+}
+
 export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { state: SendState; reason: string | null; } {
     const next: SendState = { ...st };
     if (s.loss != null) next.lossEwma = st.lossEwma * 0.6 + s.loss * 0.4;
@@ -121,8 +135,9 @@ export function scaleFor(capBps: number, height: number, width: number, fps: num
  */
 export const DECODE_TROUBLE_LIMIT = 3;
 
-export function nextDecodeTrouble(count: number, s: { pli: number; loss: number | null; }): number {
-    return s.pli >= 2 && (s.loss ?? 0) < 0.01 ? count + 1 : 0;
+export function nextDecodeTrouble(count: number, s: { pli: number; loss: number | null; nack?: number; }): number {
+    // NACK = зритель недосчитался пакетов: это сеть, а не декодер
+    return s.pli >= 2 && (s.loss ?? 0) < 0.01 && (s.nack ?? 0) <= 2 ? count + 1 : 0;
 }
 
 /**
