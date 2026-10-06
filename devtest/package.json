@@ -3,7 +3,7 @@
   "private": true,
   "description": "Сквозной тест P2PStream без Discord (headless Chrome)",
   "scripts": {
-    "test": "node quality.test.js && node run.js"
+    "test": "node quality.test.js && node audio.test.js && node run.js"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",

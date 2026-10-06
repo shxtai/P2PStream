@@ -18,7 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { DECODE_TROUBLE_LIMIT, fallbackCodec, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
+import { DECODE_TROUBLE_LIMIT, fallbackCodec, type FpsState, initFpsState, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -348,9 +348,9 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
                 params.degradationPreference = hint as RTCDegradationPreference;
                 if (!params.encodings?.length) params.encodings = [{}];
                 // авто-качество (quality.ts) задаёт потолок/масштаб конкретному зрителю
-                const aq: { capBps?: number; scale?: number; } = (pc as any).__aq ?? {};
+                const aq: { capBps?: number; scale?: number; fps?: number; } = (pc as any).__aq ?? {};
                 params.encodings[0].maxBitrate = Math.min(wantVideoBps, aq.capBps ?? Infinity);
-                params.encodings[0].maxFramerate = wantFps;
+                params.encodings[0].maxFramerate = Math.min(wantFps, aq.fps ?? Infinity);
                 params.encodings[0].scaleResolutionDownBy = aq.scale ?? 1;
                 params.encodings[0].networkPriority = "high";
                 params.encodings[0].priority = "high";
@@ -637,6 +637,9 @@ class HostPeer {
     private aqState: SendState | null = null;
     aqCapBps = 0;
     aqScale = 1;
+    /** стабилизатор FPS при нехватке процессора (0 — не вмешивался) */
+    aqFps = 0;
+    private fpsState: FpsState | null = null;
     /** сбои декодирования у зрителя (PLI без потерь) и кодеки, от которых ушли */
     private decodeTrouble = 0;
     private encoderStall = 0;
@@ -803,7 +806,7 @@ class HostPeer {
             }
             try {
                 let loss: number | null = null, rttMs: number | null = null, pliTotal = 0, codecId = "";
-                let srcTotal = 0, encTotal = 0;
+                let srcTotal = 0, encTotal = 0, encFps = 0, cpuLimited = false;
                 const report = await this.pc.getStats();
                 report.forEach((r: any) => {
                     if (r.kind !== "video") return;
@@ -814,6 +817,8 @@ class HostPeer {
                         pliTotal = r.pliCount ?? 0;
                         codecId = r.codecId ?? "";
                         encTotal = r.framesEncoded ?? 0;
+                        encFps = r.framesPerSecond ?? 0;
+                        cpuLimited = r.qualityLimitationReason === "cpu";
                     } else if (r.type === "media-source") {
                         srcTotal = r.frames ?? 0; // кадров, поданных захватом в энкодер
                     }
@@ -846,14 +851,23 @@ class HostPeer {
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
                 const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, now: Date.now() }, max);
                 this.aqState = state;
+                // ровный FPS вместо скачущего, когда энкодер упирается в процессор
+                const userFps = Number(settings.store.fps) || 60;
+                this.fpsState ??= initFpsState(userFps, Date.now());
+                const fr = nextFpsCap(this.fpsState, { encFps, cpuLimited, now: Date.now() }, userFps);
+                this.fpsState = fr.state;
+                const fpsCap = fr.state.capFps < userFps ? fr.state.capFps : 0;
+                if (fr.reason) logger.info(`FPS → ${this.userId}: ${fr.reason}`);
+
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
-                const fps = Math.min(Number(settings.store.fps) || 60, Number(src.frameRate) || 60);
+                const fps = Math.min(fpsCap || userFps, Number(src.frameRate) || 60);
                 const scale = scaleFor(state.capBps, Number(src.height) || 0, Number(src.width) || 0, fps);
-                if (state.capBps !== this.aqCapBps || scale !== this.aqScale) {
+                if (state.capBps !== this.aqCapBps || scale !== this.aqScale || fpsCap !== this.aqFps) {
                     const first = this.aqCapBps === 0;
                     this.aqCapBps = state.capBps;
                     this.aqScale = scale;
-                    (this.pc as any).__aq = { capBps: state.capBps, scale };
+                    this.aqFps = fpsCap;
+                    (this.pc as any).__aq = { capBps: state.capBps, scale, fps: fpsCap || undefined };
                     await applySendParameters(this.pc);
                     if (!first || reason) {
                         const h = Number(src.height) || 0;

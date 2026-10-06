@@ -66,7 +66,7 @@ function collectDiagnostics(): string[] {
     push("своих P2P-эфиров", manager.host ? 1 : 0);
     push("просмотров", manager.watches.size);
     for (const [uid, peer] of manager.host?.peers ?? []) {
-        push(`  зритель ${uid}`, `conn=${peer.pc.connectionState}, ice=${peer.pc.iceConnectionState}, sig=${peer.pc.signalingState}, шифр=${peer.peerPk ? "да" : "нет"}, авто-качество: ${peer.aqCapBps ? `${(peer.aqCapBps / 1e6).toFixed(1)} Мбит/с, масштаб ÷${peer.aqScale.toFixed(2)}` : "ещё не активно"}`);
+        push(`  зритель ${uid}`, `conn=${peer.pc.connectionState}, ice=${peer.pc.iceConnectionState}, sig=${peer.pc.signalingState}, шифр=${peer.peerPk ? "да" : "нет"}, авто-качество: ${peer.aqCapBps ? `${(peer.aqCapBps / 1e6).toFixed(1)} Мбит/с, масштаб ÷${peer.aqScale.toFixed(2)}${peer.aqFps ? `, FPS ${peer.aqFps}` : ""}` : "ещё не активно"}`);
     }
     for (const w of manager.watches.values()) {
         const { pc } = w;

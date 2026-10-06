@@ -13,6 +13,7 @@
 import { spawn } from "child_process";
 import { app, desktopCapturer, type IpcMainInvokeEvent } from "electron";
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "fs";
+import { constants as osConstants, setPriority } from "os";
 import { join } from "path";
 
 export interface P2PSourceInfo {
@@ -725,6 +726,8 @@ export async function startAudio(_e: IpcMainInvokeEvent, opts: { mode: string; i
         return { ok: false, error: `не удалось запустить хелпер: ${spawnError}` };
     }
     audioProc = proc;
+    // под нагрузкой игры хелпер с обычным приоритетом может притормаживать (рывки подачи звука)
+    try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_ABOVE_NORMAL); } catch { /* нет прав — не критично */ }
     audioQueue = [];
     audioQueuedBytes = 0;
 

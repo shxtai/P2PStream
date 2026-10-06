@@ -53,8 +53,15 @@ const WORKLET_SRC = `
 class VcP2pRing extends AudioWorkletProcessor {
     constructor() {
         super();
-        this.cap = 48000 * 2;           /* 1 с стерео (float) */
-        this.maxLag = 48000 * 2 / 5;    /* > 200 мс в очереди — догоняем (иначе задержка копится) */
+        this.cap = 48000 * 2 * 2;       /* 2 с стерео (float) */
+        /* Под нагрузкой (игра) данные приходят рывками: то пусто 100+ мс, то сразу пачка.
+           Раньше очередь > 200 мс обрезалась до 100 мс (слышимый пропуск), а после
+           опустошения звук шёл крупицами (серия щелчков). Теперь: копим 80 мс перед
+           стартом и после провала, обрезаем только накопления > 350 мс (до 150 мс). */
+        this.prefill = 48000 * 2 * 0.08;
+        this.maxLag = 48000 * 2 * 0.35;
+        this.trimTo = 48000 * 2 * 0.15;
+        this.buffering = true;
         this.buf = new Float32Array(this.cap);
         this.read = 0;
         this.count = 0;                 /* кол-во валидных float-значений */
@@ -73,7 +80,7 @@ class VcP2pRing extends AudioWorkletProcessor {
                 this.count++;
             }
             if (this.count > this.maxLag) {
-                const drop = (this.count - this.maxLag / 2) & ~1;
+                const drop = (this.count - this.trimTo) & ~1;
                 this.read = (this.read + drop) % this.cap;
                 this.count -= drop;
             }
@@ -84,8 +91,10 @@ class VcP2pRing extends AudioWorkletProcessor {
         const L = out[0];
         const R = out[1] || out[0];
         const n = L.length;
+        if (this.buffering && this.count >= this.prefill) this.buffering = false;
+        if (!this.buffering && this.count < n * 2) this.buffering = true; /* провал: копим заново */
         for (let i = 0; i < n; i++) {
-            if (this.count >= 2) {
+            if (!this.buffering && this.count >= 2) {
                 L[i] = this.buf[this.read];
                 R[i] = this.buf[(this.read + 1) % this.cap];
                 this.read = (this.read + 2) % this.cap;
@@ -101,9 +110,9 @@ class VcP2pRing extends AudioWorkletProcessor {
 registerProcessor("vc-p2p-ring", VcP2pRing);
 `;
 
-/** 40 мс (было 20): вдвое меньше IPC-вызовов main<->renderer, очередь ворклета
- *  (до 200 мс) спокойно покрывает интервал */
-const PULL_INTERVAL_MS = 40;
+/** 20 мс: при 40 мс под нагрузкой игры забор опаздывал, и буфер ворклета пустел
+ *  (пропадал звук). Запросы не идут внахлёст (флаг pulling), так что это дёшево. */
+const PULL_INTERVAL_MS = 20;
 
 /**
  * Запустить нативный звук. null — если недоступен (звука нет: рендерер

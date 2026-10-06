@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -100,6 +100,23 @@ const MAX = 30e6;
     check("1440p60: 5 Мбит/с — 720p", Math.round(1440 / s5) === 720, `÷${s5.toFixed(2)}`);
     check("1440p60: 2 Мбит/с — не ниже 540p", Math.round(1440 / s2) >= 540, `${Math.round(1440 / s2)}p`);
     check("720p: никогда не ниже 540p", Math.round(720 / scaleFor(1.5e6, 720, 1280, 60)) >= 540);
+}
+// 7b. стабилизатор FPS
+{
+    let st = initFpsState(60, 0), t = 0, reasons = [];
+    // процессор не тянет: энкодер даёт ~40 из 60
+    for (let i = 0; i < 4; i++) { t += 2000; const r = nextFpsCap(st, { encFps: 40, cpuLimited: true, now: t }, 60); st = r.state; if (r.reason) reasons.push(r.reason); }
+    check("cpu-ограничение и 40 из 60 FPS ×3 -> ровные 48", st.capFps === 48, reasons[0] ?? "");
+    for (let i = 0; i < 4; i++) { t += 2000; st = nextFpsCap(st, { encFps: 36, cpuLimited: true, now: t }, 60).state; }
+    check("всё ещё не тянет -> ровные 30", st.capFps === 30);
+    for (let i = 0; i < 10; i++) { t += 2000; st = nextFpsCap(st, { encFps: 30, cpuLimited: false, now: t }, 60).state; }
+    check("сразу после снижения вверх не прыгаем (антидребезг 60 с)", st.capFps === 30);
+    for (let i = 0; i < 40; i++) { t += 2000; st = nextFpsCap(st, { encFps: st.capFps, cpuLimited: false, now: t }, 60).state; }
+    check("процессор свободен долго -> FPS возвращается к 60", st.capFps === 60, `${st.capFps}`);
+    let calm = initFpsState(60, 0);
+    for (let i = 1; i <= 50; i++) calm = nextFpsCap(calm, { encFps: 59, cpuLimited: false, now: i * 2000 }, 60).state;
+    check("без cpu-ограничения FPS не трогается", calm.capFps === 60);
+    check("шаги для 144 FPS: 144 → 60 → 48 → 30", fpsSteps(144).join(",") === "144,60,48,30");
 }
 // 8. буфер зрителя: заморозки -> растёт до 300, спокойствие -> назад к минимуму
 {

@@ -141,6 +141,56 @@ export function fallbackCodec(current: string, tried: string[]): string | null {
     return chain.find(c => c !== current && !tried.includes(c)) ?? null;
 }
 
+/**
+ * Стабилизатор FPS. Когда энкодер упирается в процессор (игра + программный VP9),
+ * WebRTC выкидывает кадры неравномерно — FPS скачет 35–60, глазу это «рваные
+ * кадры». Ровные 48 или 30 смотрятся плавнее. Шаг вниз — после 3 интервалов
+ * подряд с cpu-ограничением и FPS < 85% цели; шаг вверх — после 30 с без
+ * ограничения и не раньше чем через 60 с после последнего шага вниз.
+ */
+export interface FpsState {
+    capFps: number;
+    /** интервалов подряд «не тянет» */
+    strain: number;
+    /** с какого момента энкодеру легко */
+    easySince: number;
+    lastDown: number;
+}
+
+export function initFpsState(userFps: number, now: number): FpsState {
+    return { capFps: userFps, strain: 0, easySince: now, lastDown: 0 };
+}
+
+export function fpsSteps(userFps: number): number[] {
+    return [...new Set([userFps, 60, 48, 30].filter(f => f <= userFps && f >= 30))].sort((a, b) => b - a);
+}
+
+export function nextFpsCap(st: FpsState, s: { encFps: number; cpuLimited: boolean; now: number; }, userFps: number): { state: FpsState; reason: string | null; } {
+    const steps = fpsSteps(userFps);
+    const next: FpsState = { ...st };
+    if (st.capFps > userFps) next.capFps = userFps;
+    const idx = Math.max(0, steps.indexOf(next.capFps));
+    if (s.cpuLimited && s.encFps < next.capFps * 0.85) {
+        next.strain = st.strain + 1;
+        next.easySince = s.now;
+        if (next.strain >= 3 && idx < steps.length - 1) {
+            next.capFps = steps[idx + 1];
+            next.strain = 0;
+            next.lastDown = s.now;
+            return { state: next, reason: `энкодер упирается в процессор (${Math.round(s.encFps)} FPS из ${st.capFps}) — ставлю ровные ${next.capFps}` };
+        }
+        return { state: next, reason: null };
+    }
+    next.strain = 0;
+    if (s.cpuLimited) { next.easySince = s.now; return { state: next, reason: null }; }
+    if (idx > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
+        next.capFps = steps[idx - 1];
+        next.easySince = s.now;
+        return { state: next, reason: `процессор свободен — пробую ${next.capFps} FPS` };
+    }
+    return { state: next, reason: null };
+}
+
 /** Замер со стороны зрителя за интервал */
 export interface RecvSample {
     /** новых заморозок за интервал */
