@@ -176,8 +176,35 @@ export function initFpsState(userFps: number, now: number): FpsState {
     return { capFps: userFps, strain: 0, easySince: now, lastDown: 0 };
 }
 
+/** Минимальный FPS, ниже которого авто-качество не опускается (если в настройках не меньше) */
+export const MIN_FPS = 60;
+
 export function fpsSteps(userFps: number): number[] {
-    return [...new Set([userFps, 60, 48, 30].filter(f => f <= userFps && f >= 30))].sort((a, b) => b - a);
+    // ниже 60 не уходим: при нехватке процессора/бит WebRTC в режиме «Игры»
+    // сохраняет FPS и снижает разрешение — это и нужно для игр
+    if (userFps <= MIN_FPS) return [userFps];
+    return [...new Set([userFps, 144, 120, 90, MIN_FPS].filter(f => f <= userFps && f >= MIN_FPS))].sort((a, b) => b - a);
+}
+
+/**
+ * FPS выше 60 — только когда хватает бит на кадр. Битрейт делится на все кадры:
+ * 50 Мбит/с при 110 FPS в 1440p — ~0.11 бит/пиксель/кадр, и в быстрых сценах
+ * картинка «мылится»; при 60 FPS бит на кадр почти вдвое больше. Порог ~0.16
+ * бит/пиксель/кадр (с гистерезисом: подняться — от 0.19), иначе держим 60.
+ */
+export const BPP_HIGH_FPS = 0.16;
+export const BPP_HIGH_FPS_UP = 0.19;
+
+export function qualityFpsCap(prevCap: number, capBps: number, width: number, height: number, userFps: number): number {
+    const steps = fpsSteps(userFps);
+    if (!width || !height || steps.length === 1) return steps[0];
+    const bpp = (fps: number) => capBps / (width * height * fps);
+    for (const f of steps) {
+        if (f <= MIN_FPS) return f;
+        const need = f > prevCap ? BPP_HIGH_FPS_UP : BPP_HIGH_FPS; // выше текущего — с запасом
+        if (bpp(f) >= need) return f;
+    }
+    return steps[steps.length - 1];
 }
 
 export function nextFpsCap(st: FpsState, s: { encFps: number; cpuLimited: boolean; now: number; }, userFps: number): { state: FpsState; reason: string | null; } {

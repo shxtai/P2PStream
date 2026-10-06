@@ -18,7 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, type FpsState, initFpsState, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
+import { DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, type FpsState, initFpsState, qualityFpsCap, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -640,6 +640,8 @@ class HostPeer {
     /** стабилизатор FPS при нехватке процессора (0 — не вмешивался) */
     aqFps = 0;
     private fpsState: FpsState | null = null;
+    /** FPS, на который хватает бит на кадр при текущем канале (≥ 60) */
+    private qualityFps = 0;
     /** сбои декодирования у зрителя (PLI без потерь) и кодеки, от которых ушли */
     private decodeTrouble = 0;
     private encoderStall = 0;
@@ -876,13 +878,21 @@ class HostPeer {
                 this.fpsState ??= initFpsState(userFps, Date.now());
                 const fr = nextFpsCap(this.fpsState, { encFps, cpuLimited, now: Date.now() }, userFps);
                 this.fpsState = fr.state;
-                const fpsCap = fr.state.capFps < userFps ? fr.state.capFps : 0;
                 if (fr.reason) logger.info(`FPS → ${this.userId}: ${fr.reason}`);
 
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
-                const fps = Math.min(fpsCap || userFps, Number(src.frameRate) || 60);
                 // итог: min(потолок по потерям, 90% оценки канала WebRTC, максимум из настроек)
                 const eff = effectiveCap(state, bweBps, max);
+                // FPS выше 60 — только если на него хватает бит на кадр (иначе быстрые
+                // сцены «мылятся»); ниже 60 не опускаемся никогда
+                const prevQ = this.qualityFps || userFps;
+                this.qualityFps = qualityFpsCap(prevQ, eff, Number(src.width) || 0, Number(src.height) || 0, userFps);
+                if (this.qualityFps !== prevQ && (this.aqCapBps || this.qualityFps < userFps)) {
+                    logger.info(`FPS → ${this.userId}: ${this.qualityFps < prevQ ? `бит на кадр мало для ${prevQ} FPS при ${(eff / 1e6).toFixed(1)} Мбит/с — ставлю ${this.qualityFps} ради чёткой картинки` : `канала хватает — поднимаю до ${this.qualityFps} FPS`}`);
+                }
+                const total = Math.min(fr.state.capFps, this.qualityFps);
+                const fpsCap = total < userFps ? total : 0;
+                const fps = Math.min(fpsCap || userFps, Number(src.frameRate) || 60);
                 // разрешение — только по потолку потерь: оценка канала на старте низкая и
                 // колеблется, а смена разрешения = ключевой кадр (WebRTC сам ужмёт при нехватке)
                 const scale = scaleFor(Math.min(state.capBps, max), Number(src.height) || 0, Number(src.width) || 0, fps);

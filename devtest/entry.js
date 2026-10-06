@@ -10,6 +10,7 @@ const relay = q.get("relay");
 settings.store.audioMode = "off"; // нативного хелпера в браузере нет
 if (q.get("bitrate")) settings.store.videoBitrate = Number(q.get("bitrate")); // Мбит/с, как в настройках
 if (q.get("codec")) settings.store.codec = q.get("codec");
+if (q.get("fps")) settings.store.fps = String(q.get("fps"));
 if (relay) {
     if (role === "host") {
         // TURN есть только у хоста — зритель должен получить его в оффере

@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -115,22 +115,34 @@ const MAX = 30e6;
     check("1440p60: 2 Мбит/с — не ниже 540p", Math.round(1440 / s2) >= 540, `${Math.round(1440 / s2)}p`);
     check("720p: никогда не ниже 540p", Math.round(720 / scaleFor(1.5e6, 720, 1280, 60)) >= 540);
 }
-// 7b. стабилизатор FPS
+// 7b. стабилизатор FPS при нехватке процессора — НИЖЕ 60 НЕ ОПУСКАЕТСЯ
 {
-    let st = initFpsState(60, 0), t = 0, reasons = [];
-    // процессор не тянет: энкодер даёт ~40 из 60
-    for (let i = 0; i < 4; i++) { t += 2000; const r = nextFpsCap(st, { encFps: 40, cpuLimited: true, now: t }, 60); st = r.state; if (r.reason) reasons.push(r.reason); }
-    check("cpu-ограничение и 40 из 60 FPS ×3 -> ровные 48", st.capFps === 48, reasons[0] ?? "");
-    for (let i = 0; i < 4; i++) { t += 2000; st = nextFpsCap(st, { encFps: 36, cpuLimited: true, now: t }, 60).state; }
-    check("всё ещё не тянет -> ровные 30", st.capFps === 30);
-    for (let i = 0; i < 10; i++) { t += 2000; st = nextFpsCap(st, { encFps: 30, cpuLimited: false, now: t }, 60).state; }
-    check("сразу после снижения вверх не прыгаем (антидребезг 60 с)", st.capFps === 30);
-    for (let i = 0; i < 40; i++) { t += 2000; st = nextFpsCap(st, { encFps: st.capFps, cpuLimited: false, now: t }, 60).state; }
-    check("процессор свободен долго -> FPS возвращается к 60", st.capFps === 60, `${st.capFps}`);
+    let st = initFpsState(60, 0), t = 0;
+    for (let i = 0; i < 10; i++) { t += 2000; st = nextFpsCap(st, { encFps: 40, cpuLimited: true, now: t }, 60).state; }
+    check("в настройках 60, процессор не тянет -> FPS всё равно 60 (снижать будет разрешение)", st.capFps === 60);
+    let s144 = initFpsState(144, 0), reasons = [];
+    t = 0;
+    for (let i = 0; i < 4; i++) { t += 2000; const r = nextFpsCap(s144, { encFps: 90, cpuLimited: true, now: t }, 144); s144 = r.state; if (r.reason) reasons.push(r.reason); }
+    check("144 FPS, процессор даёт ~90 -> ровные 120", s144.capFps === 120, reasons[0] ?? "");
+    for (let i = 0; i < 20; i++) { t += 2000; s144 = nextFpsCap(s144, { encFps: 50, cpuLimited: true, now: t }, 144).state; }
+    check("и дальше не тянет -> не ниже 60", s144.capFps === 60);
+    for (let i = 0; i < 60; i++) { t += 2000; s144 = nextFpsCap(s144, { encFps: s144.capFps, cpuLimited: false, now: t }, 144).state; }
+    check("процессор свободен долго -> FPS возвращается к 144", s144.capFps === 144, `${s144.capFps}`);
     let calm = initFpsState(60, 0);
     for (let i = 1; i <= 50; i++) calm = nextFpsCap(calm, { encFps: 59, cpuLimited: false, now: i * 2000 }, 60).state;
     check("без cpu-ограничения FPS не трогается", calm.capFps === 60);
-    check("шаги для 144 FPS: 144 → 60 → 48 → 30", fpsSteps(144).join(",") === "144,60,48,30");
+    check("шаги для 144 FPS: 144 → 120 → 90 → 60", fpsSteps(144).join(",") === "144,120,90,60");
+    check("в настройках 30 — остаётся 30 (не поднимаем выше выбора)", fpsSteps(30).join(",") === "30");
+}
+// 7c. FPS выше 60 — только если хватает бит на кадр (картинка в динамике без «мыла»)
+{
+    const W = 2560, H = 1440;
+    check("1440p, 50 Мбит/с, в настройках 120 -> 60 (на 90+ бит на кадр мало)", qualityFpsCap(120, 50e6, W, H, 120) === 60, `${qualityFpsCap(120, 50e6, W, H, 120)}`);
+    check("1440p, 80 Мбит/с, в настройках 120 -> 120", qualityFpsCap(60, 80e6, W, H, 120) === 90 || qualityFpsCap(120, 80e6, W, H, 120) >= 120, `${qualityFpsCap(120, 80e6, W, H, 120)}`);
+    check("1080p, 50 Мбит/с, в настройках 144 -> 120", qualityFpsCap(60, 50e6, 1920, 1080, 144) === 120, `${qualityFpsCap(60, 50e6, 1920, 1080, 144)}`);
+    check("гистерезис: на 60 при 0.17 бит/пикс не поднимаемся до 90", qualityFpsCap(60, 0.17 * W * H * 90, W, H, 120) === 60);
+    check("гистерезис: на 90 при 0.17 бит/пикс остаёмся на 90", qualityFpsCap(90, 0.17 * W * H * 90, W, H, 120) === 90);
+    check("никогда не ниже 60, даже при 5 Мбит/с", qualityFpsCap(120, 5e6, W, H, 120) === 60);
 }
 // 8. буфер зрителя: заморозки -> растёт до 300, спокойствие -> назад к минимуму
 {
