@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -159,6 +159,29 @@ const MAX = 30e6;
     check("гистерезис: на 60 при 0.17 бит/пикс не поднимаемся до 90", qualityFpsCap(60, 0.17 * W * H * 90, W, H, 120) === 60);
     check("гистерезис: на 90 при 0.17 бит/пикс остаёмся на 90", qualityFpsCap(90, 0.17 * W * H * 90, W, H, 120) === 90);
     check("никогда не ниже 60, даже при 5 Мбит/с", qualityFpsCap(120, 5e6, W, H, 120) === 60);
+}
+// 7d. лестница качества: разрешение и FPS вместе
+{
+    const A = 16 / 9;
+    const L = buildLadder(1440, 120);
+    const name = i => `${L[i].height}p@${L[i].fps}`;
+    check("лестница 1440p/120: 1440@120 → 1440@90 → 1440@60 → 1080@60 → 900@60 → 720@60",
+        L.map(r => `${r.height}@${r.fps}`).join(",") === "1440@120,1440@90,1440@60,1080@60,900@60,720@60", L.map(r => `${r.height}@${r.fps}`).join(","));
+    check("50 Мбит/с → 1440p@60 (на 90+ бит на кадр мало)", name(pickRung(L, 50e6, A, -1)) === "1440p@60", name(pickRung(L, 50e6, A, -1)));
+    check("80 Мбит/с → 1440p@120", name(pickRung(L, 80e6, A, -1)) === "1440p@120", name(pickRung(L, 80e6, A, -1)));
+    check("12 Мбит/с → 1080p@60 (не 1440p с мылом и не 480p@240)", name(pickRung(L, 12e6, A, -1)) === "1080p@60", name(pickRung(L, 12e6, A, -1)));
+    check("2 Мбит/с → не ниже 720p@60", name(pickRung(L, 2e6, A, -1)) === "720p@60");
+    // гистерезис: на 1080@60 при битрейте чуть выше нужного для 1440@60 — не прыгаем вверх
+    const need1440 = rungNeedBps(L[2], A);
+    check("гистерезис: вверх только с запасом 15%", pickRung(L, need1440 * 1.05, A, 3) === 3 && pickRung(L, need1440 * 1.2, A, 3) === 2);
+    check("нехватка процессора: на ступень ниже по разрешению, FPS тот же", name(pickRung(L, 50e6, A, -1, 1)) === "1080p@60");
+    const L60 = buildLadder(1080, 60);
+    check("1080p/60: родное@60 → 900@60 → 720@60", L60.map(r => `${r.height}@${r.fps}`).join(",") === "1080@60,900@60,720@60", L60.map(r => `${r.height}@${r.fps}`).join(","));
+    let cs = initCpuState(0), t = 0, why = null;
+    for (let i = 0; i < 3; i++) { t += 2000; const r = nextCpuSteps(cs, { encFps: 45, targetFps: 60, cpuLimited: true, now: t }, 3); cs = r.state; why = r.reason ?? why; }
+    check("процессор не тянет 60 ×3 → минус ступень", cs.steps === 1, why ?? "");
+    for (let i = 0; i < 40; i++) { t += 2000; cs = nextCpuSteps(cs, { encFps: 60, targetFps: 60, cpuLimited: false, now: t }, 3).state; }
+    check("процессор свободен → ступень возвращается", cs.steps === 0);
 }
 // 8. буфер зрителя: заморозки -> растёт до 300, спокойствие -> назад к минимуму
 {

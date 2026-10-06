@@ -239,6 +239,83 @@ export function nextFpsCap(st: FpsState, s: { encFps: number; cpuLimited: boolea
     return { state: next, reason: null };
 }
 
+/**
+ * ЛЕСТНИЦА КАЧЕСТВА (v1.18): разрешение и FPS выбираются вместе — самая
+ * качественная ступень, на которую хватает битрейта. Раньше это решали два
+ * независимых правила с разными порогами, и можно было получить «480p при
+ * 240 FPS» или «1440p, но мыло». Ступени: родное@высокий FPS → родное@60 →
+ * 1440p@60 → 1080p@60 → 900p@60 → 720p@60. Ниже 60 FPS и ниже 720p не уходим.
+ */
+export interface Rung { height: number; fps: number; }
+
+/** бит на пиксель на кадр для «отличной» картинки: при 60 FPS и для FPS выше 60 */
+export const BPP_60 = 0.08;
+export const BPP_HIGH = 0.16;
+
+export function buildLadder(srcHeight: number, userFps: number): Rung[] {
+    const fpsList = fpsSteps(userFps);
+    const base = fpsList[fpsList.length - 1]; // 60 (или выбор пользователя, если он ниже)
+    const top = Math.max(1, Math.round(srcHeight));
+    const heights = [...new Set([top, 1440, 1080, 900, 720].filter(h => h <= top && (h >= 720 || h === top)))].sort((a, b) => b - a);
+    const ladder: Rung[] = [];
+    for (const f of fpsList) if (f > base) ladder.push({ height: top, fps: f });
+    for (const h of heights) ladder.push({ height: h, fps: base });
+    return ladder;
+}
+
+export function rungNeedBps(r: Rung, aspect: number): number {
+    const w = Math.round(r.height * aspect);
+    return w * r.height * r.fps * (r.fps > 60 ? BPP_HIGH : BPP_60);
+}
+
+/**
+ * Выбор ступени. Подниматься — только с запасом 15% (против дёрганья туда-сюда,
+ * каждое переключение разрешения = ключевой кадр). cpuSteps — на сколько ступеней
+ * опуститься из-за нехватки процессора (меньше пикселей — меньше нагрузка; FPS
+ * при этом остаётся ≥ 60).
+ */
+export function pickRung(ladder: Rung[], capBps: number, aspect: number, prevIdx: number, cpuSteps = 0): number {
+    let idx = ladder.length - 1;
+    for (let i = 0; i < ladder.length; i++) {
+        const need = rungNeedBps(ladder[i], aspect) * (prevIdx >= 0 && i < prevIdx ? 1.15 : 1);
+        if (need <= capBps) { idx = i; break; }
+    }
+    return Math.min(ladder.length - 1, idx + Math.max(0, cpuSteps));
+}
+
+/**
+ * Процессор: энкодер упирается в CPU и не дотягивает до FPS ступени (×3 замера) —
+ * опускаемся на ступень; 30 с без нехватки и ≥ 60 с после спуска — пробуем вверх.
+ */
+export interface CpuState { steps: number; strain: number; easySince: number; lastDown: number; }
+
+export function initCpuState(now: number): CpuState {
+    return { steps: 0, strain: 0, easySince: now, lastDown: 0 };
+}
+
+export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: number; cpuLimited: boolean; now: number; }, maxSteps: number): { state: CpuState; reason: string | null; } {
+    const next: CpuState = { ...st };
+    if (s.cpuLimited && s.encFps < s.targetFps * 0.85) {
+        next.strain = st.strain + 1;
+        next.easySince = s.now;
+        if (next.strain >= 3 && next.steps < maxSteps) {
+            next.steps++;
+            next.strain = 0;
+            next.lastDown = s.now;
+            return { state: next, reason: `процессор не успевает (${Math.round(s.encFps)} из ${s.targetFps} FPS) — снижаю разрешение, FPS сохраняю` };
+        }
+        return { state: next, reason: null };
+    }
+    next.strain = 0;
+    if (s.cpuLimited) { next.easySince = s.now; return { state: next, reason: null }; }
+    if (next.steps > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
+        next.steps--;
+        next.easySince = s.now;
+        return { state: next, reason: "процессор свободен — пробую ступень выше" };
+    }
+    return { state: next, reason: null };
+}
+
 /** Замер со стороны зрителя за интервал */
 export interface RecvSample {
     /** новых заморозок за интервал */

@@ -18,7 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, type FpsState, initFpsState, qualityFpsCap, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextFpsCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -249,7 +249,21 @@ function applyVideoCodecPreference(pc: RTCPeerConnection, codec: string): void {
             }
         }
 
-        const list = (codec === "auto" ? [...chosen, ...rest] : chosen) as RTCRtpCodec[];
+        // Ручной выбор: выбранный кодек первым, но ЗА ним — запасные (VP9 → VP8 → H.264 →
+        // остальные). Раньше в SDP был только выбранный: если у зрителя его нет (например,
+        // H.265 у друга не поддерживается), согласование падало и видео не было вовсе.
+        let list: RTCRtpCodec[];
+        if (codec === "auto") {
+            list = [...chosen, ...rest] as RTCRtpCodec[];
+        } else {
+            const backupOrder = ["vp9", "vp8", "h264", "av1"].filter(c => c !== codec);
+            const backups: any[] = [];
+            for (const want of backupOrder) {
+                for (const c of caps.codecs) if (c.mimeType.toLowerCase() === `video/${want}`) backups.push(c);
+            }
+            const used = new Set([...chosen, ...backups]);
+            list = [...chosen, ...backups, ...caps.codecs.filter(c => !used.has(c))] as RTCRtpCodec[];
+        }
         if (!list.length) return;
 
         for (const t of pc.getTransceivers()) {
@@ -639,9 +653,10 @@ class HostPeer {
     aqScale = 1;
     /** стабилизатор FPS при нехватке процессора (0 — не вмешивался) */
     aqFps = 0;
-    private fpsState: FpsState | null = null;
-    /** FPS, на который хватает бит на кадр при текущем канале (≥ 60) */
-    private qualityFps = 0;
+    /** лестница качества: текущая ступень, сглаженный битрейт, ступени из-за процессора */
+    private rungIdx = -1;
+    private effSmooth = 0;
+    private cpuState: CpuState | null = null;
     /** сбои декодирования у зрителя (PLI без потерь) и кодеки, от которых ушли */
     private decodeTrouble = 0;
     private encoderStall = 0;
@@ -873,29 +888,37 @@ class HostPeer {
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
                 const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now() }, max);
                 this.aqState = state;
-                // ровный FPS вместо скачущего, когда энкодер упирается в процессор
                 const userFps = Number(settings.store.fps) || 60;
-                this.fpsState ??= initFpsState(userFps, Date.now());
-                const fr = nextFpsCap(this.fpsState, { encFps, cpuLimited, now: Date.now() }, userFps);
-                this.fpsState = fr.state;
-                if (fr.reason) logger.info(`FPS → ${this.userId}: ${fr.reason}`);
-
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
+                const srcW = Number(src.width) || 0, srcH = Number(src.height) || 0;
                 // итог: min(потолок по потерям, 90% оценки канала WebRTC, максимум из настроек)
                 const eff = effectiveCap(state, bweBps, max);
-                // FPS выше 60 — только если на него хватает бит на кадр (иначе быстрые
-                // сцены «мылятся»); ниже 60 не опускаемся никогда
-                const prevQ = this.qualityFps || userFps;
-                this.qualityFps = qualityFpsCap(prevQ, eff, Number(src.width) || 0, Number(src.height) || 0, userFps);
-                if (this.qualityFps !== prevQ && (this.aqCapBps || this.qualityFps < userFps)) {
-                    logger.info(`FPS → ${this.userId}: ${this.qualityFps < prevQ ? `бит на кадр мало для ${prevQ} FPS при ${(eff / 1e6).toFixed(1)} Мбит/с — ставлю ${this.qualityFps} ради чёткой картинки` : `канала хватает — поднимаю до ${this.qualityFps} FPS`}`);
+                // ЛЕСТНИЦА КАЧЕСТВА: разрешение и FPS вместе — самая качественная ступень,
+                // на которую хватает битрейта (сглаженного: оценка канала колеблется, а смена
+                // разрешения = ключевой кадр). Процессор не успевает — ступень ниже по
+                // разрешению, FPS ≥ 60 сохраняется.
+                this.effSmooth = this.effSmooth ? this.effSmooth * 0.7 + eff * 0.3 : eff;
+                const ladder = buildLadder(srcH || 1080, userFps);
+                const curRung = ladder[Math.min(this.rungIdx < 0 ? 0 : this.rungIdx, ladder.length - 1)];
+                this.cpuState ??= initCpuState(Date.now());
+                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, now: Date.now() }, ladder.length - 1);
+                this.cpuState = cr.state;
+                const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
+                const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, cr.state.steps);
+                const rung = ladder[idx];
+                if (idx !== this.rungIdx && this.rungIdx >= 0) {
+                    const why = cr.reason ?? (idx > this.rungIdx
+                        ? `битрейта ${(this.effSmooth / 1e6).toFixed(1)} Мбит/с мало для ${ladder[this.rungIdx].height}p@${ladder[this.rungIdx].fps}`
+                        : `канал позволяет (${(this.effSmooth / 1e6).toFixed(1)} Мбит/с)`);
+                    logger.info(`Качество → ${this.userId}: ${rung.height}p@${rung.fps} — ${why}`);
+                } else if (this.rungIdx < 0 && idx > 0) {
+                    logger.info(`Качество → ${this.userId}: ${rung.height}p@${rung.fps} (старт, ${(this.effSmooth / 1e6).toFixed(1)} Мбит/с)`);
+                } else if (cr.reason) {
+                    logger.info(`Качество → ${this.userId}: ${cr.reason}`);
                 }
-                const total = Math.min(fr.state.capFps, this.qualityFps);
-                const fpsCap = total < userFps ? total : 0;
-                const fps = Math.min(fpsCap || userFps, Number(src.frameRate) || 60);
-                // разрешение — только по потолку потерь: оценка канала на старте низкая и
-                // колеблется, а смена разрешения = ключевой кадр (WebRTC сам ужмёт при нехватке)
-                const scale = scaleFor(Math.min(state.capBps, max), Number(src.height) || 0, Number(src.width) || 0, fps);
+                this.rungIdx = idx;
+                const fpsCap = rung.fps < userFps ? rung.fps : 0;
+                const scale = srcH && rung.height < srcH ? srcH / rung.height : 1;
                 const capMoved = this.aqCapBps === 0 || Math.abs(eff - this.aqCapBps) > this.aqCapBps * 0.05;
                 if (capMoved || scale !== this.aqScale || fpsCap !== this.aqFps) {
                     const first = this.aqCapBps === 0;
@@ -907,9 +930,8 @@ class HostPeer {
                     await applySendParameters(this.pc);
                     const bweNote = bweBps && eff < Math.min(state.capBps, max) ? `оценка канала ${(bweBps / 1e6).toFixed(1)} Мбит/с` : null;
                     // в лог — только заметные изменения (оценка канала колеблется постоянно)
-                    if (reason || (!first && Math.abs(eff - prev) > prev * 0.25) || scale !== 1) {
-                        const h = Number(src.height) || 0;
-                        logger.info(`Авто-качество → ${this.userId}: ${(eff / 1e6).toFixed(1)} Мбит/с${scale > 1 && h ? `, ~${Math.round(h / scale)}p` : ""}${reason ? ` — ${reason}` : bweNote ? ` — ${bweNote}` : ""}`);
+                    if (reason || (!first && Math.abs(eff - prev) > prev * 0.25)) {
+                        logger.info(`Авто-качество → ${this.userId}: ${(eff / 1e6).toFixed(1)} Мбит/с, ${rung.height}p@${rung.fps}${reason ? ` — ${reason}` : bweNote ? ` — ${bweNote}` : ""}`);
                     }
                     this.host.mgr.bump();
                 }
