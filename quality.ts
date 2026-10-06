@@ -186,8 +186,7 @@ export function initFpsState(userFps: number, now: number): FpsState {
 export const MIN_FPS = 60;
 
 export function fpsSteps(userFps: number): number[] {
-    // ниже 60 не уходим: при нехватке процессора/бит WebRTC в режиме «Игры»
-    // сохраняет FPS и снижает разрешение — это и нужно для игр
+    // ступени ВЫШЕ 60 (144/120/90); снижение до 45/30 — в лестнице качества (buildLadder)
     if (userFps <= MIN_FPS) return [userFps];
     return [...new Set([userFps, 144, 120, 90, MIN_FPS].filter(f => f <= userFps && f >= MIN_FPS))].sort((a, b) => b - a);
 }
@@ -252,14 +251,20 @@ export interface Rung { height: number; fps: number; }
 export const BPP_60 = 0.08;
 export const BPP_HIGH = 0.16;
 
+/**
+ * Порядок ступеней (v1.19, по желанию пользователя): сначала жертвуем FPS при том
+ * же разрешении (60 → 45 → 30), и только если не помогло — снижаем разрешение и
+ * сразу возвращаем FPS на новом разрешении (1080@60 → 45 → 30 → 900@60 …).
+ */
 export function buildLadder(srcHeight: number, userFps: number): Rung[] {
-    const fpsList = fpsSteps(userFps);
-    const base = fpsList[fpsList.length - 1]; // 60 (или выбор пользователя, если он ниже)
+    const high = fpsSteps(userFps).filter(f => f > MIN_FPS);          // 144/120/90 — только на родном
+    const lowFps = [MIN_FPS, 45, 30].filter(f => f <= userFps);
+    const fpsAtHeight = lowFps.length ? lowFps : [userFps];            // выбор < 30 — как есть
     const top = Math.max(1, Math.round(srcHeight));
     const heights = [...new Set([top, 1440, 1080, 900, 720].filter(h => h <= top && (h >= 720 || h === top)))].sort((a, b) => b - a);
     const ladder: Rung[] = [];
-    for (const f of fpsList) if (f > base) ladder.push({ height: top, fps: f });
-    for (const h of heights) ladder.push({ height: h, fps: base });
+    for (const f of high) ladder.push({ height: top, fps: f });
+    for (const h of heights) for (const f of fpsAtHeight) ladder.push({ height: h, fps: f });
     return ladder;
 }
 
@@ -293,16 +298,29 @@ export function initCpuState(now: number): CpuState {
     return { steps: 0, strain: 0, easySince: now, lastDown: 0 };
 }
 
-export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: number; cpuLimited: boolean; now: number; }, maxSteps: number): { state: CpuState; reason: string | null; } {
+/**
+ * «Энкодер не тянет ступень»: захват подаёт кадры (srcFps ≥ 90% FPS ступени), а
+ * энкодер выпускает < 85% — из-за процессора ИЛИ потому что при «сохранять
+ * разрешение» он выкидывает кадры, чтобы уложиться в битрейт. Обычный провал —
+ * ступень вниз после 3 замеров подряд; сильный (< 50%) — сразу.
+ */
+export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: number; cpuLimited: boolean; srcFps?: number; now: number; }, maxSteps: number): { state: CpuState; reason: string | null; } {
     const next: CpuState = { ...st };
-    if (s.cpuLimited && s.encFps < s.targetFps * 0.85) {
+    // ожидаем столько, сколько реально подаёт захват (игра на 30 FPS не «провал» ступени 60);
+    // при захвате < 20 FPS (статичный экран) провалы не считаем
+    const src = s.srcFps ?? 0;
+    const target = src > 0 ? Math.min(s.targetFps, src) : s.targetFps;
+    const fed = s.cpuLimited || src >= 20;
+    if (fed && s.encFps < target * 0.85) {
         next.strain = st.strain + 1;
         next.easySince = s.now;
-        if (next.strain >= 3 && next.steps < maxSteps) {
+        const severe = s.encFps < target * 0.5;
+        if ((next.strain >= 3 || severe) && next.steps < maxSteps) {
             next.steps++;
             next.strain = 0;
             next.lastDown = s.now;
-            return { state: next, reason: `процессор не успевает (${Math.round(s.encFps)} из ${s.targetFps} FPS) — снижаю разрешение, FPS сохраняю` };
+            const who = s.cpuLimited ? "процессор не успевает" : "энкодер выкидывает кадры";
+            return { state: next, reason: `${who} (${Math.round(s.encFps)} из ${s.targetFps} FPS) — ступень ниже` };
         }
         return { state: next, reason: null };
     }
@@ -311,7 +329,7 @@ export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: numbe
     if (next.steps > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
         next.steps--;
         next.easySince = s.now;
-        return { state: next, reason: "процессор свободен — пробую ступень выше" };
+        return { state: next, reason: "энкодер справляется — пробую ступень выше" };
     }
     return { state: next, reason: null };
 }

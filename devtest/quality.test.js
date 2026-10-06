@@ -165,23 +165,30 @@ const MAX = 30e6;
     const A = 16 / 9;
     const L = buildLadder(1440, 120);
     const name = i => `${L[i].height}p@${L[i].fps}`;
-    check("лестница 1440p/120: 1440@120 → 1440@90 → 1440@60 → 1080@60 → 900@60 → 720@60",
-        L.map(r => `${r.height}@${r.fps}`).join(",") === "1440@120,1440@90,1440@60,1080@60,900@60,720@60", L.map(r => `${r.height}@${r.fps}`).join(","));
-    check("50 Мбит/с → 1440p@60 (на 90+ бит на кадр мало)", name(pickRung(L, 50e6, A, -1)) === "1440p@60", name(pickRung(L, 50e6, A, -1)));
+    check("лестница: сначала FPS (60→45→30) на родном, потом разрешение с возвратом к 60",
+        L.map(r => `${r.height}@${r.fps}`).join(",") === "1440@120,1440@90,1440@60,1440@45,1440@30,1080@60,1080@45,1080@30,900@60,900@45,900@30,720@60,720@45,720@30", L.map(r => `${r.height}@${r.fps}`).join(","));
     check("80 Мбит/с → 1440p@120", name(pickRung(L, 80e6, A, -1)) === "1440p@120", name(pickRung(L, 80e6, A, -1)));
-    check("12 Мбит/с → 1080p@60 (не 1440p с мылом и не 480p@240)", name(pickRung(L, 12e6, A, -1)) === "1080p@60", name(pickRung(L, 12e6, A, -1)));
-    check("2 Мбит/с → не ниже 720p@60", name(pickRung(L, 2e6, A, -1)) === "720p@60");
-    // гистерезис: на 1080@60 при битрейте чуть выше нужного для 1440@60 — не прыгаем вверх
+    check("50 Мбит/с → 1440p@60", name(pickRung(L, 50e6, A, -1)) === "1440p@60", name(pickRung(L, 50e6, A, -1)));
+    check("15 Мбит/с → 1440p@45 (качество сохраняем, жертвуем FPS)", name(pickRung(L, 15e6, A, -1)) === "1440p@45", name(pickRung(L, 15e6, A, -1)));
+    check("10 Мбит/с → 1440p@30", name(pickRung(L, 10e6, A, -1)) === "1440p@30", name(pickRung(L, 10e6, A, -1)));
+    check("8 Мбит/с → 1080p (30 FPS не помогли — снижаем разрешение, FPS снова выше)", L[pickRung(L, 8e6, A, -1)].height === 1080 && L[pickRung(L, 8e6, A, -1)].fps > 30, name(pickRung(L, 8e6, A, -1)));
+    check("2 Мбит/с → самая нижняя ступень 720p@30", name(pickRung(L, 2e6, A, -1)) === "720p@30");
     const need1440 = rungNeedBps(L[2], A);
     check("гистерезис: вверх только с запасом 15%", pickRung(L, need1440 * 1.05, A, 3) === 3 && pickRung(L, need1440 * 1.2, A, 3) === 2);
-    check("нехватка процессора: на ступень ниже по разрешению, FPS тот же", name(pickRung(L, 50e6, A, -1, 1)) === "1080p@60");
+    check("нехватка процессора: сначала FPS (1440p@60 → 1440p@45)", name(pickRung(L, 50e6, A, -1, 1)) === "1440p@45", name(pickRung(L, 50e6, A, -1, 1)));
     const L60 = buildLadder(1080, 60);
-    check("1080p/60: родное@60 → 900@60 → 720@60", L60.map(r => `${r.height}@${r.fps}`).join(",") === "1080@60,900@60,720@60", L60.map(r => `${r.height}@${r.fps}`).join(","));
+    check("1080p/60: 1080@60,45,30 → 900@60,45,30 → 720@60,45,30", L60.map(r => `${r.height}@${r.fps}`).join(",") === "1080@60,1080@45,1080@30,900@60,900@45,900@30,720@60,720@45,720@30", L60.map(r => `${r.height}@${r.fps}`).join(","));
     let cs = initCpuState(0), t = 0, why = null;
     for (let i = 0; i < 3; i++) { t += 2000; const r = nextCpuSteps(cs, { encFps: 45, targetFps: 60, cpuLimited: true, now: t }, 3); cs = r.state; why = r.reason ?? why; }
     check("процессор не тянет 60 ×3 → минус ступень", cs.steps === 1, why ?? "");
     for (let i = 0; i < 40; i++) { t += 2000; cs = nextCpuSteps(cs, { encFps: 60, targetFps: 60, cpuLimited: false, now: t }, 3).state; }
     check("процессор свободен → ступень возвращается", cs.steps === 0);
+    // энкодер выкидывает кадры (бит мало, «сохранять разрешение»): захват 30, выпущено 6 — сразу ступень вниз
+    let ds = initCpuState(0);
+    const r1 = nextCpuSteps(ds, { encFps: 6, targetFps: 30, cpuLimited: false, srcFps: 30, now: 2000 }, 5);
+    check("энкодер выкидывает кадры (6 из 30) → ступень вниз сразу", r1.state.steps === 1, r1.reason ?? "");
+    const r2 = nextCpuSteps(initCpuState(0), { encFps: 5, targetFps: 60, cpuLimited: false, srcFps: 5, now: 2000 }, 5);
+    check("статичный экран (захват сам даёт 5 FPS) — не провал", r2.state.steps === 0);
 }
 // 8. буфер зрителя: заморозки -> растёт до 300, спокойствие -> назад к минимуму
 {

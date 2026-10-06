@@ -353,7 +353,10 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
     const wantFps = Number(settings.store.fps) || 60;
     const wantVideoBps = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
     const wantAudioBps = Math.round(Number(settings.store.audioBitrate) * 1000);
-    const hint = String(settings.store.contentHint) === "detail" ? "maintain-resolution" : "maintain-framerate";
+    // С авто-качеством разрешением управляет лестница (сначала FPS 60 → 45 → 30,
+    // потом разрешение) — WebRTC не должен сам ронять разрешение раньше FPS.
+    const hint = settings.store.autoQuality !== false || String(settings.store.contentHint) === "detail"
+        ? "maintain-resolution" : "maintain-framerate";
 
     for (const sender of pc.getSenders()) {
         try {
@@ -362,7 +365,10 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
                 params.degradationPreference = hint as RTCDegradationPreference;
                 if (!params.encodings?.length) params.encodings = [{}];
                 // авто-качество (quality.ts) задаёт потолок/масштаб конкретному зрителю
-                const aq: { capBps?: number; scale?: number; fps?: number; } = (pc as any).__aq ?? {};
+                const aq: { capBps?: number; scale?: number; fps?: number; emergency?: boolean; } = (pc as any).__aq ?? {};
+                // аварийно (лестница на дне, энкодер всё равно не справляется) — WebRTC
+                // может снижать и разрешение сам, лишь бы не было слайд-шоу
+                if (aq.emergency) params.degradationPreference = "balanced";
                 params.encodings[0].maxBitrate = Math.min(wantVideoBps, aq.capBps ?? Infinity);
                 params.encodings[0].maxFramerate = Math.min(wantFps, aq.fps ?? Infinity);
                 params.encodings[0].scaleResolutionDownBy = aq.scale ?? 1;
@@ -657,6 +663,8 @@ class HostPeer {
     private rungIdx = -1;
     private effSmooth = 0;
     private cpuState: CpuState | null = null;
+    private aqEmergency = false;
+    private aqEmergencySince = 0;
     /** сбои декодирования у зрителя (PLI без потерь) и кодеки, от которых ушли */
     private decodeTrouble = 0;
     private encoderStall = 0;
@@ -901,7 +909,9 @@ class HostPeer {
                 const ladder = buildLadder(srcH || 1080, userFps);
                 const curRung = ladder[Math.min(this.rungIdx < 0 ? 0 : this.rungIdx, ladder.length - 1)];
                 this.cpuState ??= initCpuState(Date.now());
-                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, now: Date.now() }, ladder.length - 1);
+                // srcFps — сколько кадров реально подаёт захват (не путать статичный экран с провалом)
+                const srcFps = srcFrames / 2;
+                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now() }, ladder.length - 1);
                 this.cpuState = cr.state;
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
                 const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, cr.state.steps);
@@ -917,6 +927,21 @@ class HostPeer {
                     logger.info(`Качество → ${this.userId}: ${cr.reason}`);
                 }
                 this.rungIdx = idx;
+                // дно лестницы и сильный провал кадров — аварийный режим (см. applySendParameters)
+                const srcLive = srcFps >= 20 ? Math.min(rung.fps, srcFps) : rung.fps;
+                const atBottom = idx === ladder.length - 1;
+                // вход — дно лестницы и провал < 50% кадров; выход — лестница поднялась со дна
+                // или раз в минуту пробуем без аварийного режима (иначе он «маскирует» себя)
+                const emergency = this.aqEmergency
+                    ? atBottom && Date.now() - this.aqEmergencySince < 60_000
+                    : atBottom && srcFps >= 20 && encFps < srcLive * 0.5;
+                if (emergency && !this.aqEmergency) this.aqEmergencySince = Date.now();
+                if (emergency !== this.aqEmergency) {
+                    this.aqEmergency = emergency;
+                    logger.info(`Качество → ${this.userId}: ${emergency ? "нижняя ступень, а энкодер всё равно не справляется — разрешаю WebRTC снижать и разрешение" : "аварийный режим снят"}`);
+                    (this.pc as any).__aq = { ...((this.pc as any).__aq ?? {}), emergency };
+                    void applySendParameters(this.pc);
+                }
                 const fpsCap = rung.fps < userFps ? rung.fps : 0;
                 const scale = srcH && rung.height < srcH ? srcH / rung.height : 1;
                 const capMoved = this.aqCapBps === 0 || Math.abs(eff - this.aqCapBps) > this.aqCapBps * 0.05;
@@ -926,7 +951,7 @@ class HostPeer {
                     this.aqCapBps = eff;
                     this.aqScale = scale;
                     this.aqFps = fpsCap;
-                    (this.pc as any).__aq = { capBps: eff, scale, fps: fpsCap || undefined };
+                    (this.pc as any).__aq = { capBps: eff, scale, fps: fpsCap || undefined, emergency: this.aqEmergency };
                     await applySendParameters(this.pc);
                     const bweNote = bweBps && eff < Math.min(state.capBps, max) ? `оценка канала ${(bweBps / 1e6).toFixed(1)} Мбит/с` : null;
                     // в лог — только заметные изменения (оценка канала колеблется постоянно)
