@@ -59,7 +59,11 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     if (s.rttMs != null && s.rttMs > 0) next.minRtt = Math.min(st.minRtt, s.rttMs);
     // рост очереди: RTT заметно выше минимального — канал переполнен, даже если потерь ещё нет
     const queueing = s.rttMs != null && Number.isFinite(next.minRtt) && s.rttMs > next.minRtt + 150 && s.rttMs > next.minRtt * 2;
-    const pliStorm = s.pli >= 2;
+    // Запросы ключевых кадров — признак перегрузки, только если есть и потери.
+    // PLI при НУЛЕВЫХ потерях = декодер зрителя не справляется с потоком (реальный
+    // случай: аппаратный H.264 AMD) — битрейт тут не поможет, это лечит смена
+    // кодека (decodeTrouble ниже). Раньше такой «шторм» душил поток до 1.5 Мбит/с.
+    const pliStorm = s.pli >= 2 && (s.loss ?? 0) >= 0.01;
     let lossy = next.lossEwma > 0.03;
 
     // Помогло ли прошлое снижение? Если потери не упали хотя бы на четверть —
@@ -108,6 +112,33 @@ export function scaleFor(capBps: number, height: number, width: number, fps: num
     const steps = [1, 4 / 3, 1.5, 2, 2.667, 3, 4];
     const maxK = Math.max(1, height / 540);
     return steps.find(x => x >= k && x <= maxK) ?? Math.min(maxK, steps[steps.length - 1]);
+}
+
+/**
+ * Счётчик «декодер не справляется»: интервалы подряд, где зритель просит
+ * ключевые кадры (PLI ≥ 2 за 2 с), а потерь нет. ≥ DECODE_TROUBLE_LIMIT —
+ * пора менять кодек этому зрителю.
+ */
+export const DECODE_TROUBLE_LIMIT = 3;
+
+export function nextDecodeTrouble(count: number, s: { pli: number; loss: number | null; }): number {
+    return s.pli >= 2 && (s.loss ?? 0) < 0.01 ? count + 1 : 0;
+}
+
+/**
+ * Счётчик «энкодер завис»: захват подаёт кадры (≥10 за интервал), а энкодер
+ * выпускает ≤10% из них. Реальный случай: аппаратный H.264 AMD через Media
+ * Foundation иногда «встаёт» — 0–1 FPS при живом захвате. По времени
+ * захвата отличаем от статичного экрана (там кадров не подаётся вовсе).
+ */
+export function nextEncoderStall(count: number, s: { srcFrames: number; encFrames: number; }): number {
+    return s.srcFrames >= 10 && s.encFrames <= s.srcFrames * 0.1 ? count + 1 : 0;
+}
+
+/** Следующий кодек при сбое декодирования: от «тяжёлого/капризного» к самому совместимому */
+export function fallbackCodec(current: string, tried: string[]): string | null {
+    const chain = ["vp9", "vp8", "h264"];
+    return chain.find(c => c !== current && !tried.includes(c)) ?? null;
 }
 
 /** Замер со стороны зрителя за интервал */

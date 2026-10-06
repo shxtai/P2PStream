@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -48,10 +48,26 @@ const MAX = 30e6;
     r = nextCap(r.state, { loss: 0.06, pli: 0, rttMs: 100, now: 4000 }, MAX);
     check("повторные потери режут", r.state.capBps < MAX, `${(r.state.capBps / 1e6).toFixed(1)} Мбит/с`);
 }
-// 3. шторм PLI без потерь -> снижение
+// 3. шторм PLI: с потерями — перегрузка (режем); без потерь — это декодер (НЕ режем)
 {
-    const r = nextCap(initSendState(MAX, 0), { loss: 0, pli: 3, rttMs: 100, now: 2000 }, MAX);
-    check("шторм запросов ключевых кадров режет", r.state.capBps < MAX, r.reason ?? "");
+    const r = nextCap(initSendState(MAX, 0), { loss: 0.02, pli: 3, rttMs: 100, now: 2000 }, MAX);
+    check("PLI + потери: снижение", r.state.capBps < MAX, r.reason ?? "");
+    let st = initSendState(MAX, 0);
+    for (let i = 1; i <= 20; i++) st = nextCap(st, { loss: 0, pli: 6, rttMs: 100, now: i * 2000 }, MAX).state;
+    check("PLI без потерь (реальный лог: ×6 каждые 2 с) — битрейт НЕ режется", st.capBps === MAX, `${(st.capBps / 1e6).toFixed(1)} Мбит/с`);
+}
+// 3b. «декодер не справляется»: 3 интервала PLI без потерь подряд -> смена кодека
+{
+    let c = 0;
+    for (let i = 0; i < 3; i++) c = nextDecodeTrouble(c, { pli: 6, loss: 0 });
+    check("3 интервала PLI без потерь -> сигнал сменить кодек", c >= DECODE_TROUBLE_LIMIT);
+    check("PLI с потерями — не проблема декодера", nextDecodeTrouble(2, { pli: 6, loss: 0.05 }) === 0);
+    let st = 0;
+    for (let i = 0; i < 3; i++) st = nextEncoderStall(st, { srcFrames: 60, encFrames: 1 });
+    check("энкодер завис (60 кадров захвата -> 1 закодирован) ×3 -> сменить кодек", st >= DECODE_TROUBLE_LIMIT);
+    check("статичный экран (захват 0 кадров) — не зависание", nextEncoderStall(2, { srcFrames: 0, encFrames: 0 }) === 0);
+    check("нормальная работа — не зависание", nextEncoderStall(2, { srcFrames: 60, encFrames: 58 }) === 0);
+    check("цепочка кодеков: h264 -> vp9 -> vp8", fallbackCodec("h264", []) === "vp9" && fallbackCodec("vp9", ["h264"]) === "vp8" && fallbackCodec("vp8", ["h264", "vp9"]) === null);
 }
 // 4. рост очереди (RTT 100 -> 400) -> снижение
 {

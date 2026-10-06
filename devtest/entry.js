@@ -21,6 +21,8 @@ if (relay) {
     }
 }
 
+// доступ к (фейковой) камере — Chrome тогда показывает имена энкодера/декодера в getStats
+void navigator.mediaDevices?.getUserMedia({ audio: true }).then(s => s.getTracks().forEach(t => t.stop())).catch(() => { });
 fluxHandlers.push(manager.onMessageCreate);
 manager.start();
 
@@ -68,6 +70,8 @@ if (role === "host") {
         reported = true;
         clearInterval(watchPeers);
         setTimeout(async () => { for (const l of await mediaReport(peer.pc, "out")) report("OUT", l); }, 4000);
+        // ?switch — проверка смены кодека на лету (как при сбое декодирования у зрителя)
+        if (q.has("switch")) setTimeout(() => report("OUT", `switchCodec: ${peer.switchCodec("тест стенда")}`), 6000);
     }, 500);
 } else {
     void probeNat().then(r => status(`NAT: ${r}`));

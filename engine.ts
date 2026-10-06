@@ -18,7 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { initSendState, nextCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
+import { DECODE_TROUBLE_LIMIT, fallbackCodec, initSendState, nextCap, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -433,6 +433,7 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
         const o: Record<string, any> = {};
         rep.forEach((r: any) => {
             if (r.kind === "video" && r.type === (direction === "out" ? "outbound-rtp" : "inbound-rtp")) o.rtp = r;
+            if (r.kind === "video" && r.type === "media-source") o.src = r;
             if (r.kind === "video" && r.type === "remote-inbound-rtp") o.remote = r;
             if (r.type === "transport" && r.selectedCandidatePairId) o.pair = rep.get(r.selectedCandidatePairId);
         });
@@ -442,7 +443,8 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
     try {
         const a = pick(await pc.getStats());
         await new Promise(r => setTimeout(r, 2000));
-        const b = pick(await pc.getStats());
+        const rep2codec = await pc.getStats();
+        const b = pick(rep2codec);
         const dt = ((b.rtp?.timestamp ?? 0) - (a.rtp?.timestamp ?? 0)) / 1000 || 2;
         const d = (k: string) => (b.rtp?.[k] ?? 0) - (a.rtp?.[k] ?? 0);
         const lines: string[] = [];
@@ -458,6 +460,8 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
             const lim = r.qualityLimitationDurations
                 ? Object.entries(r.qualityLimitationDurations as Record<string, number>).map(([k, v]) => `${k}=${Math.round(v)}с`).join(" ")
                 : "";
+            const srcFrames = (b.src?.frames ?? 0) - (a.src?.frames ?? 0);
+            lines.push(`захват: ${b.src ? `${Math.round(b.src.framesPerSecond ?? 0)} FPS (+${srcFrames} кадр.), ${b.src.width}x${b.src.height}` : "нет данных media-source"}, закодировано +${d("framesEncoded")} кадр.`);
             lines.push(`отправка: ${mbps} Мбит/с (повторы ${rtxMbps}), ${r.frameWidth}x${r.frameHeight} ${Math.round(r.framesPerSecond ?? 0)} FPS, энкодер ${r.encoderImplementation ?? "?"}${r.powerEfficientEncoder ? " (аппаратный)" : ""}`);
             lines.push(`ограничение: ${r.qualityLimitationReason ?? "?"} [${lim}], оценка канала ${b.pair?.availableOutgoingBitrate ? (b.pair.availableOutgoingBitrate / 1e6).toFixed(1) + " Мбит/с" : "?"}`);
             lines.push(`от зрителя: NACK +${d("nackCount")}, PLI +${d("pliCount")} (запросы ключевого кадра), потери ${b.remote?.fractionLost != null ? (b.remote.fractionLost * 100).toFixed(1) + "%" : "?"}, джиттер ${b.remote?.jitter != null ? Math.round(b.remote.jitter * 1000) + " мс" : "?"}`);
@@ -465,7 +469,8 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
             const mbps = (d("bytesReceived") * 8 / dt / 1e6).toFixed(2);
             const lost = d("packetsLost"), got = d("packetsReceived");
             const jb = r.jitterBufferEmittedCount ? Math.round(r.jitterBufferDelay / r.jitterBufferEmittedCount * 1000) : 0;
-            lines.push(`приём: ${mbps} Мбит/с, ${r.frameWidth}x${r.frameHeight} ${Math.round(r.framesPerSecond ?? 0)} FPS, декодер ${r.decoderImplementation ?? "?"}${r.powerEfficientDecoder ? " (аппаратный)" : ""}`);
+            const inCodec = String((rep2codec.get(r.codecId) as any)?.mimeType ?? "?").replace(/^video\//i, "");
+            lines.push(`приём: ${inCodec} ${mbps} Мбит/с, ${r.frameWidth}x${r.frameHeight} ${Math.round(r.framesPerSecond ?? 0)} FPS, декодер ${r.decoderImplementation ?? "?"}${r.powerEfficientDecoder ? " (аппаратный)" : ""}`);
             lines.push(`кадры за ${dt.toFixed(1)} с: получено +${d("framesReceived")}, декодировано +${d("framesDecoded")}, выброшено +${d("framesDropped")}, ключевых +${d("keyFramesDecoded")}`);
             lines.push(`сеть: потери ${got + lost > 0 ? (lost / (got + lost) * 100).toFixed(1) : "0"}% (${lost} пак.), NACK +${d("nackCount")}, PLI +${d("pliCount")}, джиттер ${Math.round((r.jitter ?? 0) * 1000)} мс, буфер ${jb} мс`);
             lines.push(`заморозки: ${r.freezeCount ?? "?"} всего, ${r.totalFreezesDuration != null ? r.totalFreezesDuration.toFixed(1) + " с" : "?"} суммарно`);
@@ -632,6 +637,12 @@ class HostPeer {
     private aqState: SendState | null = null;
     aqCapBps = 0;
     aqScale = 1;
+    /** сбои декодирования у зрителя (PLI без потерь) и кодеки, от которых ушли */
+    private decodeTrouble = 0;
+    private encoderStall = 0;
+    private triedCodecs: string[] = [];
+    /** текущий видеокодек этого зрителя (из статистики) */
+    codecName = "";
     private lastOfferAt = 0;
 
     constructor(
@@ -783,7 +794,7 @@ class HostPeer {
         if (this.aqTimer || settings.store.autoQuality === false) return;
         const userMax = () => Math.round(Number(settings.store.videoBitrate) * 1_000_000);
         this.aqState = initSendState(userMax(), Date.now());
-        let prevPli = -1;
+        let prevPli = -1, prevSrc = -1, prevEnc = -1;
         this.aqTimer = setInterval(async () => {
             if (this.closed || !this.aqState) return;
             if (settings.store.autoQuality === false) {
@@ -791,18 +802,46 @@ class HostPeer {
                 return;
             }
             try {
-                let loss: number | null = null, rttMs: number | null = null, pliTotal = 0;
-                (await this.pc.getStats()).forEach((r: any) => {
+                let loss: number | null = null, rttMs: number | null = null, pliTotal = 0, codecId = "";
+                let srcTotal = 0, encTotal = 0;
+                const report = await this.pc.getStats();
+                report.forEach((r: any) => {
                     if (r.kind !== "video") return;
                     if (r.type === "remote-inbound-rtp") {
                         if (r.fractionLost != null) loss = r.fractionLost;
                         if (r.roundTripTime != null) rttMs = r.roundTripTime * 1000;
                     } else if (r.type === "outbound-rtp") {
                         pliTotal = r.pliCount ?? 0;
+                        codecId = r.codecId ?? "";
+                        encTotal = r.framesEncoded ?? 0;
+                    } else if (r.type === "media-source") {
+                        srcTotal = r.frames ?? 0; // кадров, поданных захватом в энкодер
                     }
                 });
+                const srcFrames = prevSrc < 0 ? 0 : Math.max(0, srcTotal - prevSrc);
+                const encFrames = prevEnc < 0 ? 0 : Math.max(0, encTotal - prevEnc);
+                prevSrc = srcTotal;
+                prevEnc = encTotal;
                 const pli = prevPli < 0 ? 0 : Math.max(0, pliTotal - prevPli);
                 prevPli = pliTotal;
+                const mime = String((report.get(codecId) as any)?.mimeType ?? "");
+                this.codecName = mime.replace(/^video\//i, "").toLowerCase();
+
+                // Кодек сломан для этой пары — меняем ЭТОМУ зрителю:
+                //  - декодер зрителя не справляется: запросы ключевых кадров без потерь;
+                //  - энкодер завис: захват подаёт кадры, а закодировано ~0.
+                this.decodeTrouble = nextDecodeTrouble(this.decodeTrouble, { pli, loss });
+                this.encoderStall = nextEncoderStall(this.encoderStall, { srcFrames, encFrames });
+                if (this.decodeTrouble || this.encoderStall) {
+                    logger.info(`Кодек ${this.codecName.toUpperCase()} → ${this.userId}: захват ${srcFrames} кадр., закодировано ${encFrames}, PLI ${pli}, потери ${loss != null ? (loss * 100).toFixed(1) + "%" : "?"} (подозрение ${Math.max(this.decodeTrouble, this.encoderStall)}/${DECODE_TROUBLE_LIMIT})`);
+                }
+                const broken = this.decodeTrouble >= DECODE_TROUBLE_LIMIT ? "у зрителя не декодируется"
+                    : this.encoderStall >= DECODE_TROUBLE_LIMIT ? "энкодер завис (кадры не кодируются)" : null;
+                if (broken && this.codecName) {
+                    this.decodeTrouble = 0;
+                    this.encoderStall = 0;
+                    if (this.switchCodec(broken)) return;
+                }
                 const max = userMax();
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
                 const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, now: Date.now() }, max);
@@ -824,6 +863,23 @@ class HostPeer {
                 }
             } catch { /* статистика недоступна — следующий тик */ }
         }, 2000);
+    }
+
+    /** Сменить видеокодек этому зрителю на следующий в цепочке (H.264 → VP9 → VP8)
+     *  с пересогласованием. false — менять больше не на что. */
+    switchCodec(reason: string): boolean {
+        if (!this.codecName) return false;
+        this.triedCodecs.push(this.codecName);
+        const next = fallbackCodec(this.codecName, this.triedCodecs);
+        if (!next) {
+            logger.warn(`${this.codecName.toUpperCase()} → ${this.userId}: ${reason}, но других кодеков не осталось`);
+            return false;
+        }
+        logger.warn(`${this.codecName.toUpperCase()} → ${this.userId}: ${reason} — переключаю на ${next.toUpperCase()}`);
+        toast(`P2P: ${this.codecName.toUpperCase()} — ${reason}, переключаю на ${next.toUpperCase()}`);
+        applyVideoCodecPreference(this.pc, next);
+        void this.negotiate(false);
+        return true;
     }
 
     close(): void {

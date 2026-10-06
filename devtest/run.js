@@ -69,9 +69,20 @@ async function runScenario(chromePath, query, port) {
     if (qp.get("plr")) net.push(`loss_percent:${qp.get("plr")}`);
     if (qp.get("qdelay")) net.push(`queue_delay_ms:${qp.get("qdelay")}`);
     const extra = net.length ? [`--force-fieldtrials=WebRTC-FakeNetworkSendConfig/${net.join(",")}/`] : [];
+    // ?gpu — обычное окно с аппаратным кодированием/декодированием (как в Discord):
+    // в headless Chrome кодирует программно, и баги аппаратных энкодеров не видны
+    const gpu = qp.has("gpu");
     const chrome = spawn(chromePath, [
-        "--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
-        "--no-first-run", "--autoplay-policy=no-user-gesture-required", ...extra, "about:blank"
+        ...(gpu ? ["--window-size=800,600"] : ["--headless=new"]),
+        `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
+        "--no-first-run", "--autoplay-policy=no-user-gesture-required",
+        // окно стенда может быть перекрыто другими — без этого Chrome душит отрисовку
+        // и тестовый canvas даёт 1–4 FPS (ложные «сбои энкодера»)
+        "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling", "--disable-features=CalculateNativeWinOcclusion",
+        // разрешение на медиа открывает имена энкодера/декодера в getStats
+        "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
+        ...extra, "about:blank"
     ], { stdio: "ignore" });
     try {
         let wsUrl;

@@ -20,7 +20,9 @@ export function setNativeTilesHandler(fn: (enabled: boolean) => void): void {
     onNativeTilesChange = fn;
 }
 
-/** Порядок предпочтения кодеков в режиме «Авто» (от самого лёгкого для CPU/GPU) */
+/** Порядок кодеков в режиме «Авто» (H.264 первым — обычно аппаратный и не грузит CPU
+ *  во время игры). Если у конкретного зрителя поток не декодируется (запросы
+ *  ключевых кадров без потерь) — хост сам переключит ему кодек: H.264 → VP9 → VP8. */
 export const AUTO_CODEC_ORDER: string[] = ["h264", "vp9", "av1"];
 
 export const settings = definePluginSettings({
@@ -90,10 +92,10 @@ export const settings = definePluginSettings({
     },
     codec: {
         type: OptionType.SELECT,
-        description: "Видеокодек (Авто: H.264 → VP9 → AV1, самый лёгкий для системы первым)",
+        description: "Видеокодек (Авто: H.264 → VP9 → AV1). Если у зрителя кодек не декодируется, плагин сам переключит ему кодек на VP9/VP8",
         options: [
             { label: "Авто", value: "auto", default: true },
-            { label: "H.264 — аппаратный на всех GPU", value: "h264" },
+            { label: "H.264 — аппаратный на большинстве GPU", value: "h264" },
             { label: "VP9 — лучшее сжатие", value: "vp9" },
             { label: "AV1 — максимум эффективности (RTX 40 / RX 7000 / Arc)", value: "av1" },
         ] as const
