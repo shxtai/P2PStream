@@ -45,8 +45,24 @@ const MAX = 30e6;
     let st = initSendState(MAX, 0);
     let r = nextCap(st, { loss: 0.04, pli: 0, rttMs: 100, now: 2000 }, MAX);
     check("одиночный всплеск потерь 4% не режет", r.state.capBps === MAX);
-    r = nextCap(r.state, { loss: 0.06, pli: 0, rttMs: 100, now: 4000 }, MAX);
-    check("повторные потери режут", r.state.capBps < MAX, `${(r.state.capBps / 1e6).toFixed(1)} Мбит/с`);
+    for (let t = 4000; t <= 10000; t += 2000) r = nextCap(r.state, { loss: 0.08, pli: 0, rttMs: 100, now: t }, MAX);
+    check("устойчивые потери 8% режут (за несколько замеров)", r.state.capBps < MAX, `${(r.state.capBps / 1e6).toFixed(1)} Мбит/с`);
+}
+// 2b. реальная жалоба: 80 Мбит/с «сразу падает до 40», хотя канал тянет больше
+{
+    const M = 100e6;
+    let st = { ...initSendState(M, 0), capBps: 80e6 };
+    for (let i = 1; i <= 30; i++) st = nextCap(st, { loss: 0.03, pli: 0, rttMs: 100, now: i * 2000 }, M).state;
+    check("3% восстанавливаемых потерь без PLI — поток 80 не трогается", st.capBps >= 80e6, `${(st.capBps / 1e6).toFixed(1)} Мбит/с`);
+    let s2 = { ...initSendState(M, 0), capBps: 40e6, lastCut: 1000, cleanSince: 1000 };
+    let t = 1000;
+    while (s2.capBps < 80e6 && t < 120000) { t += 2000; s2 = nextCap(s2, { loss: 0, pli: 0, rttMs: 100, now: t }, M).state; }
+    check("после снижения до 40 возвращается к 80 быстрее 25 с", (t - 1000) <= 25000, `${((t - 1000) / 1000).toFixed(0)} с`);
+    let s3 = { ...initSendState(M, 0), capBps: 80e6 };
+    s3 = nextCap(s3, { loss: 0.08, pli: 0, rttMs: 100, now: 2000 }, M).state;
+    s3 = nextCap(s3, { loss: 0.08, pli: 0, rttMs: 100, now: 4000 }, M).state;
+    s3 = nextCap(s3, { loss: 0.08, pli: 0, rttMs: 100, now: 6000 }, M).state;
+    check("умеренные потери режут мягко (×0.8), а не вдвое", s3.capBps >= 64e6 || s3.capBps === 80e6, `${(s3.capBps / 1e6).toFixed(1)} Мбит/с`);
 }
 // 3. шторм PLI: с потерями — перегрузка (режем); без потерь — это декодер (НЕ режем)
 {

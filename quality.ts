@@ -78,7 +78,10 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     // случай: аппаратный H.264 AMD) — битрейт тут не поможет, это лечит смена
     // кодека (decodeTrouble ниже). Раньше такой «шторм» душил поток до 1.5 Мбит/с.
     const pliStorm = s.pli >= 2 && (s.loss ?? 0) >= 0.01;
-    let lossy = next.lossEwma > 0.03;
+    // Малые потери (< 5%) без запросов ключевых кадров WebRTC сам восстанавливает
+    // повторной отправкой — картинка не страдает, резать нечего. Раньше порог был 3%,
+    // и на дальнем канале поток дёргался 80 → 40 Мбит/с из-за неопасных потерь.
+    let lossy = next.lossEwma > 0.05 || (next.lossEwma > 0.02 && s.pli >= 1);
 
     // Помогло ли прошлое снижение? Если потери не упали хотя бы на четверть —
     // они не от перегрузки (туннель/фильтр режет часть пакетов при любой скорости):
@@ -91,7 +94,8 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     if (next.uselessCuts >= 2) lossy = false;
 
     if ((lossy || pliStorm || queueing) && (!st.lastCut || s.now - st.lastCut >= 4000)) {
-        const factor = next.lossEwma > 0.1 || s.pli >= 4 ? 0.6 : 0.75;
+        // резко — только при реально плохом канале, иначе мягко
+        const factor = next.lossEwma > 0.15 || (pliStorm && s.pli >= 4) ? 0.6 : 0.8;
         next.capBps = Math.max(MIN_CAP_BPS, Math.round(st.capBps * factor));
         next.lastCut = s.now;
         next.cleanSince = s.now;
@@ -103,8 +107,10 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
 
     if (next.lossEwma < 0.01) next.uselessCuts = 0;
     // чисто: после 10 с без проблем — +15% за шаг до пользовательского максимума
-    if (next.lossEwma < 0.01 && s.now - st.cleanSince >= 10_000 && st.capBps < userMaxBps) {
-        next.capBps = Math.min(userMaxBps, Math.round(st.capBps * 1.15));
+    // возврат: после 6 с чистого канала +20% каждые 4 с (было +15% раз в 10 с —
+    // с 40 обратно до 80 Мбит/с уходила почти минута)
+    if (next.lossEwma < 0.02 && s.now - st.cleanSince >= (st.capBps < userMaxBps && st.lastCut && s.now - st.lastCut < 10_000 ? 6_000 : 4_000) && st.capBps < userMaxBps) {
+        next.capBps = Math.min(userMaxBps, Math.round(st.capBps * 1.2));
         next.cleanSince = s.now;
         return { state: next, reason: "канал чистый" };
     }
