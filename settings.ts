@@ -113,6 +113,11 @@ export const settings = definePluginSettings({
         default: 0,
         stickToMarkers: false
     },
+    autoQuality: {
+        type: OptionType.BOOLEAN,
+        description: "Авто-качество: при потерях/заморозках на канале снижать битрейт и разрешение конкретному зрителю (и плавно возвращать), а зрителю — увеличивать буфер. Рекомендуется для дальних/нестабильных соединений",
+        default: true
+    },
     audioMode: {
         type: OptionType.SELECT,
         description: "Звук трансляции. «Умный» (Windows 10 2004+): окно — звук только этого приложения; экран — вся система без Discord. Недоступен — автоматически системный",

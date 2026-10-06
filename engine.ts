@@ -18,6 +18,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
+import { initSendState, nextCap, nextJitterTarget, type RecvState, scaleFor, type SendState } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -346,9 +347,11 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
                 const params = sender.getParameters();
                 params.degradationPreference = hint as RTCDegradationPreference;
                 if (!params.encodings?.length) params.encodings = [{}];
-                params.encodings[0].maxBitrate = wantVideoBps;
+                // авто-качество (quality.ts) задаёт потолок/масштаб конкретному зрителю
+                const aq: { capBps?: number; scale?: number; } = (pc as any).__aq ?? {};
+                params.encodings[0].maxBitrate = Math.min(wantVideoBps, aq.capBps ?? Infinity);
                 params.encodings[0].maxFramerate = wantFps;
-                params.encodings[0].scaleResolutionDownBy = 1;
+                params.encodings[0].scaleResolutionDownBy = aq.scale ?? 1;
                 params.encodings[0].networkPriority = "high";
                 params.encodings[0].priority = "high";
                 await sender.setParameters(params);
@@ -624,6 +627,11 @@ class HostPeer {
     peerPk: string | null = null;
     /** Последний отправленный оффер — перепосылаем, если зритель его не получил */
     private lastOffer: Signal | null = null;
+    /** авто-качество: таймер, состояние регулятора и текущий потолок/масштаб */
+    private aqTimer: NodeJS.Timeout | undefined;
+    private aqState: SendState | null = null;
+    aqCapBps = 0;
+    aqScale = 1;
     private lastOfferAt = 0;
 
     constructor(
@@ -660,7 +668,10 @@ class HostPeer {
         this.pc.onconnectionstatechange = () => {
             const st = this.pc.connectionState;
             logger.info(`Пир ${userId}: ${st}`);
-            if (st === "connected") void logSelectedPair(this.pc, `эфир → ${userId}`);
+            if (st === "connected") {
+                void logSelectedPair(this.pc, `эфир → ${userId}`);
+                this.startAutoQuality();
+            }
             if (st === "failed" && !this.restarted) {
                 this.restarted = true;
                 void this.negotiate(true);
@@ -763,9 +774,62 @@ class HostPeer {
         }
     }
 
+    /**
+     * Авто-качество: раз в 2 с по отчётам зрителя (потери, PLI, RTT) регулятор
+     * из quality.ts решает потолок битрейта, а по нему — масштаб разрешения.
+     * Только для этого зрителя: остальные получают своё.
+     */
+    private startAutoQuality(): void {
+        if (this.aqTimer || settings.store.autoQuality === false) return;
+        const userMax = () => Math.round(Number(settings.store.videoBitrate) * 1_000_000);
+        this.aqState = initSendState(userMax(), Date.now());
+        let prevPli = -1;
+        this.aqTimer = setInterval(async () => {
+            if (this.closed || !this.aqState) return;
+            if (settings.store.autoQuality === false) {
+                if ((this.pc as any).__aq) { (this.pc as any).__aq = undefined; this.aqCapBps = 0; this.aqScale = 1; void applySendParameters(this.pc); }
+                return;
+            }
+            try {
+                let loss: number | null = null, rttMs: number | null = null, pliTotal = 0;
+                (await this.pc.getStats()).forEach((r: any) => {
+                    if (r.kind !== "video") return;
+                    if (r.type === "remote-inbound-rtp") {
+                        if (r.fractionLost != null) loss = r.fractionLost;
+                        if (r.roundTripTime != null) rttMs = r.roundTripTime * 1000;
+                    } else if (r.type === "outbound-rtp") {
+                        pliTotal = r.pliCount ?? 0;
+                    }
+                });
+                const pli = prevPli < 0 ? 0 : Math.max(0, pliTotal - prevPli);
+                prevPli = pliTotal;
+                const max = userMax();
+                if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
+                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, now: Date.now() }, max);
+                this.aqState = state;
+                const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
+                const fps = Math.min(Number(settings.store.fps) || 60, Number(src.frameRate) || 60);
+                const scale = scaleFor(state.capBps, Number(src.height) || 0, Number(src.width) || 0, fps);
+                if (state.capBps !== this.aqCapBps || scale !== this.aqScale) {
+                    const first = this.aqCapBps === 0;
+                    this.aqCapBps = state.capBps;
+                    this.aqScale = scale;
+                    (this.pc as any).__aq = { capBps: state.capBps, scale };
+                    await applySendParameters(this.pc);
+                    if (!first || reason) {
+                        const h = Number(src.height) || 0;
+                        logger.info(`Авто-качество → ${this.userId}: ${(state.capBps / 1e6).toFixed(1)} Мбит/с${scale > 1 && h ? `, ~${Math.round(h / scale)}p` : ""}${reason ? ` — ${reason}` : ""}`);
+                    }
+                    this.host.mgr.bump();
+                }
+            } catch { /* статистика недоступна — следующий тик */ }
+        }, 2000);
+    }
+
     close(): void {
         if (this.closed) return;
         this.closed = true;
+        if (this.aqTimer) clearInterval(this.aqTimer);
         if (this.iceTimer) clearTimeout(this.iceTimer);
         try { this.pc.close(); } catch { /* ignore */ }
     }
@@ -899,6 +963,9 @@ export class WatchSession {
     private bundling = false;
     /** Публичный ECDH-ключ хоста (пришёл в offer) — им шифруем answer/ice ему */
     hostPk: string | null = null;
+    /** адаптивный буфер (авто-качество зрителя) */
+    private jbTimer: NodeJS.Timeout | undefined;
+    jitterTargetMs = 0;
 
     /** Маршрут сигналов к хосту: по транспорту его анонса (совместимость со старыми версиями) */
     private hostRoute(): "broker" | "chat" | "both" {
@@ -1101,6 +1168,7 @@ export class WatchSession {
             logger.info(`Просмотр ${this.host.name}: ${st}`);
             if (st === "connected") {
                 void logSelectedPair(pc, `просмотр ${this.host.name}`);
+                this.startAdaptiveBuffer(pc);
                 this.setState("live");
             } else if (st === "disconnected") {
                 this.setState("reconnecting");
@@ -1113,8 +1181,49 @@ export class WatchSession {
         };
     }
 
+    /**
+     * Адаптивный буфер: при заморозках/скачках задержки растёт (до 300 мс), на
+     * спокойном канале возвращается к значению из настроек. Сглаживает рывки на
+     * дальних неровных каналах ценой небольшой задержки.
+     */
+    private startAdaptiveBuffer(pc: RTCPeerConnection): void {
+        this.stopAdaptiveBuffer();
+        if (settings.store.autoQuality === false) return;
+        const userMin = () => Number(settings.store.jitterBuffer) || 0;
+        let st: RecvState = { targetMs: userMin(), calmSince: Date.now() };
+        let prevFreezes = -1;
+        this.jbTimer = setInterval(async () => {
+            if (this.pc !== pc || settings.store.autoQuality === false) return;
+            try {
+                let freezes = 0, jitterMs = 0;
+                (await pc.getStats()).forEach((r: any) => {
+                    if (r.type === "inbound-rtp" && r.kind === "video") {
+                        freezes = r.freezeCount ?? 0;
+                        jitterMs = (r.jitter ?? 0) * 1000;
+                    }
+                });
+                const newFreezes = prevFreezes < 0 ? 0 : Math.max(0, freezes - prevFreezes);
+                prevFreezes = freezes;
+                const next = nextJitterTarget(st, { freezes: newFreezes, jitterMs, now: Date.now() }, userMin());
+                if (next.targetMs !== st.targetMs) {
+                    logger.info(`Буфер зрителя: ${st.targetMs} → ${next.targetMs} мс${newFreezes ? ` (заморозок +${newFreezes})` : ""}, джиттер ${Math.round(jitterMs)} мс`);
+                    for (const rcv of pc.getReceivers()) {
+                        try { (rcv as any).jitterBufferTarget = next.targetMs; } catch { /* ignore */ }
+                    }
+                    this.jitterTargetMs = next.targetMs;
+                }
+                st = next;
+            } catch { /* следующий тик */ }
+        }, 2000);
+    }
+
+    private stopAdaptiveBuffer(): void {
+        if (this.jbTimer) { clearInterval(this.jbTimer); this.jbTimer = undefined; }
+    }
+
     /** Закрыть текущий pc и убрать его дорожки из stream (перед новой сессией) */
     private resetPc(): void {
+        this.stopAdaptiveBuffer();
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
         this.iceBuf = [];
         this.pendingIce = [];
@@ -1140,6 +1249,7 @@ export class WatchSession {
 
     stop(sendLeave = true): void {
         this.stopJoinLoop();
+        this.stopAdaptiveBuffer();
         // недоставленные join/answer/ice этому хосту больше не нужны
         cancelPending(sig => sig.to === this.host.userId && sig.s === this.host.streamId && sig.t !== "leave");
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }

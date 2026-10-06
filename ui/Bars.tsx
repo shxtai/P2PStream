@@ -143,6 +143,17 @@ function HostBar({ session }: { session: HostSession }) {
             <span className={cl("hostbar-meta")}>{metaText(session.meta)}</span>
             <span className={cl("hostbar-meta")}>{live ? `↑ ${mbps.toFixed(2)} Мбит/с` : "ожидание зрителей…"}</span>
             <span className={cl("hostbar-meta")}>Зрителей: {session.peers.size}</span>
+            {(() => {
+                // авто-качество снизило поток кому-то из зрителей — показываем минимум
+                const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
+                const caps = [...session.peers.values()].map(p => p.aqCapBps).filter(c => c > 0 && c < userMax);
+                if (!caps.length) return null;
+                return (
+                    <span className={cl("hostbar-meta")} title="Канал до зрителя не тянет выбранный битрейт — поток снижен автоматически">
+                        авто ↓ {(Math.min(...caps) / 1e6).toFixed(1)} Мбит/с
+                    </span>
+                );
+            })()}
             <div className={cl("spacer")} />
             <button
                 className={cl("pill-btn", { active: profile === "games" })}
