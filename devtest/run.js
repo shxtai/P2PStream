@@ -62,9 +62,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function runScenario(chromePath, query, port) {
     const profile = fs.mkdtempSync(path.join(os.tmpdir(), "p2pstream-devtest-"));
+    // эмуляция плохого канала средствами самого WebRTC: link=кбит/с, plr=% потерь, qdelay=мс
+    const qp = new URLSearchParams(query);
+    const net = [];
+    if (qp.get("link")) net.push(`link_capacity_kbps:${qp.get("link")}`);
+    if (qp.get("plr")) net.push(`loss_percent:${qp.get("plr")}`);
+    if (qp.get("qdelay")) net.push(`queue_delay_ms:${qp.get("qdelay")}`);
+    const extra = net.length ? [`--force-fieldtrials=WebRTC-FakeNetworkSendConfig/${net.join(",")}/`] : [];
     const chrome = spawn(chromePath, [
         "--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
-        "--no-first-run", "--autoplay-policy=no-user-gesture-required", "about:blank"
+        "--no-first-run", "--autoplay-policy=no-user-gesture-required", ...extra, "about:blank"
     ], { stdio: "ignore" });
     try {
         let wsUrl;
@@ -94,13 +101,13 @@ async function runScenario(chromePath, query, port) {
         const url = "file:///" + path.join(__dirname, "index.html").replace(/\\/g, "/") + "?" + query;
         await call("Page.navigate", { url });
         const t0 = Date.now();
-        while (Date.now() - t0 < 120_000) {
+        while (Date.now() - t0 < 240_000) { // анонс при потерях может идти до ~80 с + подключение
             await sleep(1000);
             const r = await call("Runtime.evaluate", { expression: "window.__result || null", returnByValue: true });
             if (r?.result?.value) { ws.close(); return r.result.value; }
         }
         ws.close();
-        return "FAIL: нет результата за 120 с";
+        return "FAIL: нет результата за 240 с";
     } finally {
         chrome.kill();
         await sleep(300);

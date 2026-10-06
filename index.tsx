@@ -11,7 +11,7 @@ import definePlugin from "@utils/types";
 import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
 import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
-import { manager, probeNat, relayStatus } from "./engine";
+import { manager, mediaReport, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
 import { settings } from "./settings";
@@ -136,12 +136,26 @@ export default definePlugin({
             inputType: ApplicationCommandInputType.BUILT_IN,
             execute: () => {
                 for (const ln of collectDiagnostics()) logger.info(ln);
-                toast("Диагностика P2PStream: проверяю сеть (~4 с)…");
-                void probeNat().then(res => {
-                    logger.info(`P2P-DOC | NAT: ${res}`);
+                toast("Диагностика P2PStream: проверяю сеть и поток (~4 с)…");
+                void (async () => {
+                    // статистика потока (если идёт эфир/просмотр) — параллельно с проверкой NAT
+                    const reports: Array<Promise<string[]>> = [];
+                    const labels: string[] = [];
+                    for (const [uid, peer] of manager.host?.peers ?? []) {
+                        labels.push(`поток → ${uid}`);
+                        reports.push(mediaReport(peer.pc, "out"));
+                    }
+                    for (const w of manager.watches.values()) {
+                        if (!w.pc) continue;
+                        labels.push(`поток ← ${w.host.name}`);
+                        reports.push(mediaReport(w.pc, "in"));
+                    }
+                    const [nat, ...media] = await Promise.all([probeNat(), ...reports]);
+                    media.forEach((lines, i) => lines.forEach(l => logger.info(`P2P-DOC | ${labels[i]} | ${l}`)));
+                    logger.info(`P2P-DOC | NAT: ${nat}`);
                     logger.info("P2P-DOC | Скопируйте эти строки и отправьте разработчику");
                     toast("Диагностика P2PStream записана в консоль (Ctrl+Shift+I → Console)", "success");
-                });
+                })();
             }
         }
     ],

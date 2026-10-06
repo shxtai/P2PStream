@@ -11,7 +11,7 @@ const RELAY = q.get("relay") || "";
 const frames = {};
 for (const [id, role] of [["111111111111111111", "host"], ["222222222222222222", "viewer"]]) {
     const fr = document.createElement("iframe");
-    fr.src = `peer.html?me=${id}&role=${role}&relay=${encodeURIComponent(RELAY)}`;
+    fr.src = `peer.html?me=${id}&role=${role}&relay=${encodeURIComponent(RELAY)}${q.has("heavy") ? "&heavy" : ""}${q.get("bitrate") ? "&bitrate=" + q.get("bitrate") : ""}${q.get("codec") ? "&codec=" + q.get("codec") : ""}`;
     document.body.appendChild(fr);
     frames[id] = fr;
 }

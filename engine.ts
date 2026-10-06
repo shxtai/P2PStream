@@ -419,6 +419,60 @@ export async function probeNat(ms = 4000): Promise<string> {
     return `хороший (один внешний адрес ${[...sets[0]][0]} для разных серверов) — прямое P2P собирается`;
 }
 
+/**
+ * Подробная статистика медиапотока для /p2p-doctor: два снимка getStats с
+ * интервалом 2 с — скорости, потери, FPS, заморозки, причина ограничения энкодера.
+ * По ней видно, кто виноват в «лагах»: канал (потери/RTT), энкодер (cpu/bandwidth)
+ * или декодер зрителя (кадры приходят, но не декодируются).
+ */
+export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"): Promise<string[]> {
+    const pick = (rep: RTCStatsReport) => {
+        const o: Record<string, any> = {};
+        rep.forEach((r: any) => {
+            if (r.kind === "video" && r.type === (direction === "out" ? "outbound-rtp" : "inbound-rtp")) o.rtp = r;
+            if (r.kind === "video" && r.type === "remote-inbound-rtp") o.remote = r;
+            if (r.type === "transport" && r.selectedCandidatePairId) o.pair = rep.get(r.selectedCandidatePairId);
+        });
+        if (o.pair) { o.local = rep.get(o.pair.localCandidateId); o.remoteCand = rep.get(o.pair.remoteCandidateId); }
+        return o;
+    };
+    try {
+        const a = pick(await pc.getStats());
+        await new Promise(r => setTimeout(r, 2000));
+        const b = pick(await pc.getStats());
+        const dt = ((b.rtp?.timestamp ?? 0) - (a.rtp?.timestamp ?? 0)) / 1000 || 2;
+        const d = (k: string) => (b.rtp?.[k] ?? 0) - (a.rtp?.[k] ?? 0);
+        const lines: string[] = [];
+        const path = b.pair
+            ? `${b.local?.candidateType}/${b.local?.protocol} ${b.local?.address ?? ""} ↔ ${b.remoteCand?.candidateType} ${b.remoteCand?.address ?? ""}, RTT ${Math.round((b.pair.currentRoundTripTime ?? 0) * 1000)} мс`
+            : "нет выбранной пары";
+        lines.push(`путь: ${path}`);
+        if (!b.rtp) return [...lines, "видеопотока нет"];
+        const r = b.rtp;
+        if (direction === "out") {
+            const mbps = (d("bytesSent") * 8 / dt / 1e6).toFixed(2);
+            const rtxMbps = (d("retransmittedBytesSent") * 8 / dt / 1e6).toFixed(2);
+            const lim = r.qualityLimitationDurations
+                ? Object.entries(r.qualityLimitationDurations as Record<string, number>).map(([k, v]) => `${k}=${Math.round(v)}с`).join(" ")
+                : "";
+            lines.push(`отправка: ${mbps} Мбит/с (повторы ${rtxMbps}), ${r.frameWidth}x${r.frameHeight} ${Math.round(r.framesPerSecond ?? 0)} FPS, энкодер ${r.encoderImplementation ?? "?"}${r.powerEfficientEncoder ? " (аппаратный)" : ""}`);
+            lines.push(`ограничение: ${r.qualityLimitationReason ?? "?"} [${lim}], оценка канала ${b.pair?.availableOutgoingBitrate ? (b.pair.availableOutgoingBitrate / 1e6).toFixed(1) + " Мбит/с" : "?"}`);
+            lines.push(`от зрителя: NACK +${d("nackCount")}, PLI +${d("pliCount")} (запросы ключевого кадра), потери ${b.remote?.fractionLost != null ? (b.remote.fractionLost * 100).toFixed(1) + "%" : "?"}, джиттер ${b.remote?.jitter != null ? Math.round(b.remote.jitter * 1000) + " мс" : "?"}`);
+        } else {
+            const mbps = (d("bytesReceived") * 8 / dt / 1e6).toFixed(2);
+            const lost = d("packetsLost"), got = d("packetsReceived");
+            const jb = r.jitterBufferEmittedCount ? Math.round(r.jitterBufferDelay / r.jitterBufferEmittedCount * 1000) : 0;
+            lines.push(`приём: ${mbps} Мбит/с, ${r.frameWidth}x${r.frameHeight} ${Math.round(r.framesPerSecond ?? 0)} FPS, декодер ${r.decoderImplementation ?? "?"}${r.powerEfficientDecoder ? " (аппаратный)" : ""}`);
+            lines.push(`кадры за ${dt.toFixed(1)} с: получено +${d("framesReceived")}, декодировано +${d("framesDecoded")}, выброшено +${d("framesDropped")}, ключевых +${d("keyFramesDecoded")}`);
+            lines.push(`сеть: потери ${got + lost > 0 ? (lost / (got + lost) * 100).toFixed(1) : "0"}% (${lost} пак.), NACK +${d("nackCount")}, PLI +${d("pliCount")}, джиттер ${Math.round((r.jitter ?? 0) * 1000)} мс, буфер ${jb} мс`);
+            lines.push(`заморозки: ${r.freezeCount ?? "?"} всего, ${r.totalFreezesDuration != null ? r.totalFreezesDuration.toFixed(1) + " с" : "?"} суммарно`);
+        }
+        return lines;
+    } catch (e) {
+        return [`статистика недоступна: ${e}`];
+    }
+}
+
 /** Диагностика: каким путём реально пошёл трафик (host/srflx — напрямую, relay — через TURN) */
 async function logSelectedPair(pc: RTCPeerConnection, label: string): Promise<void> {
     try {
