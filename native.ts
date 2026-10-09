@@ -594,6 +594,9 @@ const P2P_AUDIO_EXE_B64 =
 let audioProc: ReturnType<typeof spawn> | null = null;
 let audioQueue: Buffer[] = [];
 let audioQueuedBytes = 0;
+/** хелпер завершился ПОСЛЕ успешного старта (закрыли игру, краш, сменилось устройство) —
+ *  вотчдог рендерера перезапустит его сам (v1.20: раньше звук молча исчезал до конца эфира) */
+let audioProcDead = false;
 /** Стерео-кадр float32 = 8 байт. Куски из пайпа приходят ПРОИЗВОЛЬНОЙ длины —
  *  отдаём рендереру только целые кадры, хвост ждёт следующего куска. Раньше
  *  невыровненный хвост сдвигал все следующие сэмплы: вместо звука — шум. */
@@ -664,6 +667,7 @@ function stopAudioInternal(): void {
     audioProc = null;
     audioQueue = [];
     audioQueuedBytes = 0;
+    audioProcDead = false;
     if (proc) {
         try { proc.kill(); } catch { /* ignore */ }
     }
@@ -730,6 +734,7 @@ export async function startAudio(_e: IpcMainInvokeEvent, opts: { mode: string; i
     try { if (proc.pid) setPriority(proc.pid, osConstants.priority.PRIORITY_ABOVE_NORMAL); } catch { /* нет прав — не критично */ }
     audioQueue = [];
     audioQueuedBytes = 0;
+    audioProcDead = false;
 
     return await new Promise<P2PAudioStartResult>(resolve => {
         let settled = false;
@@ -782,7 +787,15 @@ export async function startAudio(_e: IpcMainInvokeEvent, opts: { mode: string; i
                 stderrTail = line.slice(0, 300);
                 if (line === "READY") {
                     proc.removeAllListeners("exit");
-                    proc.on("exit", () => { if (audioProc === proc) stopAudioInternal(); });
+                    proc.on("exit", () => {
+                        // смерть хелпера после READY — штатная ситуация (закрыли игру,
+                        // сменилось устройство): помечаем, вотчдог рендерера перезапустит.
+                        audioProcDead = true;
+                        if (audioProc === proc) stopAudioInternal();
+                    });
+                    proc.stdout?.on("close", () => {
+                        if (audioProc === proc) audioProcDead = true;
+                    });
                     finish({ ok: true });
                 } else if (line.startsWith("ERR ")) {
                     finish({ ok: false, error: line.slice(4) });
@@ -807,6 +820,11 @@ export async function pullAudio(): Promise<Uint8Array | null> {
 /** Остановить нативный захват звука. */
 export async function stopAudio(): Promise<void> {
     stopAudioInternal();
+}
+
+/** Состояние хелпера для вотчдога рендерера (v1.20): мёртв ли процесс захвата */
+export async function audioStatus(): Promise<{ dead: boolean; hasProc: boolean }> {
+    return { dead: audioProcDead, hasProc: audioProc != null };
 }
 
 /**

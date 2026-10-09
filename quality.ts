@@ -252,14 +252,16 @@ export const BPP_60 = 0.08;
 export const BPP_HIGH = 0.16;
 
 /**
- * Порядок ступеней (v1.19, по желанию пользователя): сначала жертвуем FPS при том
- * же разрешении (60 → 45 → 30), и только если не помогло — снижаем разрешение и
- * сразу возвращаем FPS на новом разрешении (1080@60 → 45 → 30 → 900@60 …).
+ * Порядок ступеней (v1.20, по требованию пользователя): FPS не опускается ниже
+ * 45 (если в настройках не выставлено меньше) — жертвуем FPS (60 → 45) при том
+ * же разрешении, и только если не помогло — снижаем разрешение и сразу
+ * возвращаем FPS на новом разрешении (1080@60 → 45 → 900@60 …). Ступень 30
+ * убрана: «минимум 45» — правило эфира.
  */
 export function buildLadder(srcHeight: number, userFps: number): Rung[] {
     const high = fpsSteps(userFps).filter(f => f > MIN_FPS);          // 144/120/90 — только на родном
-    const lowFps = [MIN_FPS, 45, 30].filter(f => f <= userFps);
-    const fpsAtHeight = lowFps.length ? lowFps : [userFps];            // выбор < 30 — как есть
+    const lowFps = [MIN_FPS, 45].filter(f => f <= userFps);
+    const fpsAtHeight = lowFps.length ? lowFps : [userFps];            // выбор < 45 — как просил пользователь
     const top = Math.max(1, Math.round(srcHeight));
     const heights = [...new Set([top, 1440, 1080, 900, 720].filter(h => h <= top && (h >= 720 || h === top)))].sort((a, b) => b - a);
     const ladder: Rung[] = [];

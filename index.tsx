@@ -73,7 +73,12 @@ function collectDiagnostics(): string[] {
         push(`  просмотр ${w.host.name}`, `буфер ${w.jitterTargetMs} мс, state=${w.state}, ${pc ? `conn=${pc.connectionState}, ice=${pc.iceConnectionState}, sig=${pc.signalingState}` : "оффер от хоста НЕ получен"}, дорожек=${w.stream.getTracks().length}, хост v${w.host.hostVersion ?? "?"} via ${w.host.via ?? "?"}`);
     }
     push("нативные плитки", settings.store.nativeTiles);
+    push("нативный плеер", settings.store.nativePlayer === false ? "выключен — просмотр в своём окне" : "вкл — P2P в штатном плеере Discord (фолбэк: свой)");
     push("звук", settings.store.audioMode);
+    const audioSt = manager.host?.nativeAudio?.stats?.();
+    if (audioSt) {
+        push("нативный звук (сейчас)", `режим ${audioSt.mode} · буфер ${audioSt.levelMs} мс · рестартов ${audioSt.restarts} · тишина ${Math.round(audioSt.silenceMs / 1000)} с${audioSt.dead ? " · ХЕЛПЕР МЁРТВ (перезапуск)" : ""}`);
+    }
     return lines;
 }
 
@@ -90,7 +95,7 @@ function migrateLegacyAudio(): void {
 
 export default definePlugin({
     name: "P2PStream",
-    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Свой пикер с выбором P2P/обычного стрима, умный звук приложения (WASAPI Process Loopback — как у Discord), плитка стрима в звонке с меткой P2P и превью, зум/PiP/фуллскрин у зрителя. Тихий сигналинг: служебные коды — @silent-сообщениями в ЛС с автоудалением (ни у кого никаких уведомлений) или через свой MQTT-брокер.",
+    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Автокачество: FPS не ниже 45 (если не выставлено меньше) с авто-срезкой/возвратом разрешения, звук не пропадает (вотчдог) и не уезжает (дрейф-коррекция), P2P-эфир в штатном плеере Discord (фуллскрин/поп-аут/PiP) и в плитках звонка, свой пикер, умный звук приложения (WASAPI Process Loopback). Тихий сигналинг: @silent-коды в ЛС с самоудалением или свой MQTT-брокер.",
     searchTerms: ["p2p", "stream", "quality", "bitrate", "webrtc", "golive", "стрим", "качество"],
     tags: ["Voice", "Media", "Utility"],
     authors: [{ name: "Super Z", id: 0n }],

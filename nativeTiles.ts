@@ -15,7 +15,8 @@ import {
     UserStore
 } from "@webpack/common";
 
-import { type LiveHost, manager } from "./engine";
+import { type LiveHost, manager, type WatchSession } from "./engine";
+import { playInNativePlayer } from "./nativePlayer";
 import { setNativeTilesHandler, settings } from "./settings";
 import { myId, myName } from "./utils";
 
@@ -470,7 +471,8 @@ function wrapPreviewStore(): void {
 
 // region перехват «Смотреть»
 /** При клике «Смотреть» на нашей плитке Discord пытается подключиться к своему RTC —
- *  перехватываем и открываем наш P2P-просмотрщик. */
+ *  перехватываем: открываем ШТАТНЫЙ плеер Discord и подключаем к нему наш P2P-поток
+ *  (nativePlayer, v1.20). Не завёлся / выключен в настройках — свой просмотрщик. */
 function installWatchIntercept(): void {
     const modules = new Set<any>();
     for (const props of [
@@ -497,7 +499,26 @@ function installWatchIntercept(): void {
                     const host = key0 != null ? hostByStreamKey(key0) : null;
                     if (host) {
                         // своя плитка: смотреть самого себя нечего (раньше — тост «Эфир не найден»)
-                        if (host.userId !== myId()) manager.watch(host.streamId);
+                        if (host.userId === myId()) return;
+                        // watch() сам дёргает onWatchCreated (открывает наш модал) —
+                        // тут временно глушим: решит штатный плеер или его фолбэк
+                        const prev = manager.onWatchCreated;
+                        manager.onWatchCreated = null;
+                        let session: WatchSession | null = null;
+                        try { session = manager.watch(host.streamId); } finally { manager.onWatchCreated = prev; }
+                        if (session) {
+                            const ok = playInNativePlayer(session, {
+                                openNativeModal: () => orig.apply(this, args),
+                                closeNativeModal: () => {
+                                    for (const m of modules) {
+                                        if (typeof m.clearActiveStream === "function") {
+                                            try { m.clearActiveStream(first); } catch { try { m.clearActiveStream(); } catch { /* ignore */ } }
+                                        }
+                                    }
+                                }
+                            });
+                            if (!ok) manager.onWatchCreated?.(session);
+                        }
                         return;
                     }
                 } catch (e) {

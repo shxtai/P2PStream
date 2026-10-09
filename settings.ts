@@ -176,6 +176,11 @@ export const settings = definePluginSettings({
         default: true,
         onChange: (v: boolean) => onNativeTilesChange?.(v)
     },
+    nativePlayer: {
+        type: OptionType.BOOLEAN,
+        description: "Смотреть P2P-эфир в ШТАТНОМ плеере Discord (тот же экран, что у обычных стримов: фуллскрин, поп-аут, громкость, PiP). Не завёлся — автоматом откроется свой просмотрщик",
+        default: true
+    },
     showStats: {
         type: OptionType.BOOLEAN,
         description: "Показывать панель статистики (битрейт/FPS/задержка) в окне просмотра",

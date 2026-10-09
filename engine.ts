@@ -1121,6 +1121,8 @@ export class WatchSession {
     /** адаптивный буфер (авто-качество зрителя) */
     private jbTimer: NodeJS.Timeout | undefined;
     jitterTargetMs = 0;
+    /** вызывается один раз при завершении/срыве эфира (штатный плеер закрывает свою модалку) */
+    onEnded?: () => void;
 
     /** Маршрут сигналов к хосту: по транспорту его анонса (совместимость со старыми версиями) */
     private hostRoute(): "broker" | "chat" | "both" {
@@ -1176,6 +1178,11 @@ export class WatchSession {
     private setState(state: WatchState): void {
         if (this.state === state) return;
         this.state = state;
+        if ((state === "ended" || state === "failed") && this.onEnded) {
+            const cb = this.onEnded;
+            this.onEnded = undefined;
+            try { cb(); } catch { /* ignore */ }
+        }
         this.mgr.bump();
     }
 
