@@ -277,6 +277,36 @@ function wrapApplicationStreamingStore(): void {
         if (hostByStreamKey(streamKey)) return false;
         return orig(streamKey);
     });
+
+    // Свой эфир глазами Discord: когда getOwnActiveStream/getOwnStreamKey возвращают
+    // наш фейк, Discord сам рисует ШТАТНЫЙ UI своего стрима — красную кнопку
+    // «Остановить трансляцию» в панели голоса и бейдж LIVE. Останавливаем этот клик
+    // сами (см. hooks.ts): Discord не знает про P2P-эфир, его stopStream ничего не сделает.
+    // ВАЖНО: Discord вызывает эти геттеры как React-снапшоты (useSyncExternalStore/
+    // useStateFromStores) — новый объект на каждый вызов = бесконечный перерендер
+    // («The result of getSnapshot should be cached»). Кэшируем до смены эфира/меты.
+    const ownFakeCache = { key: "", stream: null as any };
+
+    const ownFake = (): any => {
+        const { host } = manager;
+        if (!host) return null;
+        const metaKey = `${host.streamId}|${JSON.stringify(host.meta)}`;
+        if (ownFakeCache.key !== metaKey) {
+            ownFakeCache.stream = fakeStream({
+                streamId: host.streamId, userId: myId(), name: myName(),
+                channelId: host.channelId, lastSeen: Date.now(), meta: host.meta
+            });
+            ownFakeCache.key = metaKey;
+        }
+        return ownFakeCache.stream;
+    };
+
+    override(store, "getOwnActiveStream", orig => ownFake() ?? orig());
+    override(store, "getOwnStream", orig => ownFake() ?? orig());
+    override(store, "getOwnStreamKey", orig => {
+        const fake = ownFake();
+        return fake ? fake.streamKey : orig();
+    });
 }
 
 function wrapChannelRTCStore(): void {
@@ -613,6 +643,7 @@ export function uninstallNativeTiles(): void {
 setNativeTilesHandler(enabled => {
     if (enabled) installNativeTiles();
     else uninstallNativeTiles();
+    manager.bump(); // плавающим пилюлям (фолбэк-UI) нужно перерисоваться
 });
 
 // входящие превью-кадры от хостов (DataChannel) — рисуем их в плитках сразу

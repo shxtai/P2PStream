@@ -45,7 +45,7 @@ function makeWrapper(): (opts: DisplayMediaStreamOptions) => Promise<MediaStream
                 throw notAllowedError();
             }
             if (manager.host) {
-                toast("P2P-эфир уже идёт — панель остановки внизу экрана", "critical");
+                toast("P2P-эфир уже идёт — остановить можно красной кнопкой в панели голоса (или /p2p-stop)", "critical");
                 throw notAllowedError();
             }
             // Свой пикер: резолвится потоком для «обычного стрима»,
@@ -102,6 +102,12 @@ const START_STREAM_LABEL_RE = /(go[ ._-]?live|stream|screen[ ._-]?share|share|br
  * и раньше ошибочно открывала наш пикер вместо разворачивания видео.
  */
 const NOT_START_LABEL_RE = /(stop|end|leave|disconnect|watch|view|просмотр|смотр|останов|стоп|законч|заверш|отключ|выключ|полноэкран|фуллскрин|full[ ._-]?screen|во весь экран|весь экран|развернут|pop[ ._-]?out|настройк|setting)/i;
+
+/** Кнопка остановки ШТАТНОГО стрима (появляется и для нашего P2P: nativeTiles
+ *  возвращает Discord наш фейк как «свой активный стрим» — красная кнопка в
+ *  панели голоса штатная). Матчим узко: «остановить/stop» + «трансляц/стрим/stream». */
+const STOP_STREAM_LABEL_RE = /(останов|законч|заверш|прекрат|стоп|stop|end|leave)/i;
+const STOP_STREAM_QUALIFIER_RE = /(трансляц|стрим|эфир|демонстрац|экран|go[ ._-]?live|stream|broadcast|screen)/i;
 
 let goLiveInterceptor: ((payload: any) => boolean | void) | null = null;
 let goLiveHijackInstalled = false;
@@ -187,7 +193,18 @@ function goLiveInterceptorImpl(payload: any): boolean | void {
     if ((payload as any)?.[FALLBACK_FLAG]) return;
     // settings: null — это ОСТАНОВКА Go Live (кнопка «Остановить стрим»), а не старт:
     // раньше перехватчик ловил её и писал «не понял источник — запускаю обычный стрим»
-    if (payload.settings === null || (!resolveGoLiveSourceId(payload) && !payload.source && !payload.settings)) return;
+    if (payload.settings === null) {
+        // Страховка штатной остановки нашего P2P (если клик прошёл мимо
+        // docClickCapture — например, активация с клавиатуры): Discord не знает
+        // про наш эфир, его stop-экшен для фейкового ключа ничего не сделает.
+        if (manager.host) {
+            logger.info("Stop-экшен Discord при живом P2P — останавливаю свой эфир");
+            manager.stopShare();
+            return false;
+        }
+        return;
+    }
+    if (!resolveGoLiveSourceId(payload) && !payload.source && !payload.settings) return;
     // «Обычный стрим Discord» выбран в нашем пикере — пропускаем экшен в Discord
     if (bypassToDiscordOnce) {
         bypassToDiscordOnce = false;
@@ -195,7 +212,7 @@ function goLiveInterceptorImpl(payload: any): boolean | void {
         return;
     }
     if (manager.host) {
-        toast("P2P-эфир уже идёт — сначала остановите его в панели внизу", "critical");
+        toast("P2P-эфир уже идёт — остановить можно красной кнопкой в панели голоса (или /p2p-stop)", "critical");
         return false;
     }
     logger.info("Перехвачен стоковый Go Live — запускаю P2P");
@@ -280,12 +297,32 @@ function bypassOnceToDiscord(): void {
 function docClickCapture(e: MouseEvent): void {
     try {
         if (String(settings.store.goliveMode) !== "p2p") return;
+
+        const target = e.target as Element | null;
+        const btn0 = target?.closest?.("button, [role=button]") as Element | null;
+        // --- Штатная остановка нашего P2P (v1.21): Discord рисует свою красную
+        // кнопку «Остановить трансляцию» (видит наш фейк как свой активный стрим).
+        // Его stop-экшен ничего не сделает для P2P — перехватываем и останавливаем сами.
+        if (btn0 && manager.host) {
+            const stopLabel = btn0.getAttribute("aria-label") ?? "";
+            if (stopLabel && STOP_STREAM_LABEL_RE.test(stopLabel) && STOP_STREAM_QUALIFIER_RE.test(stopLabel)
+                && !btn0.closest('[class*="vc-p2p"]')
+                && btn0.getAttribute("aria-disabled") !== "true"
+                && !btn0.hasAttribute("disabled")) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                logger.info("Клик по штатной кнопке остановки — останавливаю P2P-эфир");
+                manager.stopShare();
+                return;
+            }
+        }
+
         if (bypassToDiscordOnce) return; // разрешили обычный стрим — не мешаем
         if (isPickerOpen()) return; // наш пикер уже открыт
         if (!inVoiceChannel()) return;
 
-        const target = e.target as Element | null;
-        const btn = target?.closest?.("button, [role=button]") as Element | null;
+        const btn = btn0;
         if (!btn) return;
 
         const label = btn.getAttribute("aria-label") ?? "";

@@ -14,7 +14,7 @@ import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
 import { manager, mediaReport, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
-import { settings } from "./settings";
+import { DEFAULT_BROKER_URL, settings } from "./settings";
 import { signalingHealth } from "./signaling";
 import managedStyle from "./styles.css?managed";
 import { AboutCard } from "./ui/AboutCard";
@@ -93,9 +93,28 @@ function migrateLegacyAudio(): void {
     } catch { /* ignore */ }
 }
 
+/** v1.21: брокер-воркер зашит по умолчанию. У старых установок в store мог
+ *  сохраниться явный brokerUrl = "" (старый дефолт) и брокер был выключен —
+ *  один раз проставляем новые значения. Свой брокер, настроенный вручную,
+ *  не трогаем: раз адрес вписан, выбор был осознанным. */
+function migrateBroker121(): void {
+    try {
+        const s = settings.store as any;
+        if (s.brokerMigrated121) return;
+        const url = String(s.brokerUrl ?? "").trim();
+        if (!url) {
+            s.brokerUrl = DEFAULT_BROKER_URL;
+            s.brokerEnabled = true;
+        } else if (url === DEFAULT_BROKER_URL) {
+            s.brokerEnabled = true;
+        }
+        s.brokerMigrated121 = true;
+    } catch { /* ignore */ }
+}
+
 export default definePlugin({
     name: "P2PStream",
-    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, AV1/VP9/H.264. Автокачество: FPS не ниже 45 (если не выставлено меньше) с авто-срезкой/возвратом разрешения, звук не пропадает (вотчдог) и не уезжает (дрейф-коррекция), P2P-эфир в штатном плеере Discord (фуллскрин/поп-аут/PiP) и в плитках звонка, свой пикер, умный звук приложения (WASAPI Process Loopback). Тихий сигналинг: @silent-коды в ЛС с самоудалением или свой MQTT-брокер.",
+    description: "P2P-стриминг вместо Discord Go Live: до 100 Мбит/с, задержка 30–80 мс, до 240 FPS, H.264/H.265/VP9/AV1. Автокачество: FPS не ниже 45 (если не выставлено меньше) с авто-срезкой/возвратом разрешения, звук не пропадает (вотчдог) и не уезжает (дрейф-коррекция), P2P-эфир в штатном плеере Discord (фуллскрин/поп-аут/PiP) и в плитках звонка, остановка — штатной красной кнопкой Discord, свой пикер, умный звук приложения (WASAPI Process Loopback). Сигналинг через свой MQTT-брокер в Cloudflare (зашит по умолчанию) или тихие @silent-коды в ЛС.",
     searchTerms: ["p2p", "stream", "quality", "bitrate", "webrtc", "golive", "стрим", "качество"],
     tags: ["Voice", "Media", "Utility"],
     authors: [{ name: "Super Z", id: 0n }],
@@ -209,6 +228,7 @@ export default definePlugin({
         manager.start();
         manager.onWatchCreated = session => openViewerModal(session);
         migrateLegacyAudio();
+        migrateBroker121();
 
         // v1.4: старый дефолт «system» -> новый дефолт «native» (умный звук).
         // Один раз: флаг audioModeMigrated14 не даёт перекрыть явный выбор пользователя.

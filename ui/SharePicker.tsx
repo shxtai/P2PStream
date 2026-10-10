@@ -106,10 +106,14 @@ function RadioRow({ options, value, onChange }: {
     onChange(v: string): void;
 }) {
     return (
-        <div className={cl("picker-seg")}>
+        <div className={cl("picker-seg")} role="radiogroup">
             {options.map(o => (
                 <button
                     key={o.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={String(value) === String(o.value)}
+                    aria-pressed={String(value) === String(o.value)}
                     className={cl("pill-btn", { active: String(value) === String(o.value) })}
                     onClick={() => onChange(o.value)}
                 >
@@ -425,9 +429,9 @@ function SharePickerModal({
                     </div>
                     <div>
                         <Forms.FormTitle tag="h5" className={cl("picker-label")}>Режим (как «Stream Mode» у Discord)</Forms.FormTitle>
-                        <div className={cl("picker-seg")}>
-                            <button className={cl("pill-btn", { active: profile === "games" })} onClick={() => quickProfile("games")}>Игры</button>
-                            <button className={cl("pill-btn", { active: profile === "movies" })} onClick={() => quickProfile("movies")}>Кино</button>
+                        <div className={cl("picker-seg")} role="radiogroup">
+                            <button type="button" role="radio" aria-checked={profile === "games"} aria-pressed={profile === "games"} className={cl("pill-btn", { active: profile === "games" })} onClick={() => quickProfile("games")}>Игры</button>
+                            <button type="button" role="radio" aria-checked={profile === "movies"} aria-pressed={profile === "movies"} className={cl("pill-btn", { active: profile === "movies" })} onClick={() => quickProfile("movies")}>Кино</button>
                         </div>
                         <span className={cl("picker-hint")}>
                             Игры — плавное движение; Кино — чёткая картинка. До 240 FPS стабильнее всего при захвате всего экрана.

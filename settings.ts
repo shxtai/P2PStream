@@ -9,9 +9,13 @@ import { OptionType } from "@utils/types";
 
 export type GoliveMode = "p2p" | "boost" | "off";
 export type Profile = "games" | "movies" | "manual";
-export type Codec = "auto" | "h264" | "vp9" | "av1";
+export type Codec = "auto" | "h264" | "h265" | "vp9" | "av1";
 export type ContentHint = "motion" | "detail";
 export type AudioMode = "native" | "system" | "off";
+
+/** Сигналинг-брокер по умолчанию (свой Cloudflare Worker, cf-worker/worker.js из репо).
+ *  Зашит в плагин: сигналинг сразу мимо Discord, чат-коды не нужны вовсе. */
+export const DEFAULT_BROKER_URL = "wss://shrill-shape-9a12.kosyakmilya.workers.dev/mqtt";
 
 /** Обработчик переключения «нативных плиток» (регистрируется в nativeTiles, чтобы избежать цикла импортов) */
 export let onNativeTilesChange: ((enabled: boolean) => void) | null = null;
@@ -21,9 +25,11 @@ export function setNativeTilesHandler(fn: (enabled: boolean) => void): void {
 }
 
 /** Порядок кодеков в режиме «Авто» (H.264 первым — обычно аппаратный и не грузит CPU
- *  во время игры). Если у конкретного зрителя поток не декодируется (запросы
- *  ключевых кадров без потерь) — хост сам переключит ему кодек: H.264 → VP9 → VP8. */
-export const AUTO_CODEC_ORDER: string[] = ["h264", "vp9", "av1"];
+ *  во время игры; H.265 сразу за ним — вдвое эффективнее там, где есть и у хоста, и
+ *  у зрителя; в списке возможностей его просто не окажется — шаг пропустится).
+ *  Если у конкретного зрителя поток не декодируется (запросы ключевых кадров без
+ *  потерь) — хост сам переключит ему кодек: VP9 → VP8 → H.264. */
+export const AUTO_CODEC_ORDER: string[] = ["h264", "h265", "vp9", "av1"];
 
 export const settings = definePluginSettings({
     goliveMode: {
@@ -92,10 +98,11 @@ export const settings = definePluginSettings({
     },
     codec: {
         type: OptionType.SELECT,
-        description: "Видеокодек (Авто: H.264 → VP9 → AV1). Если у зрителя кодек не декодируется, плагин сам переключит ему кодек на VP9/VP8",
+        description: "Видеокодек (Авто: H.264 → H.265 → VP9 → AV1; H.265 появляется только если клиент умеет его кодировать). Если у зрителя кодек не декодируется, плагин сам переключит ему кодек на VP9/VP8",
         options: [
             { label: "Авто", value: "auto", default: true },
             { label: "H.264 — аппаратный на большинстве GPU", value: "h264" },
+            { label: "H.265/HEVC — вдвое эффективнее H.264 (нужен аппаратный декодер у зрителя)", value: "h265" },
             { label: "VP9 — лучшее сжатие", value: "vp9" },
             { label: "AV1 — максимум эффективности (RTX 40 / RX 7000 / Arc)", value: "av1" },
         ] as const
@@ -146,13 +153,13 @@ export const settings = definePluginSettings({
     },
     brokerEnabled: {
         type: OptionType.BOOLEAN,
-        description: "Сигналинг через MQTT-брокер (мимо Discord). Публичные брокеры у части сетей блокируются; свой брокер — cf-worker/worker.js из репозитория (Cloudflare, 2 мин) или mosquitto на своём сервере. Без брокера работает тихий Discord-транспорт",
-        default: false
+        description: "Сигналинг через свой MQTT-брокер (мимо Discord). По умолчанию — готовый Cloudflare Worker (зашит ниже), сообщения в чате не нужны вовсе. Не работает у зрителей — плагин сам откатится на тихий Discord-транспорт",
+        default: true
     },
     brokerUrl: {
         type: OptionType.STRING,
-        description: "Свой брокер сигналинга (WSS, MQTT). Работает только при включённом брокере",
-        default: "",
+        description: "Адрес брокера сигналинга (WSS, MQTT). По умолчанию — свой Worker в Cloudflare; можно поднять свой (cf-worker/worker.js из репозитория, 2 мин) или mosquitto на своём сервере",
+        default: DEFAULT_BROKER_URL,
         placeholder: "wss://мой-брокер:8084/mqtt"
     },
     notifyLive: {

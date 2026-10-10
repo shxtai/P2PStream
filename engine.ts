@@ -88,6 +88,7 @@ function currentVoiceGuildId(): string | null {
 export function codecLabel(codec: string): string {
     switch (codec) {
         case "h264": return "H.264";
+        case "h265": return "H.265";
         case "vp9": return "VP9";
         case "av1": return "AV1";
         default: return "Авто";
@@ -227,6 +228,19 @@ function buildRtcConfig(extra: RTCIceServer[] = []): RTCConfiguration {
     };
 }
 
+/** Скорость H.264-профиля для сортировки: High > Main > Baseline. Один и тот же
+ *  аппаратный энкодер на High-профиле даёт заметно лучшую картинку на том же
+ *  битрейте (Discord по умолчанию стримит constrained-baseline — мы же берём
+ *  максимум, который согласуется; Baseline остаётся запасным в хвосте списка). */
+function h264ProfileScore(c: any): number {
+    const m = /profile-level-id=([0-9a-fA-F]{6})/.exec(String(c?.sdpFmtpLine ?? ""));
+    if (!m) return 0;
+    const profile = parseInt(m[1].slice(0, 2), 16);
+    if (profile === 0x64 || profile === 0x6e || profile === 0x7a) return 3; // high
+    if (profile === 0x4d || profile === 0x53 || profile === 0x56) return 2; // main
+    return 1; // baseline/constrained
+}
+
 /** Выставить предпочтительный видеокодек. В режиме «Авто» просто поднимает
  *  лёгкие кодеки в начало списка, сохраняя все остальные (безопасно). */
 function applyVideoCodecPreference(pc: RTCPeerConnection, codec: string): void {
@@ -249,17 +263,33 @@ function applyVideoCodecPreference(pc: RTCPeerConnection, codec: string): void {
             }
         }
 
+        // Внутри одного кодека — от лучшего профиля к запасному (см. h264ProfileScore):
+        // RTP-порядок в SDP равен порядку в списке, зритель возьмёт первый общий.
+        const byProfile = (a: any, b: any) => h264ProfileScore(b) - h264ProfileScore(a);
+        chosen.sort(byProfile);
+
         // Ручной выбор: выбранный кодек первым, но ЗА ним — запасные (VP9 → VP8 → H.264 →
         // остальные). Раньше в SDP был только выбранный: если у зрителя его нет (например,
         // H.265 у друга не поддерживается), согласование падало и видео не было вовсе.
         let list: RTCRtpCodec[];
         if (codec === "auto") {
+            // авто: выбранные кодеки уже в порядке AUTO_CODEC_ORDER — сортируем
+            // только внутри каждого кодека (byProfile внутри равных mime стабилен)
+            const rank = (c: any) => {
+                const mime = c.mimeType.toLowerCase().replace("video/", "");
+                const i = AUTO_CODEC_ORDER.indexOf(mime);
+                return i < 0 ? AUTO_CODEC_ORDER.length : i;
+            };
+            chosen.sort((a, b) => rank(a) - rank(b) || h264ProfileScore(b) - h264ProfileScore(a));
             list = [...chosen, ...rest] as RTCRtpCodec[];
         } else {
-            const backupOrder = ["vp9", "vp8", "h264", "av1"].filter(c => c !== codec);
+            const backupOrder = ["vp9", "h265", "vp8", "h264", "av1"].filter(c => c !== codec);
             const backups: any[] = [];
             for (const want of backupOrder) {
-                for (const c of caps.codecs) if (c.mimeType.toLowerCase() === `video/${want}`) backups.push(c);
+                const found: any[] = [];
+                for (const c of caps.codecs) if (c.mimeType.toLowerCase() === `video/${want}`) found.push(c);
+                found.sort(byProfile);
+                backups.push(...found);
             }
             const used = new Set([...chosen, ...backups]);
             list = [...chosen, ...backups, ...caps.codecs.filter(c => !used.has(c))] as RTCRtpCodec[];
@@ -1639,7 +1669,7 @@ export class P2PManager {
     /** Проверки перед стартом эфира. true — можно начинать */
     checkCanStart(): boolean {
         if (this.host) {
-            toast("P2P-эфир уже идёт — остановите его в панели внизу", "critical");
+            toast("P2P-эфир уже идёт — остановить можно красной кнопкой в панели голоса (или /p2p-stop)", "critical");
             return false;
         }
         if (!currentVoiceChannelId()) {

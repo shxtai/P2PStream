@@ -2,22 +2,19 @@
  * Vencord, a Discord client mod
  * Copyright (c) 2026 Super Z
  * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Плавающие пилюли эфиров. С v1.21 НИКАКОЙ постоянной панели «эфир идёт»:
+ * свой эфир виден штатно — плиткой в звонке (nativeTiles) и красной кнопкой
+ * «Остановить трансляцию» в панели голоса (Discord рисует её сам, видя наш
+ * фейк как свой активный стрим). Эти пилюли остались ТОЛЬКО запасным UI на
+ * случай выключенных нативных плиток: чужие эфиры с кнопкой «Смотреть».
  */
 
-import { createRoot,React, SelectedChannelStore } from "@webpack/common";
+import { createRoot, React, SelectedChannelStore } from "@webpack/common";
 
 import { cl } from "../css";
-import { createStatsTracker, type HostSession, type LiveHost, manager, type StreamMeta, type WatchSession } from "../engine";
-import { applyProfile, settings } from "../settings";
-import { toast } from "../utils";
-
-/** свой счётчик на каждое соединение — дельты байтов не смешиваются между зрителями */
-const outTrackers = new WeakMap<RTCPeerConnection, ReturnType<typeof createStatsTracker>>();
-function readOutStats(pc: RTCPeerConnection) {
-    let t = outTrackers.get(pc);
-    if (!t) outTrackers.set(pc, t = createStatsTracker("out"));
-    return t(pc);
-}
+import { type LiveHost, manager, type WatchSession } from "../engine";
+import { settings } from "../settings";
 
 export function mountBars(): () => void {
     const el = document.createElement("div");
@@ -39,8 +36,10 @@ function useManager(): void {
 function BarsRoot() {
     useManager();
 
+    // С нативными плитками UI звонка сам показывает эфиры — плавающие пилюли не нужны.
+    if (settings.store.nativeTiles) return null;
+
     const voiceId = safeVoiceId();
-    const meId = manager.host?.streamId ?? "";
     const hosts = [...manager.liveHosts.values()]
         .filter(h => h.channelId === voiceId)
         .sort((a, b) => a.name.localeCompare(b.name));
@@ -48,9 +47,8 @@ function BarsRoot() {
     return (
         <div className={cl("bars-root")}>
             {hosts.map(host => (
-                <LivePill key={host.streamId} host={host} isMine={host.streamId === meId} />
+                <LivePill key={host.streamId} host={host} isMine={host.streamId === manager.host?.streamId} />
             ))}
-            {manager.host && <HostBar session={manager.host} />}
         </div>
     );
 }
@@ -63,7 +61,7 @@ function safeVoiceId(): string | null {
     }
 }
 
-function metaText(meta: StreamMeta): string {
+function metaText(meta: { res?: string; fps?: number; bitrate?: number; codec?: string }): string {
     return [meta.res, meta.fps ? `${meta.fps} FPS` : "", meta.codec, meta.bitrate ? `${meta.bitrate} Мбит/с` : ""]
         .filter(Boolean)
         .join(" · ");
@@ -103,78 +101,6 @@ function LivePill({ host, isMine }: { host: LiveHost; isMine?: boolean }) {
                     {watch?.state === "failed" ? "Повторить" : "Смотреть"}
                 </button>
             )}
-        </div>
-    );
-}
-
-function HostBar({ session }: { session: HostSession }) {
-    useManager();
-    const [mbps, setMbps] = React.useState(0);
-    const live = session.peers.size > 0;
-
-    // суммарная отдача по ВСЕМ зрителям (раньше — только первый, и общий счётчик)
-    React.useEffect(() => {
-        if (!live) { setMbps(0); return; }
-        let alive = true;
-        const tick = () => {
-            const pcs = [...session.peers.values()].map(p => p.pc);
-            void Promise.all(pcs.map(readOutStats)).then(list => {
-                if (alive) setMbps(list.reduce((a, s) => a + (s?.mbps ?? 0), 0));
-            });
-        };
-        tick();
-        const timer = setInterval(tick, 2000); // getStats по всем зрителям — не чаще раза в 2 с
-        return () => { alive = false; clearInterval(timer); };
-    }, [live, session]);
-
-    const profile = String(settings.store.profile);
-
-    const quickProfile = (p: "games" | "movies") => {
-        applyProfile(p);
-        settings.store.profile = p;
-        session.applyLiveChanges();
-        toast(p === "games" ? "Профиль «Игры» применён к эфиру" : "Профиль «Кино» применён к эфиру", "success");
-    };
-
-    return (
-        <div className={cl("hostbar")}>
-            <span className={cl("live-dot")} />
-            <span className={cl("hostbar-label")}>P2P ЭФИР</span>
-            <span className={cl("hostbar-meta")}>{metaText(session.meta)}</span>
-            <span className={cl("hostbar-meta")}>{live ? `↑ ${mbps.toFixed(2)} Мбит/с` : "ожидание зрителей…"}</span>
-            <span className={cl("hostbar-meta")}>Зрителей: {session.peers.size}</span>
-            {(() => {
-                // авто-качество снизило поток кому-то из зрителей — показываем минимум
-                const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
-                const caps = [...session.peers.values()].map(p => p.aqCapBps).filter(c => c > 0 && c < userMax);
-                if (!caps.length) return null;
-                return (
-                    <span className={cl("hostbar-meta")} title="Канал до зрителя не тянет выбранный битрейт — поток снижен автоматически">
-                        авто ↓ {(Math.min(...caps) / 1e6).toFixed(1)} Мбит/с
-                    </span>
-                );
-            })()}
-            <div className={cl("spacer")} />
-            <button
-                className={cl("pill-btn", { active: profile === "games" })}
-                onClick={() => quickProfile("games")}
-                title="Пресет: минимальная задержка"
-            >
-                Игры
-            </button>
-            <button
-                className={cl("pill-btn", { active: profile === "movies" })}
-                onClick={() => quickProfile("movies")}
-                title="Пресет: плавность"
-            >
-                Кино
-            </button>
-            <button
-                className={`${cl("pill-btn")} ${cl("danger")}`}
-                onClick={() => manager.stopShare()}
-            >
-                Стоп
-            </button>
         </div>
     );
 }
