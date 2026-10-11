@@ -329,7 +329,9 @@ function mungeOpusStereo(sdp: string): string {
             if (!inAudio) continue;
             const fm = lines[i].match(/^a=fmtp:(\d+)\s(.+)$/);
             if (fm && opusPts.has(fm[1]) && !fm[2].includes("stereo=1")) {
-                lines[i] = `a=fmtp:${fm[1]} ${fm[2]};stereo=1;sprop-stereo=1;maxaveragebandwidth=510000`;
+                // useinbandfec=1: Opus сам чинит потери пакетов — на нестабильных
+                // сетях звук не осыпается (для музыки stereo+fec — правильная связка)
+                lines[i] = `a=fmtp:${fm[1]} ${fm[2]};stereo=1;sprop-stereo=1;maxaveragebandwidth=510000;useinbandfec=1`;
             }
         }
         return lines.join("\r\n");
@@ -383,9 +385,12 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
     const wantFps = Number(settings.store.fps) || 60;
     const wantVideoBps = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
     const wantAudioBps = Math.round(Number(settings.store.audioBitrate) * 1000);
-    // С авто-качеством разрешением управляет лестница (сначала FPS 60 → 45 → 30,
-    // потом разрешение) — WebRTC не должен сам ронять разрешение раньше FPS.
-    const hint = settings.store.autoQuality !== false || String(settings.store.contentHint) === "detail"
+    // С авто-качеством и в играх (motion) FPS — ПРИОРИТЕТ: канала не хватает —
+    // жертвуем разрешением (наша лестница делает то же самое). Раньше тут стоял
+    // "maintain-resolution": Chrome сам ронял FPS при просадке канала — прямо
+    // вопреки требованию «FPS не ниже 45» и лестнице, жертвующей разрешением.
+    // "Detail" (фильмы/статика) — наоборот, держим чёткость, FPS может подсесть.
+    const hint = String(settings.store.contentHint) === "detail"
         ? "maintain-resolution" : "maintain-framerate";
 
     for (const sender of pc.getSenders()) {
@@ -1622,7 +1627,7 @@ export class P2PManager {
             return;
         }
         if (list.length > 1) {
-            toast(`Несколько эфиров (${list.map(h => h.name).join(", ")}) — выберите пилюлю внизу экрана`);
+            toast(`Несколько эфиров (${list.map(h => h.name).join(", ")}) — нажмите «Смотреть» на плитке нужного стрима в звонке`);
             return;
         }
         const native = this.nativeStreamsInVoice();
@@ -1905,7 +1910,7 @@ export class P2PManager {
 
                 if (!prev && channelId === voice) {
                     if (settings.store.notifyLive) {
-                        toast(`${userNameSafe(sig.from)} начал P2P-эфир — нажмите пилюлю внизу экрана`, "success");
+                        toast(`${userNameSafe(sig.from)} начал P2P-эфир — плитка стрима появилась в звонке`, "success");
                     }
                     if (settings.store.autoWatch && !this.watches.has(sig.s)) {
                         this.watch(sig.s);
@@ -2061,10 +2066,13 @@ export class P2PManager {
         }
     };
 
-    /** Есть ли у пользователя активный Discord-стрим (чтобы не конфликтовать) */
+    /** Есть ли у пользователя активный Discord-стрим (чтобы не конфликтовать).
+     *  Наш собственный P2P-фейк (nativeTiles) — НЕ Discord-стрим: раньше из-за него
+     *  пикер писал «Сначала остановите Discord-стрим» вместо сообщения про P2P. */
     hasDiscordStream(userId: string): boolean {
         try {
-            return !!ApplicationStreamingStore.getStreamForUser?.(userId);
+            const st: any = ApplicationStreamingStore.getStreamForUser?.(userId);
+            return !!st && !st.__vcP2PFake;
         } catch {
             return false;
         }
@@ -2079,6 +2087,7 @@ export class P2PManager {
             const out: Array<{ userId: string; name: string }> = [];
             for (const st of all) {
                 try {
+                    if (st?.__vcP2PFake) continue; // наши P2P-эфиры — не «нативные Discord-стримы»
                     if (String(st?.channelId ?? st?.channel_id ?? "") !== voice) continue;
                     const uid = String(st?.userId ?? st?.ownerId ?? "");
                     if (!uid || uid === myId()) continue;

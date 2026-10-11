@@ -87,18 +87,34 @@ function hostByOwner(ownerId: any): LiveHost | null {
     return allHosts().find(h => h.userId === id) ?? null;
 }
 
+/** streamKey в ТОЧНОМ формате Discord (utils streamKey): строковые константы
+ *  streamType = "guild" | "call", ключ = [type, guildId?, channelId, ownerId].join(":").
+ *  Раньше ключ был без префикса — любой парсинг ключа внутри Discord
+ *  (getPreviewURLForStreamKey, getActiveStreamForStreamKey из плитки, STREAM_WATCH,
+ *  парсер Iy()) кидал "Unknown stream type 95412..." — и штатная кнопка
+ *  «Смотреть» на нашей плитке не появлялась ВООБЩЕ (v1.21 fix). */
 function streamKeyFor(host: LiveHost): string {
     const gid = guildIdOfChannel(host.channelId);
-    return gid ? `${gid}:${host.channelId}:${host.userId}` : `${host.channelId}:${host.userId}`;
+    return gid
+        ? `guild:${gid}:${host.channelId}:${host.userId}`
+        : `call:${host.channelId}:${host.userId}`;
 }
 
 function hostByStreamKey(streamKey: any): LiveHost | null {
     if (streamKey == null) return null;
     const key = String(streamKey);
-    const byKey = allHosts().find(h => streamKeyFor(h) === key);
+    const hosts = allHosts();
+    const byKey = hosts.find(h => streamKeyFor(h) === key);
     if (byKey) return byKey;
+    // разбор формата Discord: call:channelId:ownerId | guild:guildId:channelId:ownerId
+    const parts = key.split(":");
+    if ((parts[0] === "call" && parts.length === 3) || (parts[0] === "guild" && parts.length === 4)) {
+        const channelId = parts[parts.length - 2];
+        const ownerId = parts[parts.length - 1];
+        return hosts.find(h => h.channelId === channelId && h.userId === ownerId) ?? null;
+    }
     // запасной вариант: ключ оканчивается на userId
-    return allHosts().find(h => key.endsWith(h.userId)) ?? null;
+    return hosts.find(h => key.endsWith(h.userId)) ?? null;
 }
 
 function maxResolution(): { height: number; width: number } {
@@ -218,6 +234,15 @@ function wrapApplicationStreamingStore(): void {
         return fakes.length ? [...res, ...fakes] : res;
     });
 
+    // «Единственный активный стрим» сверху звонка (полоса «Смотрим стрим X») и
+    // авто-подключение при входе в канал читают ИМЕННО getAllActiveStreams.
+    // Раньше наш эфир там отсутствовал — полоса и авто-watch не срабатывали.
+    override(store, "getAllActiveStreams", orig => {
+        const res = orig() ?? [];
+        const fakes = allHosts().map(fakeStream);
+        return fakes.length ? [...res, ...fakes] : res;
+    });
+
     override(store, "getAllApplicationStreamsForChannel", (orig, channelId) => {
         const res = orig(channelId) ?? [];
         const fakes = hostsInChannel(channelId).map(fakeStream);
@@ -309,6 +334,19 @@ function wrapApplicationStreamingStore(): void {
     });
 }
 
+/** Есть ли в списке уже участник-стрим этого хоста (реестр Discord сам добавляет
+ *  его через наши же override getStreamForUser/getActiveStreamForUser — id =
+ *  streamKey в формате Discord). Без дедупликации плитка стрима рисуется ДВАЖДЫ. */
+function listHasHost(list: any[], host: LiveHost): boolean {
+    const key = streamKeyFor(host);
+    const streamType = participantTypeValue();
+    return list.some(p => {
+        if (!p || p.__vcP2PFake) return false;
+        const id = String(p?.id ?? "");
+        return id === key || (streamType != null && p?.type === streamType && id.endsWith(host.userId));
+    });
+}
+
 function wrapChannelRTCStore(): void {
     const store: any = ChannelRTCStore;
     if (!store) return;
@@ -320,8 +358,7 @@ function wrapChannelRTCStore(): void {
         // участника-пользователя НЕ трогаем — плитку стрима добавляем рядом
         const list = [...res].filter((p: any) => !p?.__vcP2PFake);
         for (const host of hosts) {
-            const key = streamKeyFor(host);
-            if (list.some((p: any) => p && String(p.id) === key)) continue;
+            if (listHasHost(list, host)) continue;
             list.push(fakeParticipant(host));
         }
         return list;
@@ -334,10 +371,10 @@ function wrapChannelRTCStore(): void {
 
     override(store, "getStreamParticipants", (orig, channelId) => {
         const res = orig(channelId) ?? [];
-        const fakes = hostsInChannel(channelId).map(fakeParticipant);
-        if (!fakes.length) return res;
+        const hosts = hostsInChannel(channelId).filter(h => !listHasHost(res, h));
+        if (!hosts.length) return res;
         const list = [...res].filter((p: any) => !p?.__vcP2PFake);
-        return [...list, ...fakes];
+        return [...list, ...hosts.map(fakeParticipant)];
     });
 
     override(store, "isParticipantPoppedOut", (orig, channelId, participantId) => {
@@ -564,6 +601,58 @@ function installWatchIntercept(): void {
         }
     }
 }
+
+/** Слой 2 — Flux-интерцептор STREAM_WATCH. Все штатные пути «Смотреть» сходятся
+ *  в функцию watchStream (слой 1 её оборачивает), но часть кода Discord диспетчит
+ *  экшен напрямую (авто-watch при входе в канал, горячие клавиши, полоса
+ *  «Смотрим стрим»). Без этого слоя такие пути улетали в RTC с фейковым ключом
+ *  и тихо умирали. */
+let suppressWatchIntercept = false;
+
+function installStreamWatchInterceptor(): void {
+    const fd: any = FluxDispatcher;
+    if (typeof fd?.addInterceptor !== "function") return;
+    const interceptor = (payload: any): boolean | void => {
+        try {
+            if (suppressWatchIntercept || payload?.type !== "STREAM_WATCH") return;
+            const host = hostByStreamKey(payload.streamKey);
+            if (!host) return;
+            if (host.userId === myId()) return false; // свой эфир
+            const prev = manager.onWatchCreated;
+            manager.onWatchCreated = null;
+            let session: WatchSession | null = null;
+            try { session = manager.watch(host.streamId); } finally { manager.onWatchCreated = prev; }
+            if (!session) return false;
+            // открыть штатную модалку = пропустить экшен дальше один раз
+            const openNativeModal = () => {
+                suppressWatchIntercept = true;
+                try { fd.dispatch({ ...payload }); } finally {
+                    setTimeout(() => { suppressWatchIntercept = false; }, 0);
+                }
+            };
+            const closeNativeModal = () => {
+                for (const props of [["clearActiveStream", "setActiveStream"], ["clearActiveStream"]]) {
+                    try {
+                        const mod: any = findByProps(...props);
+                        if (mod && typeof mod.clearActiveStream === "function") {
+                            try { mod.clearActiveStream({ streamKey: payload.streamKey }); } catch { try { mod.clearActiveStream(); } catch { /* ignore */ } }
+                        }
+                    } catch { /* ignore */ }
+                }
+            };
+            const ok = playInNativePlayer(session, { openNativeModal, closeNativeModal });
+            if (!ok) manager.onWatchCreated?.(session);
+            return false;
+        } catch (e) {
+            logger.debug("STREAM_WATCH intercept:", e);
+            return undefined;
+        }
+    };
+    fd.addInterceptor(interceptor);
+    restoreFns.push(() => {
+        try { fd.removeInterceptor?.(interceptor); } catch { /* ignore */ }
+    });
+}
 // endregion
 
 // region обновление UI Discord'а
@@ -607,6 +696,7 @@ export function installNativeTiles(): boolean {
         wrapChannelRTCStore();
         wrapPreviewStore();
         installWatchIntercept();
+        installStreamWatchInterceptor();
 
         // превью раз в 5 с (было 2 с): плитке звонка этого достаточно
         previewTimer = setInterval(() => { void tickPreviews(); }, 5000);

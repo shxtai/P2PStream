@@ -470,6 +470,7 @@ function SharePickerModal({
                                     options={[
                                         { label: "Авто", value: "auto" },
                                         { label: "H.264", value: "h264" },
+                                        { label: "H.265 (если есть у вас и у зрителей)", value: "h265" },
                                         { label: "VP9", value: "vp9" },
                                         { label: "AV1", value: "av1" }
                                     ]}
