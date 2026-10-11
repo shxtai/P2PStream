@@ -21,8 +21,13 @@
  *   2. Edit code -> вставить содержимое этого файла -> Deploy
  *   3. Settings -> Bindings -> Add -> Durable Object Namespace:
  *      class name = Broker,  namespace name = BROKER
- *      (при первом деплое Cloudflare сама предложит миграцию — согласиться)
- *   4. В настройках P2PStream:
+ *      (при первом деплое Cloudflare сама предложит миграцию — согласиться;
+ *       БЕЗ биндинга сокет откроется, но CONNACK никогда не придёт)
+ *   4. ПРОВЕРКА (у себя, Node 22+):
+ *        node cf-worker/test-mqtt.mjs wss://<имя>.<аккаунт>.workers.dev/mqtt
+ *      Должно напечатать «РАУНДТРИП OK». «нет CONNACK» = деплой старый
+ *      или биндинг не добавлен — повтори шаги 2-3.
+ *   5. В настройках P2PStream:
  *        брокер = включён
  *        адрес  = wss://p2ps-broker.<твой-аккаунт>.workers.dev/mqtt
  *      и у друга то же самое. Готово — сигналинг больше не пишется в Discord.
