@@ -154,7 +154,11 @@ export default definePlugin({
 
     toolboxActions: {
         "Начать P2P-стрим": () => void manager.startShare(),
-        "Остановить P2P-стрим": () => manager.stopShare()
+        "Остановить P2P-стрим": () => manager.stopShare(),
+        "🔌 Подключиться к брокеру (ссылка из приглашения)": () => {
+            const link = prompt("Вставьте ссылку p2ps://connect… из приглашения:");
+            if (link?.trim()) applyBrokerLink(link.trim());
+        }
     },
 
     commands: [
@@ -217,7 +221,7 @@ export default definePlugin({
             inputType: ApplicationCommandInputType.BUILT_IN,
             execute: async () => {
                 const brokerUrl = settings.store.brokerUrl || DEFAULT_BROKER_URL;
-                const secret = settings.store.brokerSecret || "";
+                const secret = String(settings.store.brokerSecret ?? "");
                 if (!brokerUrl) {
                     toast("Настройте brokerUrl", "critical");
                     return;
@@ -232,29 +236,48 @@ export default definePlugin({
                     toast("Откройте текстовый канал", "critical");
                     return;
                 }
+                // Ссылка-приглашение: зритель копирует её и применяет
+                // инструментом «🔌 Подключиться к брокеру» (хот-свап, без перезагрузки).
+                const link = `p2ps://connect?broker=${encodeURIComponent(brokerUrl)}&secret=${encodeURIComponent(secret)}`;
                 try {
                     await RestAPI.post({
                         url: `/channels/${channelId}/messages`,
                         body: {
-                            content: "🎬 **P2P-стрим**\nБрокер: `" + brokerUrl + "`\nСекрет: " + (secret ? "✅" : "❌"),
+                            content: "🎬 **P2P-эфир** — чтобы смотреть, скопируйте ссылку ниже и используйте в Vencord: **Tools → P2PStream → 🔌 Подключиться к брокеру** (без перезагрузки Discord)",
                             embeds: [{
-                                title: "Нажмите для подключения",
-                                description: "Перезагрузка НЕ требуется",
+                                title: "P2P-стрим: подключение",
+                                description: "```\n" + link + "\n```",
                                 color: 0x5865F2,
                                 fields: [
                                     { name: "📡 Брокер", value: brokerUrl },
-                                    { name: "🔑 Секрет", value: secret ? "✅" : "❌" },
+                                    { name: "🔑 Секрет", value: secret ? "✅ в ссылке" : "❌ не задан (нужен для воркера с защитой)" },
                                     { name: "🎙 Канал", value: "<#" + voiceId + ">" }
                                 ],
                                 footer: { text: "P2PStream v" + PLUGIN_VERSION }
                             }]
                         }
                     });
-                    toast("Приглашение отправлено!", "success");
+                    toast("Приглашение отправлено", "success");
                 } catch (e) {
                     logger.error("p2p-share error:", e);
-                    toast("Ошибка отправки", "critical");
+                    toast("Ошибка отправки приглашения", "critical");
                 }
+            }
+        },
+        {
+            name: "p2p-join",
+            description: "Подключиться к P2P-брокеру по ссылке-приглашению (p2ps://connect…)",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            options: [
+                {
+                    name: "link",
+                    description: "Ссылка p2ps://connect?broker=...&secret=...",
+                    type: 3,
+                    required: true
+                }
+            ],
+            execute: async (args: { link: string }) => {
+                applyBrokerLink(String(args.link));
             }
         }
     ],

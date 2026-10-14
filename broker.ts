@@ -90,15 +90,27 @@ function packet(firstByte: number, body: Uint8Array): Uint8Array {
 }
 
 function connectPacket(clientId: string, password?: string): Uint8Array {
-    let flags = 0x02; // clean session
-    let body = mqttString("MQTT");
-    body = new Uint8Array([...body, 0x04, flags, (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff]);
-    if (password) {
-        flags |= 0xc0; // username flag + password flag
-        body = new Uint8Array([...new Uint8Array([0x04, flags, (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff]), ...mqttString(clientId), ...mqttString(password)]);
-    } else {
-        body = new Uint8Array([...body, ...mqttString(clientId)]);
+    if (!password) {
+        // без пароля: flags = clean session (0x02)
+        const body = new Uint8Array([
+            ...mqttString("MQTT"),
+            0x04, 0x02,
+            (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff,
+            ...mqttString(clientId)
+        ]);
+        return packet(0x10, body);
     }
+    // с паролем: flags = clean session (0x02) + username (0x80) + password (0x40)
+    // ВАЖНО: флаг username требует поле username ПОСЛЕ clientId, затем password.
+    // username = clientId (воркеру он не нужен, но протокол требует поле).
+    const body = new Uint8Array([
+        ...mqttString("MQTT"),
+        0x04, 0xc2,
+        (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff,
+        ...mqttString(clientId),
+        ...mqttString(clientId), // username
+        ...mqttString(password)
+    ]);
     return packet(0x10, body);
 }
 
@@ -275,6 +287,8 @@ export function brokerLastError(): string {
 }
 
 let currentUrl: string | null = null;
+/** clientId, по которому открыто текущее соединение (для переподключения при смене канала). */
+let connectedClientId: string | null = null;
 
 function brokerUrls(): string[] {
     const custom = String(settings.store.brokerUrl ?? "").trim();
@@ -429,6 +443,7 @@ function connect(): Promise<void> {
                         settled = true;
                         clearTimeout(connackTimer);
                         status = "connected";
+                        connectedClientId = clientId;
                         reconnectAttempts = 0;
                         logger.info(`Сигналинг через брокер ${url}`);
                         startPing();
@@ -537,13 +552,26 @@ export function brokerUnsubscribeStream(streamId: string): void {
     }
 }
 
-/** Обновить набор нужных подписок (зовёт engine при смене голосового канала). */
+/** Обновить набор нужных подписок (зовёт engine при смене голосового канала).
+ *  clientId содержит channelId — при смене канала переподключаемся,
+ *  иначе брокер будет считать клиента в старом канале. */
 export function brokerSetChannel(channelId: string | null): void {
     wantSubs.add(brokerInboxTopic());
     for (const t of [...wantSubs]) {
         if (t.startsWith(`${TOPIC_PREFIX}/c/`)) wantSubs.delete(t);
     }
     if (channelId) wantSubs.add(brokerChannelTopic(channelId));
+    // Переподключение при смене канала: новый clientId = myId():новыйChannelId
+    // (shutdown чистит wantSubs — подписки пересобираем ПОСЛЕ него)
+    if (brokerIsConnected() && connectedClientId) {
+        const newClientId = `${myId() || "anon"}:${channelId ?? ""}`;
+        if (connectedClientId !== newClientId) {
+            logger.info(`Смена голосового канала — переподключение к брокеру (${newClientId})`);
+            brokerShutdown();
+            wantSubs.add(brokerInboxTopic());
+            if (channelId) wantSubs.add(brokerChannelTopic(channelId));
+        }
+    }
     if (wantSubs.size > 0) brokerEnsure();
     syncSubscriptions();
 }
