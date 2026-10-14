@@ -23,6 +23,7 @@
  */
 
 import { Logger } from "@utils/Logger";
+import { SelectedChannelStore } from "@webpack/common";
 
 import { settings } from "./settings";
 import { myId, randomId } from "./utils";
@@ -88,15 +89,16 @@ function packet(firstByte: number, body: Uint8Array): Uint8Array {
     return out;
 }
 
-function connectPacket(clientId: string): Uint8Array {
-    const body = new Uint8Array([
-        ...mqttString("MQTT"),
-        0x04,        // protocol level (MQTT 3.1.1)
-        0x02,        // clean session
-        (KEEPALIVE_S >> 8) & 0xff,
-        KEEPALIVE_S & 0xff,
-        ...mqttString(clientId)
-    ]);
+function connectPacket(clientId: string, password?: string): Uint8Array {
+    let flags = 0x02; // clean session
+    let body = mqttString("MQTT");
+    body = new Uint8Array([...body, 0x04, flags, (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff]);
+    if (password) {
+        flags |= 0xc0; // username flag + password flag
+        body = new Uint8Array([...new Uint8Array([0x04, flags, (KEEPALIVE_S >> 8) & 0xff, KEEPALIVE_S & 0xff]), ...mqttString(clientId), ...mqttString(password)]);
+    } else {
+        body = new Uint8Array([...body, ...mqttString(clientId)]);
+    }
     return packet(0x10, body);
 }
 
@@ -311,7 +313,9 @@ function connect(): Promise<void> {
     }
     const gen = ++wsGeneration;
     const url = nextUrl();
-    const clientId = `p2ps-${randomId(10)}`;
+    const clientId = `${myId()}:${SelectedChannelStore.getVoiceChannelId?.() ?? ""}`;
+
+    const secret = settings.store.brokerSecret || undefined;
     status = "connecting";
     currentUrl = url;
     recv = []; // недочитанный хвост прошлого сокета испортил бы разбор пакетов нового
@@ -352,7 +356,7 @@ function connect(): Promise<void> {
         sock.onopen = () => {
             if (gen !== wsGeneration) return;
             try {
-                wsSend(sock, connectPacket(clientId));
+                wsSend(sock, connectPacket(clientId, secret));
             } catch {
                 failOver("send CONNECT");
             }
@@ -511,6 +515,26 @@ export function brokerInboxTopic(): string {
 /** Топик голосового канала — подписан, пока сидим в голосе. */
 export function brokerChannelTopic(channelId: string): string {
     return `${TOPIC_PREFIX}/c/${channelId}`;
+}
+
+/** Топик конкретного стрима — для приватных стримов. */
+export function brokerStreamTopic(streamId: string): string {
+    return `${TOPIC_PREFIX}/s/${streamId}`;
+}
+
+/** Подписаться на топик стрима. */
+export function brokerSubscribeStream(streamId: string): void {
+    wantSubs.add(brokerStreamTopic(streamId));
+    syncSubscriptions();
+}
+
+/** Отписаться от топика стрима. */
+export function brokerUnsubscribeStream(streamId: string): void {
+    const topic = brokerStreamTopic(streamId);
+    if (wantSubs.has(topic)) {
+        wantSubs.delete(topic);
+        syncSubscriptions();
+    }
 }
 
 /** Обновить набор нужных подписок (зовёт engine при смене голосового канала). */

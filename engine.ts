@@ -29,6 +29,7 @@ import {
     pruneFragments,
     sendSignals,
     setCleanupEnabledGetter,
+    signalingCleanup,
     type Signal,
     signalingHealth
 } from "./signaling";
@@ -1649,6 +1650,7 @@ export class P2PManager {
         this.discoverTimer = undefined;
         this.stopHeartbeat();
         brokerShutdown();
+        signalingCleanup();
         this.bump();
         logger.info("P2P-движок остановлен");
     }
@@ -1818,11 +1820,15 @@ export class P2PManager {
             if (now - this.lastChatAnnounce < 20_000) return;
             this.lastChatAnnounce = now;
         }
-        sendSignals(host.channelId, {
-            v: 1, t: "announce", s: host.streamId, from: myId(),
-            _route: route,
-            d: { ...this.host!.meta, av: PLUGIN_VERSION }
-        });
+                const payload = { v: 1, t: "announce" as const, s: host.streamId, from: myId(), _route: route };
+                const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId };
+                // Приватный стрим: публикуем announce только в топик стрима (не в канал)
+                if (settings.store.privateStream) {
+                    const streamTopic = `${TOPIC_PREFIX}/s/${host.streamId}`;
+                    brokerPublish(streamTopic, { ...payload, d: data, allowedViewers: settings.store.allowedViewers?.split(',').filter(Boolean) || [] });
+                } else {
+                    sendSignals(host.channelId, { ...payload, d: data });
+                }
     }
 
     private startHeartbeat(): void {
@@ -1896,6 +1902,12 @@ export class P2PManager {
         switch (sig.t) {
             case "announce": {
                 const voice = currentVoiceChannelId();
+                // ФИЛЬТРАЦИЯ: если зритель НЕ в том же голосовом канале — игнорируем announce
+                // Это предотвращает "подсматривание" стрима теми, кто не в звонке
+                const announceChannelId = typeof sig.d?.channelId === "string" ? sig.d.channelId : channelId;
+                if (announceChannelId && voice && announceChannelId !== voice) {
+                    return true; // тихо игнорируем — зритель не в том канале
+                }
                 const prev = this.liveHosts.get(sig.s);
                 this.liveHosts.set(sig.s, {
                     streamId: sig.s,

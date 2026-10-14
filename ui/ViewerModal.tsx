@@ -15,23 +15,55 @@ import { openMiniPlayer } from "./MiniPlayer";
 export function openViewerModal(session: WatchSession): void {
     if (openSessions.has(session.host.streamId)) return;
     openSessions.add(session.host.streamId);
-    openModal(
-        props => <ViewerModal modalProps={props} session={session} />,
-        {
-            onCloseCallback: () => {
-                openSessions.delete(session.host.streamId);
-                // закрытие модалки НЕ останавливает просмотр — эфир продолжает
-                // играть в компактном мини-плеере («панелька где-то сбоку»)
-                if (manager.watches.get(session.host.streamId) !== session) return;
-                if (session.state !== "ended" && session.state !== "failed") {
-                    openMiniPlayer(session);
-                } else {
-                    // эфир кончился/упал — убираем сессию, иначе она висит мёртвой
-                    manager.unwatch(session.host.streamId);
-                }
+    
+    // Пытаемся открыть штатный плеер Discord (v1.20+)
+    const { playInNativePlayer } = require("./nativePlayer");
+    const hooks = {
+        openNativeModal: () => {
+            try {
+                const { ApplicationStreamingStore, FluxDispatcher } = require("@webpack/common");
+                // Открываем штатный просмотр через Discord API
+                const streamKey = session.host.streamId; // nativeTiles сам преобразует
+                FluxDispatcher.dispatch({
+                    type: "STREAM_JOIN",
+                    streamKey,
+                    ownerId: session.host.userId
+                });
+            } catch (e) {
+                console.warn("Не удалось открыть штатный плеер:", e);
+            }
+        },
+        closeNativeModal: () => {
+            try {
+                const { FluxDispatcher } = require("@webpack/common");
+                FluxDispatcher.dispatch({
+                    type: "STREAM_LEAVE",
+                    streamKey: session.host.streamId
+                });
+            } catch (e) {
+                console.warn("Не удалось закрыть штатный плеер:", e);
             }
         }
-    );
+    };
+    
+    const opened = playInNativePlayer(session, hooks);
+    if (!opened) {
+        // Фолбэк: наша модалка
+        openModal(
+            props => <ViewerModal modalProps={props} session={session} />,
+            {
+                onCloseCallback: () => {
+                    openSessions.delete(session.host.streamId);
+                    if (manager.watches.get(session.host.streamId) !== session) return;
+                    if (session.state !== "ended" && session.state !== "failed") {
+                        openMiniPlayer(session);
+                    } else {
+                        manager.unwatch(session.host.streamId);
+                    }
+                }
+            }
+        );
+    }
 }
 
 const openSessions = new Set<string>();

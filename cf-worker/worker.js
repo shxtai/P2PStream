@@ -43,6 +43,16 @@ export class Broker {
         this.env = env;
         /** ws -> Set<topicFilter> */
         this.clients = new Map();
+        /** ws -> channelId (голосовой канал Discord) для фильтрации анонсов */
+        this.voiceChannels = new Map();
+        /** ws -> Discord userId (из username в CONNECT) */
+        this.discordUsers = new Map();
+        /** простой logger */
+        this.logger = {
+            info: (msg) => console.log(`[p2ps-broker] ${msg}`),
+            warn: (msg) => console.warn(`[p2ps-broker] ${msg}`),
+            error: (msg) => console.error(`[p2ps-broker] ${msg}`)
+        };
     }
 
     async fetch(request) {
@@ -91,8 +101,52 @@ export class Broker {
 
     handlePacket(ws, type, body) {
         switch (type) {
-            case 0x10: { // CONNECT -> CONNACK (session present = 0, rc = 0)
-                this.send(ws, new Uint8Array([0x20, 0x02, 0x00, 0x00]));
+            case 0x10: { // CONNECT -> CONNACK (session present = 0, rc = 0 or 5)
+                // Проверяем, что brokerSecret задан в wrangler env
+                const secret = this.env.BROKER_SECRET;
+                if (!secret) {
+                    this.logger.warn("BROKER_SECRET не задан в env — аутентификация отключена");
+                    this.send(ws, new Uint8Array([0x20, 0x02, 0x00, 0x00]));
+                    return;
+                }
+                // Парсим CONNECT payload: clientId + username/password
+                if (body.length < 10) return; // минимальный CONNECT: clientId >= 1 байт, flags=1, keepalive=2
+                const flags = body[3];
+                const hasUsername = (flags & 0x80) !== 0;
+                const hasPassword = (flags & 0x40) !== 0;
+                let p = 6; // после MQTT, level, flags, keepalive
+                // clientId (переменная длина)
+                const clientIdLen = body[p++];
+                if (p + clientIdLen > body.length) return;
+                const clientId = new TextDecoder().decode(body.subarray(p, p + clientIdLen));
+                p += clientIdLen;
+                // username (если есть)
+                let username = "";
+                if (hasUsername) {
+                    const usernameLen = body[p++];
+                    if (p + usernameLen > body.length) return;
+                    username = new TextDecoder().decode(body.subarray(p, p + usernameLen));
+                    p += usernameLen;
+                }
+                // password (если есть)
+                let password = "";
+                if (hasPassword) {
+                    const passwordLen = body[p++];
+                    if (p + passwordLen > body.length) return;
+                    password = new TextDecoder().decode(body.subarray(p, p + passwordLen));
+                }
+                // Проверяем пароль: должен совпадать с BROKER_SECRET
+                if (password !== secret) {
+                    this.logger.warn(`Неверный пароль для клиента ${clientId}: ${password}`);
+                    this.send(ws, new Uint8Array([0x20, 0x02, 0x05, 0x00])); // CONNACK rc=5 (not authorized)
+                    return;
+                }
+                // clientId = DiscordUserId:ChannelId (если есть channelId)
+                const [userId, channelId] = clientId.split(':');
+                this.discordUsers.set(ws, userId);
+                if (channelId) this.voiceChannels.set(ws, channelId);
+                this.logger.info(`Клиент ${clientId} подключился успешно (user=${userId}, channel=${channelId || 'none'})`);
+                this.send(ws, new Uint8Array([0x20, 0x02, 0x00, 0x00])); // CONNACK rc=0 (accepted)
                 return;
             }
             // тип = старшие 4 бита: SUBSCRIBE (0x82 на проводе) приходит сюда как 0x80.
@@ -190,15 +244,22 @@ function parseSubscribeTopics(body) {
     return topics;
 }
 
-/** Совпадение фильтра с топиком: точное имя или '+' на уровне одного сегмента */
+/** Совпадение фильтра с топиком: ТОЛЬКО точное имя.
+ *  Wildcard '+' разрешён ТОЛЬКО в последнем сегменте личного ящика (p2ps/v1/u/+),
+ *  чтобы клиент мог подписаться на свой ящик независимо от userId.
+ *  Wildcard '*' (произвольное число сегментов) запрещён. */
 function topicMatches(filter, topic) {
     if (filter === topic) return true;
-    if (!filter.includes("+")) return false;
-    const f = filter.split("/");
-    const t = topic.split("/");
-    if (f.length !== t.length) return false;
-    for (let i = 0; i < f.length; i++) {
-        if (f[i] !== "+" && f[i] !== t[i]) return false;
+    // запретить '*' — слишком широкий (p2ps/# поймает всё)
+    if (filter.includes('*')) return false;
+    // разрешить '+' только в последнем сегменте личного ящика
+    const fParts = filter.split('/');
+    if (fParts.length < 4 || fParts[fParts.length - 1] !== '+') return false;
+    // фильтр типа p2ps/v1/u/+ — разрешить
+    const tParts = topic.split('/');
+    if (fParts.length !== tParts.length) return false;
+    for (let i = 0; i < fParts.length - 1; i++) {
+        if (fParts[i] !== tParts[i]) return false;
     }
     return true;
 }

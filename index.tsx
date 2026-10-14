@@ -10,7 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
-import { brokerLabel, brokerLastError, brokerStatus } from "./broker";
+import { brokerEnsure, brokerShutdown } from "./broker";
 import { manager, mediaReport, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
@@ -23,6 +23,35 @@ import { openViewerModal } from "./ui/ViewerModal";
 import { PLUGIN_VERSION, toast } from "./utils";
 
 const logger = new Logger("P2PStream");
+
+/** Хот-свап: применить настройки брокера из ссылки `p2ps://connect?broker=...&secret=...`
+ *  без перезагрузки Discord/плагина. Останавливает текущее соединение и
+ *  немедленно переподключается с новыми параметрами. */
+function applyBrokerLink(url: string): void {
+    try {
+        const parsed = new URL(url);
+        const broker = parsed.searchParams.get("broker");
+        const secret = parsed.searchParams.get("secret");
+        if (!broker) {
+            toast("Неверная ссылка подключения", "critical");
+            return;
+        }
+        // Применяем настройки мгновенно
+        const store = settings.store as any;
+        store.brokerUrl = broker;
+        if (secret != null) store.brokerSecret = secret;
+        store.brokerEnabled = true;
+        // Перезапускаем брокер
+        brokerShutdown();
+        setTimeout(() => {
+            brokerEnsure();
+            toast(`Подключено к брокеру: ${new URL(broker).host}`, "success");
+        }, 100);
+    } catch (e) {
+        logger.error("applyBrokerLink:", e);
+        toast("Ошибка подключения (неверная ссылка?)", "critical");
+    }
+}
 
 /** Собрать снимок состояния плагина — для /p2p-doctor и стартового баннера */
 function collectDiagnostics(): string[] {
@@ -181,10 +210,56 @@ export default definePlugin({
                     toast("Диагностика P2PStream записана в консоль (Ctrl+Shift+I → Console)", "success");
                 })();
             }
+        },
+        {
+            name: "p2p-share",
+            description: "Отправить приглашение на P2P-стрим в текущий чат",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            execute: async () => {
+                const brokerUrl = settings.store.brokerUrl || DEFAULT_BROKER_URL;
+                const secret = settings.store.brokerSecret || "";
+                if (!brokerUrl) {
+                    toast("Настройте brokerUrl", "critical");
+                    return;
+                }
+                const voiceId = SelectedChannelStore.getVoiceChannelId?.();
+                if (!voiceId) {
+                    toast("Зайдите в голосовой канал", "critical");
+                    return;
+                }
+                const channelId = SelectedChannelStore.getChannelId?.();
+                if (!channelId) {
+                    toast("Откройте текстовый канал", "critical");
+                    return;
+                }
+                try {
+                    await RestAPI.post({
+                        url: `/channels/${channelId}/messages`,
+                        body: {
+                            content: "🎬 **P2P-стрим**\nБрокер: `" + brokerUrl + "`\nСекрет: " + (secret ? "✅" : "❌"),
+                            embeds: [{
+                                title: "Нажмите для подключения",
+                                description: "Перезагрузка НЕ требуется",
+                                color: 0x5865F2,
+                                fields: [
+                                    { name: "📡 Брокер", value: brokerUrl },
+                                    { name: "🔑 Секрет", value: secret ? "✅" : "❌" },
+                                    { name: "🎙 Канал", value: "<#" + voiceId + ">" }
+                                ],
+                                footer: { text: "P2PStream v" + PLUGIN_VERSION }
+                            }]
+                        }
+                    });
+                    toast("Приглашение отправлено!", "success");
+                } catch (e) {
+                    logger.error("p2p-share error:", e);
+                    toast("Ошибка отправки", "critical");
+                }
+            }
         }
     ],
 
-    flux: {
+    flux:: {
         MESSAGE_CREATE: (payload: any) => manager.onMessageCreate(payload),
         VOICE_STATE_UPDATES: () => manager.onVoiceStateUpdate()
     },
@@ -243,6 +318,18 @@ export default definePlugin({
         if (settings.store.nativeTiles) installNativeTiles();
 
         this.unmountBars = mountBars();
+
+        // Обработка ссылок p2ps://connect (хот-свап настроек брокера)
+        // Пользователь открывает ссылку из приглашения — настройки применяются мгновенно
+        const handleDeepLink = (e: MouseEvent) => {
+            const target = e.target as HTMLElement;
+            const link = target.closest("a[href^='p2ps://']") as HTMLAnchorElement | null;
+            if (link?.href) {
+                e.preventDefault();
+                applyBrokerLink(link.href);
+            }
+        };
+        document.addEventListener("click", handleDeepLink, true);
 
         // Кнопка «Демонстрация экрана» → наш пикер: подменяем getDisplayMedia
         // (тот же приём, что у встроенного плагина Vencord WebScreenShare —

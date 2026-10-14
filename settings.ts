@@ -232,6 +232,62 @@ export const settings = definePluginSettings({
         default: "",
         placeholder: "API token"
     }
+    brokerSecret: {
+        type: OptionType.STRING,
+        description: "Секрет для аутентификации к MQTT-брокеру (shared‑secret). Оставьте пустым для отключения проверки.",
+        default: "",
+        placeholder: "base64‑encoded secret",
+        component: ({ value, onChange }) => {
+            const generate = () => {
+                const arr = new Uint8Array(24);
+                crypto.getRandomValues(arr);
+                onChange(btoa(String.fromCharCode(...arr)).replace(/=/g, "").replace(/+/g, "-").replace(///g, "_"));
+            };
+            const shareLink = () => {
+                if (!value) {
+                    alert("Сначала задайте brokerSecret");
+                    return;
+                }
+                const brokerUrl = settings.store.brokerUrl || "";
+                if (!brokerUrl) {
+                    alert("Задайте адрес брокера (brokerUrl)");
+                    return;
+                }
+                const link = `p2ps://connect?broker=${encodeURIComponent(brokerUrl)}&secret=${encodeURIComponent(value)}`;
+                navigator.clipboard.writeText(link).then(() => {
+                    alert("Ссылка скопирована! Отправьте её другу — он откроет в Discord и настройки применятся автоматически.");
+                });
+            };
+            return h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+                h("input", {
+                    value: value || "",
+                    onChange: (e: any) => onChange(e.target.value),
+                    placeholder: "base64‑encoded secret",
+                    style: { flex: 1, padding: "8px", borderRadius: "4px", border: "1px solid var(--background-modifier-accent)" }
+                }),
+                h("button", {
+                    onClick: generate,
+                    style: { padding: "8px 12px", borderRadius: "4px", background: "var(--brand-500)", color: "white", border: "none", cursor: "pointer" }
+                }, "🔑 Сгенерировать"),
+                h("button", {
+                    onClick: shareLink,
+                    style: { padding: "8px 12px", borderRadius: "4px", background: "var(--green-500)", color: "white", border: "none", cursor: "pointer" }
+                }, "📤 Поделиться")
+            ]);
+        }
+    },
+    privateStream: {
+        type: OptionType.BOOLEAN,
+        description: "Приватный стрим: видят только те, кому вы дали ссылку-приглашение",
+        default: false
+    },
+    allowedViewers: {
+        type: OptionType.STRING,
+        description: "Список Discord ID зрителей через запятую (для приватного стрима). Оставив пустым — стрим публичный",
+        default: "",
+        placeholder: "123456789,987654321"
+    },
+
 });
 
 /** Применить пресет профиля к значениям настроек */

@@ -741,3 +741,30 @@ export function handleOwnEcho(msg: { id?: string; channel_id?: string; nonce?: s
 export function deleteSignalMessage(channelId: string, messageId: string): void {
     queueDelete(channelId, messageId);
 }
+
+/** Cleanup internal caches/maps to prevent memory leaks. Called on plugin shutdown. */
+export function signalingCleanup(): void {
+    // Clear fragment buffers
+    fragBufs.clear();
+    doneFrags.clear();
+    // Clear pending reliable signals and seen ids
+    pendingReliable.clear();
+    seenIds.clear();
+    // Clear DM channel caches
+    dmChannels.clear();
+    dmFailedUntil.clear();
+    // Clear own echo structures
+    ownEchoes.clear();
+    // Clear delete queue and cancel timer
+    deleteQueue.length = 0;
+    if (deleteDrain) { clearInterval(deleteDrain); deleteDrain = undefined; }
+    // Reset recent nonces set
+    recentNonces.clear();
+    // Reset health counters (optional)
+    signalingHealth.sent = 0;
+    signalingHealth.failed = 0;
+    signalingHealth.consecutiveFailures = 0;
+    signalingHealth.lastError = "";
+    signalingHealth.lastSuccess = 0;
+}
+

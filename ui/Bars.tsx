@@ -10,11 +10,62 @@
  * случай выключенных нативных плиток: чужие эфиры с кнопкой «Смотреть».
  */
 
-import { createRoot, React, SelectedChannelStore } from "@webpack/common";
+import { createRoot, React, RestAPI, SelectedChannelStore } from "@webpack/common";
+import { Logger } from "@utils/Logger";
 
 import { cl } from "../css";
 import { type LiveHost, manager, type WatchSession } from "../engine";
 import { settings } from "../settings";
+import { PLUGIN_VERSION, toast } from "../utils";
+
+const logger = new Logger("P2PStream:Bars");
+
+/** Кнопка «🔗 Пригласить» — embed с брокером+секретом в текущий текстовый канал.
+ *  Тикет для зрителя: тот жмёт на ссылку (p2ps://connect…) и подключается
+ *  без настройки брокера вручную (хот-свап, v1.23). */
+export async function sendInvite(): Promise<void> {
+    const brokerUrl = String(settings.store.brokerUrl ?? "").trim();
+    const secret = String(settings.store.brokerSecret ?? "").trim();
+    if (!brokerUrl) {
+        toast("Не задан брокер (brokerUrl) — пришлите адрес вручную", "critical");
+        return;
+    }
+    const voiceId = safeVoiceId();
+    if (!voiceId) {
+        toast("Зайдите в голосовой канал, чтобы отправить приглашение", "critical");
+        return;
+    }
+    const channelId = (() => { try { return SelectedChannelStore.getChannelId?.() ?? null; } catch { return null; } })();
+    if (!channelId) {
+        toast("Откройте текстовый канал, куда отправить приглашение", "critical");
+        return;
+    }
+    const link = `p2ps://connect?broker=${encodeURIComponent(brokerUrl)}&secret=${encodeURIComponent(secret)}`;
+    try {
+        await RestAPI.post({
+            url: `/channels/${channelId}/messages`,
+            body: {
+                content: "🎬 **P2P-эфир** — нажмите, чтобы подключиться (без перезагрузки)",
+                embeds: [{
+                    title: "P2P-стрим: открыть",
+                    description: `\n${link}`,
+                    color: 0x5865F2,
+                    fields: [
+                        { name: "📡 Брокер", value: brokerUrl },
+                        { name: "🔑 Секрет", value: secret ? "✅ в ссылке" : "❌ не задан" },
+                        { name: "🎙 Канал", value: "<#" + voiceId + ">" }
+                    ],
+                    footer: { text: "P2PStream v" + PLUGIN_VERSION }
+                }]
+            }
+        });
+        toast("Приглашение отправлено в канал", "success");
+    } catch (e) {
+        logger.error("sendInvite:", e);
+        toast("Не удалось отправить приглашение (нет прав?)", "critical");
+    }
+}
+
 
 export function mountBars(): () => void {
     const el = document.createElement("div");
@@ -96,6 +147,10 @@ function LivePill({ host, isMine }: { host: LiveHost; isMine?: boolean }) {
                         Отключиться
                     </button>
                 </>
+            ) : isMine ? (
+                <button className={cl("pill-btn")} onClick={() => sendInvite()}>
+                    🔗 Пригласить
+                </button>
             ) : (
                 <button className={cl("pill-btn")} onClick={() => manager.watch(host.streamId)}>
                     {watch?.state === "failed" ? "Повторить" : "Смотреть"}
