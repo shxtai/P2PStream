@@ -87,13 +87,17 @@ function useManager(): void {
 function BarsRoot() {
     useManager();
 
-    // С нативными плитками UI звонка сам показывает эфиры — плавающие пилюли не нужны.
-    if (settings.store.nativeTiles) return null;
-
+    // Раньше с нативными плитками пилюли прятались целиком. Но плитки держатся на
+    // подмене внутренних сторов Discord и ломаются с его обновлениями (1.23: эфир
+    // виден движку, а плитки нет) — чужие эфиры показываем всегда, свой — только
+    // без плиток (у стримера есть штатная красная кнопка).
+    const native = !!settings.store.nativeTiles;
     const voiceId = safeVoiceId();
     const hosts = [...manager.liveHosts.values()]
         .filter(h => h.channelId === voiceId)
+        .filter(h => !native || h.streamId !== manager.host?.streamId)
         .sort((a, b) => a.name.localeCompare(b.name));
+    if (!hosts.length) return null;
 
     return (
         <div className={cl("bars-root")}>
