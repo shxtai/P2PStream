@@ -219,6 +219,11 @@ function SharePickerModal({
                 setPreview(null);
                 setSelected(null);
             });
+        } catch (e: any) {
+            // раньше ошибка тут терялась молча: пикер просто «не реагировал»
+            logger.error("Выбор источника:", e);
+            setSelected(null);
+            toast(`Не удалось захватить источник: ${e?.message ?? e?.name ?? e}`, "critical");
         } finally {
             setBusy(false);
         }
@@ -515,7 +520,7 @@ function SharePickerModal({
                         disabled={!preview || busy}
                         onClick={() => void startP2P()}
                     >
-                        {busy ? "Запуск…" : "Начать P2P-трансляцию"}
+                        {busy ? "Запуск…" : preview ? "Начать P2P-трансляцию" : "Сначала выберите экран или окно"}
                     </Button>
                 </div>
             </div>
