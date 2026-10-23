@@ -26,7 +26,7 @@ import { Logger } from "@utils/Logger";
 import { SelectedChannelStore } from "@webpack/common";
 
 import { settings } from "./settings";
-import { myId, randomId } from "./utils";
+import { myId, randomId, toast } from "./utils";
 
 const logger = new Logger("P2PStream:Broker");
 
@@ -296,6 +296,34 @@ function brokerUrls(): string[] {
     return [...DEFAULT_BROKERS];
 }
 
+function isWorkerUrl(url: string): boolean {
+    try { return new URL(url).hostname.endsWith(".workers.dev"); } catch { return false; }
+}
+
+/** Хосты, уже разрешённые в CSP из native.ts (держать в синхроне со списком там) */
+const CSP_BUILTIN = new Set(DEFAULT_BROKERS.map(u => { try { return new URL(u).host; } catch { return ""; } }));
+const cspAsked = new Set<string>();
+
+/** Свой адрес брокера вне встроенного списка: Discord заблокирует сокет (CSP).
+ *  Один раз на хост спрашиваем у пользователя разрешение штатным диалогом Vencord. */
+function ensureCspFor(url: string): void {
+    let host: string;
+    try { host = new URL(url).host; } catch { return; }
+    if (isWorkerUrl(url) || CSP_BUILTIN.has(host) || cspAsked.has(host)) return;
+    cspAsked.add(host);
+    const csp = (globalThis as any).VencordNative?.csp;
+    if (!csp?.isDomainAllowed) return;
+    void (async () => {
+        try {
+            if (await csp.isDomainAllowed(url, ["connect-src"])) return;
+            const res = await csp.requestAddOverride(url, ["connect-src"], "P2PStream");
+            if (res === "ok") toast(`Брокер ${host} разрешён — полностью перезапустите Discord`, "success");
+        } catch (e) {
+            logger.debug("CSP request:", e);
+        }
+    })();
+}
+
 function nextUrl(): string {
     const list = brokerUrls();
     const url = list[urlIndex % list.length];
@@ -327,6 +355,7 @@ function connect(): Promise<void> {
     }
     const gen = ++wsGeneration;
     const url = nextUrl();
+    ensureCspFor(url);
     const clientId = `${myId()}:${SelectedChannelStore.getVoiceChannelId?.() ?? ""}`;
 
     const secret = settings.store.brokerSecret || undefined;
@@ -338,7 +367,10 @@ function connect(): Promise<void> {
         let settled = false;
         let sock: WebSocket;
         try {
-            sock = new WebSocket(url);
+            // Публичные брокеры (emqx, mosquitto) без подпротокола "mqtt" рвут
+            // рукопожатие. Воркер Cloudflare его не возвращает — ему не передаём,
+            // иначе браузер сам закроет сокет.
+            sock = isWorkerUrl(url) ? new WebSocket(url) : new WebSocket(url, ["mqtt"]);
         } catch (e: any) {
             logger.warn("Не удалось открыть WebSocket:", url, e);
             lastError = e?.message ?? "WebSocket не открылся";

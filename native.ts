@@ -10,11 +10,26 @@
  * и импорты рендерера ломают сборку (см. историю бага «Cannot find module ~plugins»).
  */
 
+import { ConnectSrc, CspPolicies } from "@main/csp";
 import { spawn } from "child_process";
 import { app, desktopCapturer, type IpcMainInvokeEvent } from "electron";
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "fs";
 import { constants as osConstants, setPriority } from "os";
 import { join } from "path";
+
+// Белый список CSP: свежий Vencord пускает рендерер только на перечисленные хосты
+// (connect-src). Без этого WebSocket к брокерам сигналинга блокируется
+// («violates the following Content Security Policy directive»), брокер не
+// подключается ни один и остаётся только медленный чат-фолбэк.
+// Порт в ключе обязателен: хост без порта в CSP разрешает только 443.
+for (const host of [
+    "*.workers.dev", // свой брокер на Cloudflare Workers (cf-worker/worker.js)
+    "broker.emqx.io:8084",
+    "broker.hivemq.com:8884",
+    "test.mosquitto.org:8081"
+]) {
+    CspPolicies[host] = ConnectSrc;
+}
 
 export interface P2PSourceInfo {
     /** Electron source id, например "screen:0:0" или "window:131076:0" */
