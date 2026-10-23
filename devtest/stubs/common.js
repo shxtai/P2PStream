@@ -46,4 +46,6 @@ export const UserStore = {
 };
 export const ApplicationStreamingStore = { getStreamForUser: () => null, getAllActiveStreams: () => [] };
 export const Toasts = { show: t => parent.postMessage({ kind: "log", text: `[${ME.slice(0, 3)}] toast: ${t.text}` }, "*") };
+export const showToast = t => Toasts.show(t);
+export const React = { createElement: () => null };
 export const FluxDispatcher = { dispatch() { } };

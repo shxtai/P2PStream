@@ -6,6 +6,7 @@
 
 import { definePluginSettings } from "@api/Settings";
 import { OptionType } from "@utils/types";
+import { React } from "@webpack/common";
 
 export type GoliveMode = "p2p" | "boost" | "off";
 export type Profile = "games" | "movies" | "manual";
@@ -231,49 +232,41 @@ export const settings = definePluginSettings({
         description: "Cloudflare TURN — API token (показывается один раз при создании ключа)",
         default: "",
         placeholder: "API token"
-    }
+    },
     brokerSecret: {
         type: OptionType.STRING,
         description: "Секрет для аутентификации к MQTT-брокеру (shared‑secret). Оставьте пустым для отключения проверки.",
         default: "",
-        placeholder: "base64‑encoded secret",
-        component: ({ value, onChange }) => {
+        placeholder: "base64‑encoded secret"
+    },
+    brokerSecretTools: {
+        type: OptionType.COMPONENT,
+        component: () => {
+            const btn = { padding: "8px 12px", borderRadius: "4px", color: "white", border: "none", cursor: "pointer" };
             const generate = () => {
                 const arr = new Uint8Array(24);
                 crypto.getRandomValues(arr);
-                onChange(btoa(String.fromCharCode(...arr)).replace(/=/g, "").replace(/+/g, "-").replace(///g, "_"));
+                settings.store.brokerSecret = btoa(String.fromCharCode(...arr))
+                    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+                alert("Секрет сгенерирован. Откройте настройки заново, чтобы увидеть его в поле выше.");
             };
             const shareLink = () => {
-                if (!value) {
+                const secret = String(settings.store.brokerSecret ?? "");
+                const brokerUrl = String(settings.store.brokerUrl || DEFAULT_BROKER_URL);
+                if (!secret) {
                     alert("Сначала задайте brokerSecret");
                     return;
                 }
-                const brokerUrl = settings.store.brokerUrl || "";
-                if (!brokerUrl) {
-                    alert("Задайте адрес брокера (brokerUrl)");
-                    return;
-                }
-                const link = `p2ps://connect?broker=${encodeURIComponent(brokerUrl)}&secret=${encodeURIComponent(value)}`;
-                navigator.clipboard.writeText(link).then(() => {
-                    alert("Ссылка скопирована! Отправьте её другу — он откроет в Discord и настройки применятся автоматически.");
-                });
+                const link = `p2ps://connect?broker=${encodeURIComponent(brokerUrl)}&secret=${encodeURIComponent(secret)}`;
+                navigator.clipboard.writeText(link).then(
+                    () => alert("Ссылка скопирована! Отправьте её другу — он применит её через Tools → P2PStream → «Подключиться к брокеру» или /p2p-join."),
+                    () => alert(link)
+                );
             };
-            return h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
-                h("input", {
-                    value: value || "",
-                    onChange: (e: any) => onChange(e.target.value),
-                    placeholder: "base64‑encoded secret",
-                    style: { flex: 1, padding: "8px", borderRadius: "4px", border: "1px solid var(--background-modifier-accent)" }
-                }),
-                h("button", {
-                    onClick: generate,
-                    style: { padding: "8px 12px", borderRadius: "4px", background: "var(--brand-500)", color: "white", border: "none", cursor: "pointer" }
-                }, "🔑 Сгенерировать"),
-                h("button", {
-                    onClick: shareLink,
-                    style: { padding: "8px 12px", borderRadius: "4px", background: "var(--green-500)", color: "white", border: "none", cursor: "pointer" }
-                }, "📤 Поделиться")
-            ]);
+            return React.createElement("div", { style: { display: "flex", gap: "8px" } },
+                React.createElement("button", { onClick: generate, style: { ...btn, background: "var(--brand-500)" } }, "🔑 Сгенерировать секрет"),
+                React.createElement("button", { onClick: shareLink, style: { ...btn, background: "var(--green-500)" } }, "📤 Скопировать ссылку-приглашение")
+            );
         }
     },
     privateStream: {
@@ -286,8 +279,7 @@ export const settings = definePluginSettings({
         description: "Список Discord ID зрителей через запятую (для приватного стрима). Оставив пустым — стрим публичный",
         default: "",
         placeholder: "123456789,987654321"
-    },
-
+    }
 });
 
 /** Применить пресет профиля к значениям настроек */

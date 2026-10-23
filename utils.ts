@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { Toasts, UserStore } from "@webpack/common";
+import { showToast, UserStore } from "@webpack/common";
 
 /** Версия плагина (видна в консоли, /p2p-doctor и анонсах) */
-export const PLUGIN_VERSION = "1.23.0";
+export const PLUGIN_VERSION = "1.23.1";
 
 /** Сравнение версий «1.10.0»: true, если v >= major.minor.
  *  Используется для гейтинга шифрования сигналов по версии пира. */
@@ -23,7 +23,7 @@ export function versionAtLeast(v: string | null | undefined, major: number, mino
 
 export function toast(message: string, variant: "default" | "success" | "critical" = "default"): void {
     try {
-        Toasts.show({
+        showToast({
             text: message,
             variant,
             duration: 3500

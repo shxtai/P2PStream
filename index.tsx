@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { ApplicationCommandInputType } from "@api/Commands";
+import { ApplicationCommandInputType, findOption } from "@api/Commands";
 import { Settings as AppSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
 import { MessageActions, RestAPI, SelectedChannelStore } from "@webpack/common";
 
-import { brokerEnsure, brokerShutdown } from "./broker";
+import { brokerEnsure, brokerLabel, brokerLastError, brokerShutdown, brokerStatus } from "./broker";
 import { manager, mediaReport, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
@@ -276,13 +276,13 @@ export default definePlugin({
                     required: true
                 }
             ],
-            execute: async (args: { link: string }) => {
-                applyBrokerLink(String(args.link));
+            execute: async args => {
+                applyBrokerLink(String(findOption(args, "link", "")));
             }
         }
     ],
 
-    flux:: {
+    flux: {
         MESSAGE_CREATE: (payload: any) => manager.onMessageCreate(payload),
         VOICE_STATE_UPDATES: () => manager.onVoiceStateUpdate()
     },

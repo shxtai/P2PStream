@@ -12,7 +12,9 @@ import {
     brokerIdleCheck,
     brokerIsConnected,
     brokerOpen,
+    brokerPublish,
     brokerSetChannel,
+    brokerStreamTopic,
     brokerShutdown,
     setBrokerMessageHandler
 } from "./broker";
@@ -1820,15 +1822,15 @@ export class P2PManager {
             if (now - this.lastChatAnnounce < 20_000) return;
             this.lastChatAnnounce = now;
         }
-                const payload = { v: 1, t: "announce" as const, s: host.streamId, from: myId(), _route: route };
-                const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId };
-                // Приватный стрим: публикуем announce только в топик стрима (не в канал)
-                if (settings.store.privateStream) {
-                    const streamTopic = `${TOPIC_PREFIX}/s/${host.streamId}`;
-                    brokerPublish(streamTopic, { ...payload, d: data, allowedViewers: settings.store.allowedViewers?.split(',').filter(Boolean) || [] });
-                } else {
-                    sendSignals(host.channelId, { ...payload, d: data });
-                }
+        const payload = { v: 1 as const, t: "announce" as const, s: host.streamId, from: myId(), _route: route };
+        const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId };
+        // Приватный стрим: публикуем announce только в топик стрима (не в канал)
+        if (settings.store.privateStream) {
+            const allowedViewers = String(settings.store.allowedViewers ?? "").split(",").map(s => s.trim()).filter(Boolean);
+            brokerPublish(brokerStreamTopic(host.streamId), { ...payload, d: data, allowedViewers });
+        } else {
+            sendSignals(host.channelId, { ...payload, d: data });
+        }
     }
 
     private startHeartbeat(): void {
