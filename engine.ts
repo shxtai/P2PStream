@@ -10,6 +10,7 @@ import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStor
 import {
     brokerEnsure,
     brokerIdleCheck,
+    brokerInboxTopic,
     brokerIsConnected,
     brokerOpen,
     brokerPublish,
@@ -1548,6 +1549,10 @@ export class P2PManager {
                 sendSignals(v, { v: 1, t: "query", s: "*", from: myId() });
             }, (myId().charCodeAt(0) % 5) * 700);
         }, 3_000);
+        // Уже в голосовом канале при старте (Ctrl+R, включение плагина): без этого
+        // подписка брокера на топик канала ждала следующего VOICE_STATE_UPDATES,
+        // и до него эфиры через брокер не было видно.
+        this.onVoiceStateUpdate();
         logger.info("P2P-движок запущен");
     }
 
@@ -1924,7 +1929,7 @@ export class P2PManager {
 
                 if (!prev && channelId === voice) {
                     if (settings.store.notifyLive) {
-                        toast(`${userNameSafe(sig.from)} начал P2P-эфир — плитка стрима появилась в звонке`, "success");
+                        toast(`${userNameSafe(sig.from)} начал P2P-эфир — «Смотреть» на плашке внизу экрана`, "success");
                     }
                     if (settings.store.autoWatch && !this.watches.has(sig.s)) {
                         this.watch(sig.s);
@@ -2048,12 +2053,16 @@ export class P2PManager {
      * { v:1, k:тип, from, to?, s, ch?, pk?, d? | e? }, для offer/answer/ice — e
      * зашифрован ECDH+AES-GCM ключом отправителя.
      */
-    private onBrokerMessage = async (msg: any, _topic?: string): Promise<void> => {
+    private onBrokerMessage = async (msg: any, topic?: string): Promise<void> => {
         try {
             if (!msg || msg.v !== 1 || typeof msg.k !== "string" || typeof msg.from !== "string") return;
             if (msg.from === myId()) return; // MQTT возвращает и свои публикации в подписанный топик
             const me = myId();
             if (msg.to && msg.to !== me) return;
+            // Всё, что пришло в личный ящик (p2ps/v1/u/<я>), адресовано мне. Пиры до 1.23.6
+            // не клали to в брокерные сообщения — без этого их offer/answer/ice отбрасывались.
+            const to: string | undefined = typeof msg.to === "string" ? msg.to
+                : topic && topic === brokerInboxTopic() ? me : undefined;
 
             let d = msg.d;
             if (msg.k === "offer" || msg.k === "answer" || msg.k === "ice") {
@@ -2066,7 +2075,7 @@ export class P2PManager {
                 t: msg.k as Signal["t"],
                 s: typeof msg.s === "string" ? msg.s : "*",
                 from: msg.from,
-                to: msg.to,
+                to,
                 // ключ отправителя: без него хост не мог зашифровать оффер зрителю,
                 // а зритель — ответ хосту (брокерный путь offer/answer был мёртв)
                 pk: typeof msg.pk === "string" ? msg.pk : undefined,

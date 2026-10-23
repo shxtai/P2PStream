@@ -5,7 +5,15 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { findByProps } from "@webpack";
+import { filters, find, findByProps } from "@webpack";
+
+/** Тихий поиск модуля: в свежем Discord экспорты минифицированы (setActiveStream и
+ *  т.п. больше не находятся) — findByProps на каждый промах пишет в консоль красную
+ *  ошибку, и в логах пользователей это выглядело как поломка. Промах тут штатный:
+ *  «Смотреть» ловит слой 2 (Flux STREAM_WATCH). */
+function findPropsQuiet(...props: string[]): any {
+    try { return find(filters.byProps(...props), { isIndirect: true }); } catch { return null; }
+}
 import {
     ApplicationStreamingStore,
     ApplicationStreamPreviewStore,
@@ -549,7 +557,7 @@ function installWatchIntercept(): void {
         ["watchStream"]
     ]) {
         try {
-            const mod: any = findByProps(...props);
+            const mod: any = findPropsQuiet(...props);
             if (mod) modules.add(mod);
         } catch { /* ignore */ }
     }
@@ -633,7 +641,7 @@ function installStreamWatchInterceptor(): void {
             const closeNativeModal = () => {
                 for (const props of [["clearActiveStream", "setActiveStream"], ["clearActiveStream"]]) {
                     try {
-                        const mod: any = findByProps(...props);
+                        const mod: any = findPropsQuiet(...props);
                         if (mod && typeof mod.clearActiveStream === "function") {
                             try { mod.clearActiveStream({ streamKey: payload.streamKey }); } catch { try { mod.clearActiveStream(); } catch { /* ignore */ } }
                         }

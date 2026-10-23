@@ -313,7 +313,7 @@ async function tryBrokerSend(channelId: string, sig: Signal): Promise<boolean> {
             // наш публичный ключ нужен хосту, чтобы шифровать offer/ice нам
             const pk = sig.t === "join" ? await brokerPublicKey() : undefined;
             return brokerPublish(`${TOPIC_PREFIX}/u/${sig.to}`, {
-                v: 1, k: sig.t, s: sig.s, from: sig.from, ch: channelId, pk
+                v: 1, k: sig.t, s: sig.s, from: sig.from, to: sig.to, ch: channelId, pk
             });
         }
         case "offer":
@@ -322,8 +322,10 @@ async function tryBrokerSend(channelId: string, sig: Signal): Promise<boolean> {
             if (!sig.to || !sig.pk) return false;
             // SDP и ICE содержат IP — шифруем ECDH+AES-GCM ключом адресата
             const [sealed, myPk] = await Promise.all([brokerSeal(sig.pk, sig.d ?? null), brokerPublicKey()]);
+            // to обязателен: зритель/хост принимают offer/answer/ice только при to === я.
+            // Без него брокерный оффер доходил и молча выбрасывался.
             return brokerPublish(`${TOPIC_PREFIX}/u/${sig.to}`, {
-                v: 1, k: sig.t, s: sig.s, from: sig.from, ch: channelId, pk: myPk, e: sealed
+                v: 1, k: sig.t, s: sig.s, from: sig.from, to: sig.to, ch: channelId, pk: myPk, e: sealed
             });
         }
         default:
