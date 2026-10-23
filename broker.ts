@@ -304,24 +304,17 @@ function isWorkerUrl(url: string): boolean {
 const CSP_BUILTIN = new Set(DEFAULT_BROKERS.map(u => { try { return new URL(u).host; } catch { return ""; } }));
 const cspAsked = new Set<string>();
 
-/** Свой адрес брокера вне встроенного списка: Discord заблокирует сокет (CSP).
- *  Один раз на хост спрашиваем у пользователя разрешение штатным диалогом Vencord. */
+/** Свой адрес брокера вне встроенного списка: native.ts разрешает его в CSP,
+ *  но CSP применяется только при загрузке страницы — после смены адреса нужен Ctrl+R. */
 function ensureCspFor(url: string): void {
     let host: string;
     try { host = new URL(url).host; } catch { return; }
     if (isWorkerUrl(url) || CSP_BUILTIN.has(host) || cspAsked.has(host)) return;
     cspAsked.add(host);
-    const csp = (globalThis as any).VencordNative?.csp;
-    if (!csp?.isDomainAllowed) return;
-    void (async () => {
-        try {
-            if (await csp.isDomainAllowed(url, ["connect-src"])) return;
-            const res = await csp.requestAddOverride(url, ["connect-src"], "P2PStream");
-            if (res === "ok") toast(`Брокер ${host} разрешён — полностью перезапустите Discord`, "success");
-        } catch (e) {
-            logger.debug("CSP request:", e);
-        }
-    })();
+    // соединение уже открывалось без ошибки — значит, разрешён; иначе подсказка
+    setTimeout(() => {
+        if (!brokerIsConnected()) toast(`Брокер ${host} не подключается — если адрес новый, нажмите Ctrl+R`, "critical");
+    }, CONNECT_TIMEOUT_MS + 500);
 }
 
 function nextUrl(): string {

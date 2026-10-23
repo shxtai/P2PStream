@@ -11,6 +11,7 @@
  */
 
 import { ConnectSrc, CspPolicies } from "@main/csp";
+import { RendererSettings } from "@main/settings";
 import { spawn } from "child_process";
 import { app, desktopCapturer, type IpcMainInvokeEvent } from "electron";
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "fs";
@@ -21,15 +22,30 @@ import { join } from "path";
 // (connect-src). Без этого WebSocket к брокерам сигналинга блокируется
 // («violates the following Content Security Policy directive»), брокер не
 // подключается ни один и остаётся только медленный чат-фолбэк.
-// Порт в ключе обязателен: хост без порта в CSP разрешает только 443.
-for (const host of [
-    "*.workers.dev", // свой брокер на Cloudflare Workers (cf-worker/worker.js)
-    "broker.emqx.io:8084",
-    "broker.hivemq.com:8884",
-    "test.mosquitto.org:8081"
+// Схема wss:// обязательна: запись без схемы на https-странице WebSocket не
+// разрешает (проверено в 1.23.3 — хосты были в списке, сокеты всё равно резались).
+// Порт тоже обязателен: без порта разрешается только 443.
+for (const src of [
+    "wss://*.workers.dev", // свой брокер на Cloudflare Workers (cf-worker/worker.js)
+    "wss://broker.emqx.io:8084",
+    "wss://broker.hivemq.com:8884",
+    "wss://test.mosquitto.org:8081"
 ]) {
-    CspPolicies[host] = ConnectSrc;
+    CspPolicies[src] = ConnectSrc;
 }
+
+/** Свой адрес брокера из настроек плагина. CSP собирается при загрузке страницы,
+ *  так что после смены адреса достаточно Ctrl+R. */
+function allowBrokerUrl(url: unknown): void {
+    try {
+        const u = new URL(String(url ?? "").trim());
+        if (u.protocol === "wss:" || u.protocol === "ws:") CspPolicies[`${u.protocol}//${u.host}`] = ConnectSrc;
+    } catch { /* пусто или не URL */ }
+}
+try {
+    allowBrokerUrl(RendererSettings.store.plugins?.P2PStream?.brokerUrl);
+    RendererSettings.addChangeListener("plugins.P2PStream.brokerUrl", allowBrokerUrl);
+} catch { /* старый Vencord без RendererSettings */ }
 
 export interface P2PSourceInfo {
     /** Electron source id, например "screen:0:0" или "window:131076:0" */
