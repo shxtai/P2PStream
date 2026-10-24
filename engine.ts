@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import * as DataStore from "@api/DataStore";
 import { Logger } from "@utils/Logger";
 import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
@@ -21,7 +22,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, type SendState } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -314,6 +315,15 @@ function applyVideoCodecPreference(pc: RTCPeerConnection, codec: string): void {
 /** id сеанса из строки o= SDP: меняется только при НОВОМ RTCPeerConnection */
 function sdpSessionId(sdp: string): string {
     return /^o=\S+ (\S+)/m.exec(sdp)?.[1] ?? "";
+}
+
+/** Последняя рабочая скорость к зрителю (бит/с): DataStore Vencord (localStorage Discord удаляет) */
+const BWE_KEY = (uid: string) => `P2PStream_bwe_${uid}`;
+async function rememberedBps(uid: string): Promise<number> {
+    try { return Number(await DataStore.get(BWE_KEY(uid))) || 0; } catch { return 0; }
+}
+function rememberBps(uid: string, bps: number): void {
+    try { void DataStore.set(BWE_KEY(uid), Math.round(bps)); } catch { /* ignore */ }
 }
 
 /** SDP-мунж: стерео Opus + максимальная полоса для музыки/звука без потерь */
@@ -703,6 +713,8 @@ class HostPeer {
     /** лестница качества: текущая ступень, сглаженный битрейт, ступени из-за процессора */
     private rungIdx = -1;
     private effSmooth = 0;
+    private startLogged = false;
+    private lastRemember = 0;
     private cpuState: CpuState | null = null;
     private aqEmergency = false;
     private aqEmergencySince = 0;
@@ -845,7 +857,16 @@ class HostPeer {
             // после ICE-restart remoteDescription уже есть (от прошлого раунда) —
             // проверяем только состояние, иначе answer на рестарт игнорировался
             if (this.pc.signalingState === "have-local-offer") {
-                await this.pc.setRemoteDescription({ type: "answer", sdp: d.sdp });
+                // Старт оценки канала: идущий сеанс — с текущей сглаженной скорости,
+                // новый — с последней рабочей к этому зрителю (или 8 Мбит/с)
+                const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
+                const startBps = startBitrateBps(this.effSmooth || await rememberedBps(this.userId), userMax);
+                const sdp = withStartBitrate(d.sdp, Math.round(startBps / 1000));
+                if (!this.startLogged) {
+                    this.startLogged = true;
+                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с (замер 3×/6× в первую секунду)`);
+                }
+                await this.pc.setRemoteDescription({ type: "answer", sdp });
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
                 this.pendingIce = [];
                 for (const c of queue) {
@@ -965,7 +986,12 @@ class HostPeer {
                 this.cpuState ??= initCpuState(Date.now());
                 // srcFps — сколько кадров реально подаёт захват (не путать статичный экран с провалом)
                 const srcFps = srcFrames / 2;
-                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now() }, ladder.length - 1);
+                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now(), capBps: this.effSmooth }, ladder.length - 1);
+                // запоминаем рабочую скорость к зрителю (раз в 10 с, только на чистом канале)
+                if ((loss ?? 0) < 0.02 && Date.now() - this.lastRemember > 10_000 && this.effSmooth > 0) {
+                    this.lastRemember = Date.now();
+                    rememberBps(this.userId, this.effSmooth);
+                }
                 this.cpuState = cr.state;
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
                 const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, cr.state.steps);
@@ -998,18 +1024,22 @@ class HostPeer {
                 }
                 const fpsCap = rung.fps < userFps ? rung.fps : 0;
                 const scale = srcH && rung.height < srcH ? srcH / rung.height : 1;
-                const capMoved = this.aqCapBps === 0 || Math.abs(eff - this.aqCapBps) > this.aqCapBps * 0.05;
+                // потолок энкодера: на чистом канале выше оценки — WebRTC зондирует и
+                // оценка растёт быстро; разрешение при этом выбирается по eff (см. выше)
+                const clean = (loss ?? 0) < 0.02 && !reason && (!state.lastCut || Date.now() - state.lastCut > 4000);
+                const encCap = sendCap(state, bweBps, max, clean);
+                const capMoved = this.aqCapBps === 0 || Math.abs(encCap - this.aqCapBps) > this.aqCapBps * 0.05;
                 if (capMoved || scale !== this.aqScale || fpsCap !== this.aqFps) {
                     const first = this.aqCapBps === 0;
                     const prev = this.aqCapBps;
-                    this.aqCapBps = eff;
+                    this.aqCapBps = encCap;
                     this.aqScale = scale;
                     this.aqFps = fpsCap;
-                    (this.pc as any).__aq = { capBps: eff, scale, fps: fpsCap || undefined, emergency: this.aqEmergency };
+                    (this.pc as any).__aq = { capBps: encCap, scale, fps: fpsCap || undefined, emergency: this.aqEmergency };
                     await applySendParameters(this.pc);
                     const bweNote = bweBps && eff < Math.min(state.capBps, max) ? `оценка канала ${(bweBps / 1e6).toFixed(1)} Мбит/с` : null;
                     // в лог — только заметные изменения (оценка канала колеблется постоянно)
-                    if (reason || (!first && Math.abs(eff - prev) > prev * 0.25)) {
+                    if (reason || (!first && Math.abs(encCap - prev) > prev * 0.25)) {
                         logger.info(`Авто-качество → ${this.userId}: ${(eff / 1e6).toFixed(1)} Мбит/с, ${rung.height}p@${rung.fps}${reason ? ` — ${reason}` : bweNote ? ` — ${bweNote}` : ""}`);
                     }
                     this.host.mgr.bump();

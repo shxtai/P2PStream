@@ -22,3 +22,8 @@ export function definePluginSettings(def) {
     }
     return { store, def };
 }
+
+// @api/DataStore (IndexedDB в Vencord) — в стенде в памяти
+const dataStore = new Map();
+export function get(key) { return Promise.resolve(dataStore.get(key)); }
+export function set(key, value) { dataStore.set(key, value); return Promise.resolve(); }

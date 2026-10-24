@@ -67,6 +67,20 @@ export function effectiveCap(st: SendState, bweBps: number | null | undefined, u
     return Math.min(st.capBps, bweCap, userMaxBps);
 }
 
+/**
+ * Потолок ДЛЯ ЭНКОДЕРА (maxBitrate). В отличие от effectiveCap (по нему выбирается
+ * разрешение) на чистом канале он на 60% ВЫШЕ оценки WebRTC: повышение maxBitrate
+ * заставляет WebRTC сразу прозондировать канал на новом уровне, и оценка растёт
+ * скачками ×1.6 раз в 2 с. Раньше maxBitrate = 90% оценки: WebRTC не пробовал выше
+ * потолка, оценка ползла ~8%/с — до 30 Мбит/с полминуты «мыла» на старте.
+ * Есть потери/срез — как раньше, 90% оценки (случай 1.15: энкодер выше канала → потери).
+ */
+export function sendCap(st: SendState, bweBps: number | null | undefined, userMaxBps: number, clean: boolean): number {
+    if (!bweBps || bweBps <= 0) return Math.min(st.capBps, userMaxBps);
+    const bweCap = Math.max(MIN_CAP_BPS, Math.round(bweBps * (clean ? 1.6 : 0.9)));
+    return Math.min(st.capBps, bweCap, userMaxBps);
+}
+
 export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { state: SendState; reason: string | null; } {
     const next: SendState = { ...st };
     if (s.loss != null) next.lossEwma = st.lossEwma * 0.6 + s.loss * 0.4;
@@ -294,11 +308,21 @@ export function pickRung(ladder: Rung[], capBps: number, aspect: number, prevIdx
  * Процессор: энкодер упирается в CPU и не дотягивает до FPS ступени (×3 замера) —
  * опускаемся на ступень; 30 с без нехватки и ≥ 60 с после спуска — пробуем вверх.
  */
-export interface CpuState { steps: number; strain: number; easySince: number; lastDown: number; }
+export interface CpuState {
+    steps: number; strain: number; easySince: number; lastDown: number;
+    /** из steps — сколько ступеней снято НЕ из-за процессора (энкодер выкидывал кадры,
+     *  укладываясь в битрейт): их возвращаем по мере роста канала, а не по таймеру */
+    bwSteps?: number;
+    /** битрейт (бит/с) в момент последнего такого снижения */
+    bwAtDown?: number;
+}
 
 export function initCpuState(now: number): CpuState {
-    return { steps: 0, strain: 0, easySince: now, lastDown: 0 };
+    return { steps: 0, strain: 0, easySince: now, lastDown: 0, bwSteps: 0, bwAtDown: 0 };
 }
+
+/** Во сколько раз должен вырасти битрейт, чтобы вернуть ступень, снятую из-за битрейта */
+export const BW_STEP_RECOVER = 1.35;
 
 /**
  * «Энкодер не тянет ступень»: захват подаёт кадры (srcFps ≥ 90% FPS ступени), а
@@ -306,8 +330,23 @@ export function initCpuState(now: number): CpuState {
  * разрешение» он выкидывает кадры, чтобы уложиться в битрейт. Обычный провал —
  * ступень вниз после 3 замеров подряд; сильный (< 50%) — сразу.
  */
-export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: number; cpuLimited: boolean; srcFps?: number; now: number; }, maxSteps: number): { state: CpuState; reason: string | null; } {
+export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: number; cpuLimited: boolean; srcFps?: number; now: number; capBps?: number; }, maxSteps: number): { state: CpuState; reason: string | null; } {
     const next: CpuState = { ...st };
+    // (1.23.9) Ступени, снятые из-за нехватки битрейта, возвращаем, как только канал
+    // вырос на 35% с момента снижения (не чаще раза в 4 с). Раньше они возвращались
+    // только по таймеру «30 с спокойно и 60 с после спуска»: на старте, пока оценка
+    // канала разгоняется, энкодер выкидывал кадры — плагин уходил на 360p и сидел
+    // там минуту, хотя канал уже давно позволял 1080p.
+    const bwSteps = st.bwSteps ?? 0;
+    if (bwSteps > 0 && !s.cpuLimited && s.capBps && st.bwAtDown && s.capBps >= st.bwAtDown * BW_STEP_RECOVER && s.now - st.lastDown >= 4000) {
+        next.steps = Math.max(0, st.steps - 1);
+        next.bwSteps = bwSteps - 1;
+        next.bwAtDown = s.capBps;
+        next.strain = 0;
+        next.easySince = s.now;
+        next.lastDown = s.now; // следующий возврат/спуск — не раньше чем через 4 с
+        return { state: next, reason: `канал вырос до ${(s.capBps / 1e6).toFixed(1)} Мбит/с — ступень выше` };
+    }
     // ожидаем столько, сколько реально подаёт захват (игра на 30 FPS не «провал» ступени 60);
     // при захвате < 20 FPS (статичный экран) провалы не считаем
     const src = s.srcFps ?? 0;
@@ -321,6 +360,10 @@ export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: numbe
             next.steps++;
             next.strain = 0;
             next.lastDown = s.now;
+            if (!s.cpuLimited) {
+                next.bwSteps = bwSteps + 1;
+                next.bwAtDown = s.capBps ?? 0;
+            }
             const who = s.cpuLimited ? "процессор не успевает" : "энкодер выкидывает кадры";
             return { state: next, reason: `${who} (${Math.round(s.encFps)} из ${s.targetFps} FPS) — ступень ниже` };
         }
@@ -330,6 +373,7 @@ export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: numbe
     if (s.cpuLimited) { next.easySince = s.now; return { state: next, reason: null }; }
     if (next.steps > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
         next.steps--;
+        if ((next.bwSteps ?? 0) > next.steps) next.bwSteps = next.steps;
         next.easySince = s.now;
         return { state: next, reason: "энкодер справляется — пробую ступень выше" };
     }
@@ -366,4 +410,58 @@ export function nextJitterTarget(st: RecvState, s: RecvSample, userMinMs: number
         return { targetMs: Math.max(userMinMs, st.targetMs - 25), calmSince: s.now };
     }
     return st;
+}
+
+/**
+ * Стартовый битрейт сеанса (x-google-start-bitrate). С ним WebRTC в первую секунду
+ * пробует канал на 3× и 6× от старта — по сути замер скорости при подключении.
+ * Без него оценка канала стартовала с ~0.3 Мбит/с и росла ~8% в секунду: до
+ * 30 Мбит/с — полминуты, и всё это время картинка была мыльной.
+ * Старт — 80% последней рабочей скорости к этому зрителю, без истории — 12 Мбит/с
+ * (хватает на 1080p60 сразу; на слабом канале оценка упадёт за секунду);
+ * не меньше 2.5 и не больше максимума из настроек.
+ */
+export const DEFAULT_START_BPS = 12_000_000;
+
+export function startBitrateBps(rememberedBps: number | null | undefined, userMaxBps: number): number {
+    const base = rememberedBps && rememberedBps > 0 ? rememberedBps * 0.8 : DEFAULT_START_BPS;
+    return Math.round(Math.max(2_500_000, Math.min(userMaxBps, base, 60_000_000)));
+}
+
+/** Стартовый битрейт для видео в SDP: x-google-start-bitrate (кбит/с) в fmtp каждого
+ *  видеокодека. Ставится в answer зрителя на стороне стримера перед
+ *  setRemoteDescription — WebRTC отправителя берёт параметры из удалённого описания. */
+export function withStartBitrate(sdp: string, startKbps: number): string {
+    const lines = sdp.split("\r\n");
+    const out: string[] = [];
+    let inVideo = false;
+    const rtxLike = new Set<string>();
+    const hasFmtp = new Set<string>();
+    // первый проход: какие payload-ы служебные и у каких уже есть fmtp
+    let video = false;
+    for (const l of lines) {
+        if (l.startsWith("m=")) video = l.startsWith("m=video");
+        if (!video) continue;
+        const rm = /^a=rtpmap:(\d+) ([\w-]+)\//.exec(l);
+        if (rm && /^(rtx|red|ulpfec|flexfec)/i.test(rm[2])) rtxLike.add(rm[1]);
+        const fm = /^a=fmtp:(\d+) /.exec(l);
+        if (fm) hasFmtp.add(fm[1]);
+    }
+    for (const l of lines) {
+        if (l.startsWith("m=")) inVideo = l.startsWith("m=video");
+        if (inVideo) {
+            const fm = /^a=fmtp:(\d+) (.*)$/.exec(l);
+            if (fm && !rtxLike.has(fm[1])) {
+                out.push(`a=fmtp:${fm[1]} ${fm[2].replace(/;?x-google-start-bitrate=\d+/g, "")};x-google-start-bitrate=${startKbps}`);
+                continue;
+            }
+            const rm = /^a=rtpmap:(\d+) /.exec(l);
+            if (rm && !rtxLike.has(rm[1]) && !hasFmtp.has(rm[1])) {
+                out.push(l, `a=fmtp:${rm[1]} x-google-start-bitrate=${startKbps}`);
+                continue;
+            }
+        }
+        out.push(l);
+    }
+    return out.join("\r\n");
 }

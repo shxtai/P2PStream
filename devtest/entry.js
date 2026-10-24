@@ -47,15 +47,27 @@ async function pathOf(pc) {
 if (role === "host") {
     // «экран» хоста — анимированный canvas
     // ?heavy — 1280x720 с шумом: «тяжёлый» контент как игра, энкодер просит много битрейта
-    const heavy = q.has("heavy");
-    const W = heavy ? 1280 : 640, H = heavy ? 720 : 360;
+    const heavy = q.has("heavy") || q.has("big");
+    // ?big — 1920x1080 с шумом (тест разгона качества)
+    const W = q.has("big") ? 1920 : heavy ? 1280 : 640, H = q.has("big") ? 1080 : heavy ? 720 : 360;
     const canvas = document.createElement("canvas");
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext("2d");
-    const noise = heavy ? ctx.createImageData(W, H) : null;
+    const big = q.has("big");
+    // big: шум 320x180, растянутый на 1080p без сглаживания — для энкодера тяжело,
+    // а генерация дешёвая (полноразмерный шум на JS сам упирался в процессор)
+    const small = big ? Object.assign(document.createElement("canvas"), { width: 320, height: 180 }) : null;
+    const sctx = small?.getContext("2d");
+    const noise = big ? sctx.createImageData(320, 180) : heavy ? ctx.createImageData(W, H) : null;
     let f = 0;
     setInterval(() => {
-        if (noise) {
+        if (big) {
+            const d = noise.data;
+            for (let i = 0; i < d.length; i += 4) { const v = Math.random() * 255; d[i] = v; d[i + 1] = (v + f) % 255; d[i + 2] = 255 - v; d[i + 3] = 255; }
+            sctx.putImageData(noise, 0, 0);
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(small, 0, 0, W, H);
+        } else if (noise) {
             const d = noise.data;
             for (let i = 0; i < d.length; i += 4) { const v = Math.random() * 255; d[i] = v; d[i + 1] = (v + f) % 255; d[i + 2] = 255 - v; d[i + 3] = 255; }
             ctx.putImageData(noise, 0, 0);
@@ -79,6 +91,21 @@ if (role === "host") {
         if (!peer || peer.pc.connectionState !== "connected" || reported) return;
         reported = true;
         clearInterval(watchPeers);
+        // ?ramp — разгон: каждые 2 с оценка канала, отправка, разрешение (30 с)
+        if (q.has("ramp")) {
+            const t0r = Date.now(); let prevBytes = 0, prevT = Date.now();
+            const ramp = setInterval(async () => {
+                const st = await peer.pc.getStats(); let bwe = 0, bytes = 0, h = 0, fps = 0;
+                st.forEach(r => {
+                    if (r.type === "candidate-pair" && r.nominated && r.availableOutgoingBitrate) bwe = r.availableOutgoingBitrate;
+                    if (r.type === "outbound-rtp" && r.kind === "video") { bytes += r.bytesSent; h = r.frameHeight ?? h; fps = r.framesPerSecond ?? fps; }
+                });
+                const now = Date.now(); const mbps = ((bytes - prevBytes) * 8 / ((now - prevT) / 1000) / 1e6);
+                prevBytes = bytes; prevT = now;
+                report("OUT", `разгон t=${Math.round((now - t0r) / 1000)}с: оценка ${(bwe / 1e6).toFixed(1)} Мбит/с, шлём ${mbps.toFixed(1)} Мбит/с, ${h}p ${Math.round(fps)} FPS`);
+                if (now - t0r > 30_000) clearInterval(ramp);
+            }, 2000);
+        }
         setTimeout(async () => { for (const l of await mediaReport(peer.pc, "out")) report("OUT", l); }, 4000);
         // ?switch — проверка смены кодека на лету (как при сбое декодирования у зрителя)
         if (q.has("switch")) setTimeout(() => report("OUT", `switchCodec: ${peer.switchCodec("тест стенда")}`), 6000);
@@ -137,7 +164,7 @@ if (role === "host") {
                 void (async () => {
                     // отчёт /p2p-doctor зрителя (VERBOSE=1 — виден в выводе)
                     // через 15 с — когда оценка канала (BWE) уже разогналась
-                    await new Promise(r => setTimeout(r, q.has("heavy") ? 15000 : 0));
+                    await new Promise(r => setTimeout(r, q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
                     for (const l of await mediaReport(w.pc, "in")) report("IN ", l);
                     status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${secs} с, путь ${await pathOf(w.pc)}`);
                 })();

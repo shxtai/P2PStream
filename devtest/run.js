@@ -145,6 +145,7 @@ async function runScenario(chromePath, query, port) {
             "@utils/Logger": stub("misc.js"),
             "@utils/types": stub("misc.js"),
             "@api/Settings": stub("misc.js"),
+            "@api/DataStore": stub("misc.js"),
             "@p2p": ROOT
         }
     });

@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -198,5 +198,50 @@ const MAX = 30e6;
     let t = 20000;
     for (let i = 0; i < 400; i++) { t += 2000; st = nextJitterTarget(st, { freezes: 0, jitterMs: 5, now: t }, 0); }
     check("спокойный канал возвращает буфер к минимуму", st.targetMs === 0, `${st.targetMs} мс`);
+}
+// --- 1.23.9: быстрый разгон ---
+{
+    // стартовый битрейт: без истории 12, с историей 80% от неё, в пределах [2.5; максимум]
+    check("старт без истории — 12 Мбит/с", startBitrateBps(0, 100e6) === 12e6, `${startBitrateBps(0, 100e6) / 1e6}`);
+    check("старт с историей 40 Мбит/с — 32", startBitrateBps(40e6, 100e6) === 32e6);
+    check("старт не выше максимума из настроек", startBitrateBps(40e6, 20e6) === 20e6);
+    check("старт не ниже 2.5 Мбит/с", startBitrateBps(1e6, 100e6) === 2.5e6);
+
+    // потолок энкодера: на чистом канале выше оценки (зондирование), с потерями — 90%
+    const st = initSendState(100e6, 0);
+    check("чистый канал: потолок энкодера 1.6× оценки", sendCap(st, 10e6, 100e6, true) === 16e6, `${sendCap(st, 10e6, 100e6, true) / 1e6}`);
+    check("потери: потолок энкодера 0.9× оценки", sendCap(st, 10e6, 100e6, false) === 9e6);
+    check("потолок энкодера не выше максимума", sendCap(st, 80e6, 30e6, true) === 30e6);
+    check("без оценки — потолок по потерям/настройкам", sendCap({ ...st, capBps: 20e6 }, null, 100e6, true) === 20e6);
+
+    // ступени, снятые из-за битрейта (энкодер выкидывал кадры, процессор свободен),
+    // возвращаются по мере роста канала, а не через минуту
+    let c = initCpuState(0), t = 0;
+    for (let i = 0; i < 3; i++) { t += 2000; c = nextCpuSteps(c, { encFps: 20, targetFps: 60, cpuLimited: false, srcFps: 60, now: t, capBps: 6e6 }, 5).state; }
+    check("кадры выкидываются на 6 Мбит/с → ступень ниже", c.steps >= 1 && c.bwSteps >= 1, `steps=${c.steps}`);
+    const down = c.steps;
+    t += 2000; c = nextCpuSteps(c, { encFps: 60, targetFps: 60, cpuLimited: false, srcFps: 60, now: t, capBps: 7e6 }, 5).state;
+    check("канал вырос мало (+17%) — ступень не возвращаем", c.steps === down);
+    t += 4000; const r = nextCpuSteps(c, { encFps: 60, targetFps: 60, cpuLimited: false, srcFps: 60, now: t, capBps: 6e6 * BW_STEP_RECOVER }, 5);
+    check("канал вырос на 35% — ступень возвращается сразу (не через 60 с)", r.state.steps === down - 1, r.reason);
+
+    // а ступень из-за процессора по росту канала НЕ возвращается
+    let p = initCpuState(0); t = 0;
+    for (let i = 0; i < 3; i++) { t += 2000; p = nextCpuSteps(p, { encFps: 20, targetFps: 60, cpuLimited: true, srcFps: 60, now: t, capBps: 6e6 }, 5).state; }
+    const pd = p.steps;
+    t += 6000; p = nextCpuSteps(p, { encFps: 60, targetFps: 60, cpuLimited: false, srcFps: 60, now: t, capBps: 50e6 }, 5).state;
+    check("ступень из-за процессора не возвращается от роста канала", pd >= 1 && p.steps === pd);
+
+    // SDP: x-google-start-bitrate каждому видеокодеку (и с fmtp, и без), служебным — нет
+    const sdp = [
+        "v=0", "m=audio 9 UDP/TLS/RTP/SAVPF 111", "a=rtpmap:111 opus/48000/2", "a=fmtp:111 minptime=10",
+        "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99", "a=rtpmap:96 VP8/90000", "a=rtpmap:97 rtx/90000", "a=fmtp:97 apt=96",
+        "a=rtpmap:98 H264/90000", "a=fmtp:98 profile-level-id=42e01f;packetization-mode=1", "a=rtpmap:99 red/90000", ""
+    ].join("\r\n");
+    const m = withStartBitrate(sdp, 12000);
+    check("SDP: VP8 без fmtp получил start-bitrate", m.includes("a=fmtp:96 x-google-start-bitrate=12000"));
+    check("SDP: H264 fmtp дополнен", m.includes("a=fmtp:98 profile-level-id=42e01f;packetization-mode=1;x-google-start-bitrate=12000"));
+    check("SDP: rtx/red и звук не тронуты", m.includes("a=fmtp:97 apt=96\r\n") && !/a=fmtp:99/.test(m) && m.includes("a=fmtp:111 minptime=10\r\n"));
+    check("SDP: повторный мунж не дублирует параметр", (withStartBitrate(m, 9000).match(/x-google-start-bitrate/g) || []).length === 2 && withStartBitrate(m, 9000).includes("x-google-start-bitrate=9000"));
 }
 process.exit(failed ? 1 : 0);
