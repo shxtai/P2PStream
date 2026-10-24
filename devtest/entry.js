@@ -121,7 +121,7 @@ if (role === "host") {
                 if (now - t0r > 30_000) clearInterval(ramp);
             }, 2000);
         }
-        setTimeout(async () => { for (const l of await mediaReport(peer.pc, "out")) report("OUT", l); }, 4000);
+        setTimeout(async () => { for (const l of await mediaReport(peer.pc, "out")) report("OUT", l); const rx = peer.viewerRx; report("OUT", `обратная связь зрителя: ${rx ? `получает ${rx.recvFps.toFixed(0)}, декодирует ${rx.decFps.toFixed(0)}, выбрасывает ${rx.dropFps.toFixed(0)} FPS, ${rx.impl}` : "НЕТ"}`); }, 6000);
         // ?switch — проверка смены кодека на лету (как при сбое декодирования у зрителя)
         if (q.has("switch")) setTimeout(() => report("OUT", `switchCodec: ${peer.switchCodec("тест стенда")}`), 6000);
     }, 500);

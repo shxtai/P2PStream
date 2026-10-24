@@ -562,3 +562,51 @@ export function directPathVerdict(pairs: PairInfo[]): { selectedPrivate: boolean
         && (!sel || p.local !== sel.local) && p.localType !== "relay" && p.remoteType !== "relay");
     return { selectedPrivate, directOk };
 }
+
+/**
+ * Декодер ЗРИТЕЛЯ не успевает (из локальной доработки 1.21.1, перенесено в 1.23.12).
+ * Хост не видит, сколько кадров зритель реально показал — зритель раз в 2 с
+ * присылает по каналу обратной связи: получено/декодировано/выброшено кадров.
+ * Реальный лог 1.23.11: стример отдаёт 1080p58 / 31 Мбит/с, а у зрителя 9 FPS и
+ * 5 заморозок — стример этого не знал и держал ту же ступень.
+ *  - программный декодер AV1 не успевает → сразу сменить кодек;
+ *  - иначе 2 замера подряд → ступень лестницы ниже; 45 с без проблем → назад.
+ */
+export interface ViewerRx { recvFps: number; decFps: number; dropFps: number; hw: boolean; }
+export interface ViewerDecodeState { strain: number; steps: number; calmSince: number; lastAct: number; }
+
+export function initViewerDecode(now: number): ViewerDecodeState {
+    return { strain: 0, steps: 0, calmSince: now, lastAct: 0 };
+}
+
+export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: string, now: number, maxSteps: number): { state: ViewerDecodeState; action: "codec" | "down" | "up" | null; reason: string | null; } {
+    const next = { ...st };
+    const shown = rx.decFps - rx.dropFps;
+    const behind = rx.recvFps >= 20 && (shown < rx.recvFps * 0.85 || (shown < 28 && rx.recvFps >= 30));
+    if (behind) {
+        next.strain = st.strain + 1;
+        next.calmSince = now;
+        const why = `зритель показывает ${Math.round(shown)} из ${Math.round(rx.recvFps)} FPS (${rx.hw ? "аппаратный" : "программный"} декодер)`;
+        if (now - st.lastAct < 6000) return { state: next, action: null, reason: null };
+        if (!rx.hw && codec === "av1") {
+            next.strain = 0;
+            next.lastAct = now;
+            return { state: next, action: "codec", reason: why };
+        }
+        if (next.strain >= 2 && next.steps < maxSteps) {
+            next.strain = 0;
+            next.steps++;
+            next.lastAct = now;
+            return { state: next, action: "down", reason: `${why} — ступень ниже` };
+        }
+        return { state: next, action: null, reason: null };
+    }
+    next.strain = 0;
+    if (next.steps > 0 && now - st.calmSince >= 45_000 && now - st.lastAct >= 45_000) {
+        next.steps--;
+        next.lastAct = now;
+        next.calmSince = now;
+        return { state: next, action: "up", reason: "зритель успевает — пробую ступень выше" };
+    }
+    return { state: next, action: null, reason: null };
+}

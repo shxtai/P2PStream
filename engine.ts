@@ -21,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -736,6 +736,9 @@ class HostPeer {
     private decodeTrouble = 0;
     private encoderStall = 0;
     private triedCodecs: string[] = [];
+    /** обратная связь от зрителя: как его декодер справляется (последний замер) */
+    viewerRx: (ViewerRx & { impl: string; at: number; }) | null = null;
+    private viewerDecode: ViewerDecodeState | null = null;
     /** текущий видеокодек этого зрителя (из статистики) */
     codecName = "";
     private lastOfferAt = 0;
@@ -747,6 +750,17 @@ class HostPeer {
         // (v1.11) без DataChannel превью: кадры уходили только тем, кто эфир уже
         // смотрит (пир создаётся по join) — лишние JPEG, SCTP и размер оффера
         this.pc = new RTCPeerConnection(buildRtcConfig());
+        // канал обратной связи от зрителя (negotiated: без ondatachannel; старые версии
+        // его просто не откроют): сколько кадров его декодер реально успевает
+        try {
+            const fb = this.pc.createDataChannel("p2p-fb", { negotiated: true, id: 5, ordered: false, maxRetransmits: 0 });
+            fb.onmessage = ev => {
+                try {
+                    const m = JSON.parse(String(ev.data));
+                    if (m?.t === "rx") this.viewerRx = { recvFps: +m.recv || 0, decFps: +m.dec || 0, dropFps: +m.drop || 0, hw: !!m.hw, impl: String(m.impl ?? "?"), at: Date.now() };
+                } catch { /* ignore */ }
+            };
+        } catch { /* ignore */ }
 
         // Нативный звук идёт через буфер ~200 мс (ворклет), а метку времени RTP
         // получает уже на выходе из него — для WebRTC он «снят» на 200 мс позже,
@@ -1068,7 +1082,17 @@ class HostPeer {
                 const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now(), capBps: this.effSmooth }, ladder.length - 1);
                 this.cpuState = cr.state;
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
-                const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, cr.state.steps);
+                // декодер зрителя не успевает (по его обратной связи) — лестница вниз / смена кодека
+                this.viewerDecode ??= initViewerDecode(Date.now());
+                const rx = this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
+                if (rx) {
+                    const vd = nextViewerDecode(this.viewerDecode, rx, this.codecName, Date.now(), ladder.length - 1);
+                    this.viewerDecode = vd.state;
+                    if (vd.action === "codec" && this.switchCodec(`${vd.reason} — нужен кодек с аппаратным декодированием`)) return;
+                    if (vd.reason && vd.action !== "codec") logger.info(`Качество → ${this.userId}: ${vd.reason}`);
+                }
+                const steps = Math.min(ladder.length - 1, cr.state.steps + this.viewerDecode.steps);
+                const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, steps);
                 const rung = ladder[idx];
                 if (idx !== this.rungIdx && this.rungIdx >= 0) {
                     const why = cr.reason ?? (idx > this.rungIdx
@@ -1492,6 +1516,7 @@ export class WatchSession {
         if (hostRelays.length) logger.info(`Хост прислал TURN (${hostRelays.length}) — ретранслятор доступен, если прямой путь не пройдёт`);
         const pc = new RTCPeerConnection(buildRtcConfig(hostRelays));
         this.pc = pc;
+        try { this.fb = pc.createDataChannel("p2p-fb", { negotiated: true, id: 5, ordered: false, maxRetransmits: 0 }); } catch { this.fb = null; }
 
         pc.ondatachannel = e => {
             const dc = e.channel;
@@ -1585,14 +1610,37 @@ export class WatchSession {
      * спокойном канале возвращается к значению из настроек. Сглаживает рывки на
      * дальних неровных каналах ценой небольшой задержки.
      */
+    /** канал обратной связи стримеру (кадры: получено/декодировано/выброшено) */
+    private fb: RTCDataChannel | null = null;
+
     private startAdaptiveBuffer(pc: RTCPeerConnection): void {
         this.stopAdaptiveBuffer();
-        if (settings.store.autoQuality === false) return;
         const userMin = () => Number(settings.store.jitterBuffer) || 0;
         let st: RecvState = { targetMs: userMin(), calmSince: Date.now() };
         let prevFreezes = -1;
+        let prev: { recv: number; dec: number; drop: number; at: number; } | null = null;
         this.jbTimer = setInterval(async () => {
-            if (this.pc !== pc || settings.store.autoQuality === false) return;
+            if (this.pc !== pc) return;
+            // обратная связь стримеру: сколько кадров декодер реально успевает
+            try {
+                let recv = 0, dec = 0, drop = 0, impl = "?", hw = false;
+                (await pc.getStats()).forEach((r: any) => {
+                    if (r.type === "inbound-rtp" && r.kind === "video") {
+                        recv = r.framesReceived ?? 0;
+                        dec = r.framesDecoded ?? 0;
+                        drop = r.framesDropped ?? 0;
+                        impl = r.decoderImplementation ?? "?";
+                        hw = !!r.powerEfficientDecoder;
+                    }
+                });
+                const now = Date.now();
+                if (prev && this.fb?.readyState === "open" && now > prev.at) {
+                    const k = 1000 / (now - prev.at);
+                    this.fb.send(JSON.stringify({ t: "rx", recv: (recv - prev.recv) * k, dec: (dec - prev.dec) * k, drop: Math.max(0, drop - prev.drop) * k, hw, impl }));
+                }
+                prev = { recv, dec, drop, at: now };
+            } catch { /* ignore */ }
+            if (settings.store.autoQuality === false) return;
             try {
                 let freezes = 0, jitterMs = 0;
                 (await pc.getStats()).forEach((r: any) => {

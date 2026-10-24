@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -285,5 +285,21 @@ const MAX = 30e6;
     const sdp = ["v=0", "a=candidate:1 1 udp 2122260223 10.111.234.122 54321 typ host", "a=candidate:3 1 udp 1686052607 109.195.75.27 61000 typ srflx raddr 10.111.234.122 rport 54321", ""].join("\r\n");
     const r = removeVpnInSdp(sdp);
     check("режим «только прямой»: VPN-кандидаты убраны из SDP, srflx остался", !r.includes("10.111.234.122 54321 typ host") && r.includes("typ srflx"));
+}
+// --- обратная связь декодера зрителя (из 1.21.1) ---
+{
+    let v = initViewerDecode(0);
+    let a = nextViewerDecode(v, { recvFps: 60, decFps: 24, dropFps: 0, hw: false }, "av1", 10000, 14);
+    check("зритель: программный AV1 даёт 24 из 60 -> смена кодека сразу", a.action === "codec", a.reason);
+    v = initViewerDecode(0);
+    a = nextViewerDecode(v, { recvFps: 60, decFps: 40, dropFps: 0, hw: true }, "vp9", 10000, 14);
+    const b = nextViewerDecode(a.state, { recvFps: 60, decFps: 40, dropFps: 0, hw: true }, "vp9", 12000, 14);
+    check("зритель: аппаратный декодер не успевает 2 замера -> ступень ниже", a.action === null && b.action === "down" && b.state.steps === 1, b.reason);
+    const ok = nextViewerDecode(b.state, { recvFps: 60, decFps: 60, dropFps: 0, hw: true }, "vp9", 14000, 14);
+    check("зритель успевает -> сразу назад не прыгаем", ok.action === null && ok.state.steps === 1);
+    const back = nextViewerDecode(ok.state, { recvFps: 60, decFps: 60, dropFps: 0, hw: true }, "vp9", 60000, 14);
+    check("45 с без проблем -> ступень выше", back.action === "up" && back.state.steps === 0);
+    const stat = nextViewerDecode(initViewerDecode(0), { recvFps: 5, decFps: 5, dropFps: 0, hw: false }, "av1", 10000, 14);
+    check("статичный экран (5 FPS приходит) -> не проблема", stat.action === null && stat.state.strain === 0);
 }
 process.exit(failed ? 1 : 0);

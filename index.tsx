@@ -95,7 +95,7 @@ function collectDiagnostics(): string[] {
     push("своих P2P-эфиров", manager.host ? 1 : 0);
     push("просмотров", manager.watches.size);
     for (const [uid, peer] of manager.host?.peers ?? []) {
-        push(`  зритель ${uid}`, `conn=${peer.pc.connectionState}, ice=${peer.pc.iceConnectionState}, sig=${peer.pc.signalingState}, шифр=${peer.peerPk ? "да" : "нет"}, авто-качество: ${peer.aqCapBps ? `${(peer.aqCapBps / 1e6).toFixed(1)} Мбит/с, масштаб ÷${peer.aqScale.toFixed(2)}${peer.aqFps ? `, FPS ${peer.aqFps}` : ""}` : "ещё не активно"}`);
+        push(`  зритель ${uid}`, `conn=${peer.pc.connectionState}, ice=${peer.pc.iceConnectionState}, sig=${peer.pc.signalingState}, шифр=${peer.peerPk ? "да" : "нет"}, декодер зрителя: ${peer.viewerRx && Date.now() - peer.viewerRx.at < 5000 ? `показывает ${Math.round(peer.viewerRx.decFps - peer.viewerRx.dropFps)} из ${Math.round(peer.viewerRx.recvFps)} FPS (${peer.viewerRx.hw ? "аппаратный" : "программный"}, ${peer.viewerRx.impl})` : "нет данных"}, авто-качество: ${peer.aqCapBps ? `${(peer.aqCapBps / 1e6).toFixed(1)} Мбит/с, масштаб ÷${peer.aqScale.toFixed(2)}${peer.aqFps ? `, FPS ${peer.aqFps}` : ""}` : "ещё не активно"}`);
     }
     for (const w of manager.watches.values()) {
         const { pc } = w;
