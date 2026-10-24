@@ -413,19 +413,18 @@ export function nextJitterTarget(st: RecvState, s: RecvSample, userMinMs: number
 }
 
 /**
- * Стартовый битрейт сеанса (x-google-start-bitrate). С ним WebRTC в первую секунду
- * пробует канал на 3× и 6× от старта — по сути замер скорости при подключении.
- * Без него оценка канала стартовала с ~0.3 Мбит/с и росла ~8% в секунду: до
- * 30 Мбит/с — полминуты, и всё это время картинка была мыльной.
- * Старт — 80% последней рабочей скорости к этому зрителю, без истории — 12 Мбит/с
- * (хватает на 1080p60 сразу; на слабом канале оценка упадёт за секунду);
- * не меньше 2.5 и не больше максимума из настроек.
+ * Стартовый битрейт сеанса (x-google-start-bitrate). Как просил пользователь: сначала
+ * пробуем то, что задал стример (не больше 50 Мбит/с — дальше старт ничего не даёт),
+ * не тянет — оценка WebRTC за ~секунду падает до реально пропущенного (×0.85 от
+ * подтверждённого), дальше растёт сама. Идущий сеанс (перезапуск ICE, смена
+ * кодека) — с текущей скорости, без нового скачка.
+ * Раньше старт был ~0.3 Мбит/с и рост ~8%/с: полминуты «мыла».
  */
-export const DEFAULT_START_BPS = 12_000_000;
+export const MAX_START_BPS = 50_000_000;
 
-export function startBitrateBps(rememberedBps: number | null | undefined, userMaxBps: number): number {
-    const base = rememberedBps && rememberedBps > 0 ? rememberedBps * 0.8 : DEFAULT_START_BPS;
-    return Math.round(Math.max(2_500_000, Math.min(userMaxBps, base, 60_000_000)));
+export function startBitrateBps(currentBps: number | null | undefined, userMaxBps: number): number {
+    const base = currentBps && currentBps > 0 ? currentBps : Math.min(userMaxBps, MAX_START_BPS);
+    return Math.round(Math.max(2_500_000, Math.min(userMaxBps, base)));
 }
 
 /** Стартовый битрейт для видео в SDP: x-google-start-bitrate (кбит/с) в fmtp каждого
@@ -464,4 +463,75 @@ export function withStartBitrate(sdp: string, startKbps: number): string {
         out.push(l);
     }
     return out.join("\r\n");
+}
+
+/**
+ * Порядок видеокодеков в ответе зрителя — как в оффере стримера. Реальный случай
+ * 1.23.9: в «Авто» стример предлагал H.264 первым, а ответ Chrome 148 у зрителя
+ * ставил первым AV1 — отправка шла программным libaom (0.6 Мбит/с, мыло, 60 FPS
+ * не тянет). Кодек для отправки берётся первым из ответа, поэтому стример
+ * переставляет payload-ы ответа в порядке своего оффера (работает с любой версией
+ * у зрителя; набор кодеков не меняется — только порядок).
+ */
+export function reorderAnswerCodecs(answerSdp: string, offerSdp: string): string {
+    const offerM = /^m=video \S+ \S+ (.+)$/m.exec(offerSdp);
+    if (!offerM) return answerSdp;
+    const rank = new Map(offerM[1].trim().split(/\s+/).map((pt, i) => [pt, i] as const));
+    return answerSdp.replace(/^(m=video \S+ \S+ )(.+)$/m, (_all, head: string, pts: string) => {
+        const list = pts.trim().split(/\s+/);
+        const sorted = [...list].sort((a, b) => (rank.get(a) ?? 1e9) - (rank.get(b) ?? 1e9));
+        return head + sorted.join(" ");
+    });
+}
+
+/** Адрес из частной/VPN-сети: LAN, CGNAT/Tailscale (100.64/10), Hamachi (25/8), Radmin (26/8) */
+export function isPrivateOrVpnIPv4(ip: string): boolean {
+    const m = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(ip);
+    if (!m) return false;
+    const a = Number(m[1]), b = Number(m[2]);
+    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+        || (a === 100 && b >= 64 && b <= 127) || a === 25 || a === 26;
+}
+
+/** Разбор строки кандидата (с «a=» или без): приоритет, адрес, тип */
+function parseCandidate(line: string): { prio: number; ip: string; typ: string } | null {
+    const m = /candidate:\S+ \d+ \S+ (\d+) (\S+) \d+ typ (\S+)/.exec(line);
+    return m ? { prio: Number(m[1]), ip: m[2], typ: m[3] } : null;
+}
+
+/** Публичные адреса (srflx) из SDP или списка строк кандидатов */
+export function srflxIps(lines: string[]): Set<string> {
+    const out = new Set<string>();
+    for (const l of lines) {
+        const c = parseCandidate(l);
+        if (c && c.typ === "srflx") out.add(c.ip);
+    }
+    return out;
+}
+
+/** Пир в другой сети: оба публичных адреса известны и не совпадают */
+export function peerIsRemote(ourSrflx: Set<string>, peerSrflx: Set<string>): boolean {
+    if (!ourSrflx.size || !peerSrflx.size) return false;
+    for (const ip of peerSrflx) if (ourSrflx.has(ip)) return false;
+    return true;
+}
+
+/**
+ * Понизить приоритет host-кандидата пира с адресом из частной/VPN-сети, если пир
+ * в ДРУГОЙ сети (разные публичные адреса). Реальный случай 1.23.9: у обоих стоял
+ * VPN (10.111.234.x), ICE выбрал его как «локальную сеть» (host ↔ host, RTT 101 мс)
+ * вместо прямого пути через интернет, и оценка канала упиралась в ~6 Мбит/с.
+ * Тип-предпочтение 50: ниже srflx (100) — прямой путь в приоритете, но выше
+ * relay (0) — VPN остаётся запасным, если прямой путь не пробивается.
+ */
+export function demoteVpnCandidate(line: string): string {
+    const c = parseCandidate(line);
+    if (!c || c.typ !== "host" || !isPrivateOrVpnIPv4(c.ip)) return line;
+    const demoted = 50 * 2 ** 24 + (c.prio % 2 ** 24);
+    if (demoted >= c.prio) return line;
+    return line.replace(/(candidate:\S+ \d+ \S+ )\d+/, `$1${demoted}`);
+}
+
+export function demoteVpnInSdp(sdp: string): string {
+    return sdp.split("\r\n").map(l => (l.startsWith("a=candidate:") ? demoteVpnCandidate(l) : l)).join("\r\n");
 }

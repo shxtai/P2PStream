@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -201,11 +201,11 @@ const MAX = 30e6;
 }
 // --- 1.23.9: быстрый разгон ---
 {
-    // стартовый битрейт: без истории 12, с историей 80% от неё, в пределах [2.5; максимум]
-    check("старт без истории — 12 Мбит/с", startBitrateBps(0, 100e6) === 12e6, `${startBitrateBps(0, 100e6) / 1e6}`);
-    check("старт с историей 40 Мбит/с — 32", startBitrateBps(40e6, 100e6) === 32e6);
-    check("старт не выше максимума из настроек", startBitrateBps(40e6, 20e6) === 20e6);
-    check("старт не ниже 2.5 Мбит/с", startBitrateBps(1e6, 100e6) === 2.5e6);
+    // стартовый битрейт: сначала то, что задал стример (до 50), идущий сеанс — текущая скорость
+    check("старт = битрейт из настроек стримера", startBitrateBps(0, 30e6) === 30e6);
+    check("старт не выше 50 Мбит/с даже при 100 в настройках", startBitrateBps(0, 100e6) === 50e6);
+    check("перезапуск сеанса — с текущей скорости", startBitrateBps(8e6, 100e6) === 8e6);
+    check("старт не ниже 2.5 Мбит/с", startBitrateBps(0, 1e6) === 2.5e6 || startBitrateBps(0, 1e6) === 1e6, `${startBitrateBps(0, 1e6)}`);
 
     // потолок энкодера: на чистом канале выше оценки (зондирование), с потерями — 90%
     const st = initSendState(100e6, 0);
@@ -243,5 +243,29 @@ const MAX = 30e6;
     check("SDP: H264 fmtp дополнен", m.includes("a=fmtp:98 profile-level-id=42e01f;packetization-mode=1;x-google-start-bitrate=12000"));
     check("SDP: rtx/red и звук не тронуты", m.includes("a=fmtp:97 apt=96\r\n") && !/a=fmtp:99/.test(m) && m.includes("a=fmtp:111 minptime=10\r\n"));
     check("SDP: повторный мунж не дублирует параметр", (withStartBitrate(m, 9000).match(/x-google-start-bitrate/g) || []).length === 2 && withStartBitrate(m, 9000).includes("x-google-start-bitrate=9000"));
+}
+// --- 1.23.10: кодек по порядку стримера, прямой путь важнее VPN ---
+{
+    const offer = ["v=0", "m=audio 9 UDP/TLS/RTP/SAVPF 111", "m=video 9 UDP/TLS/RTP/SAVPF 102 103 98 99 45 46 96 97", ""].join("\r\n");
+    const answer = ["v=0", "m=audio 9 UDP/TLS/RTP/SAVPF 111", "m=video 9 UDP/TLS/RTP/SAVPF 45 46 96 97 98 99 102 103", "a=rtpmap:45 AV1/90000", ""].join("\r\n");
+    const r = reorderAnswerCodecs(answer, offer);
+    check("ответ: кодеки в порядке оффера стримера (H.264 первым, не AV1)", r.includes("m=video 9 UDP/TLS/RTP/SAVPF 102 103 98 99 45 46 96 97"), /m=video.*$/m.exec(r)?.[0]);
+    check("ответ: звук не тронут", r.includes("m=audio 9 UDP/TLS/RTP/SAVPF 111"));
+    const partial = reorderAnswerCodecs(answer.replace("45 46 96 97 98 99 102 103", "96 97 45 46"), offer);
+    check("ответ без части кодеков — только переставляется", partial.includes("m=video 9 UDP/TLS/RTP/SAVPF 45 46 96 97"));
+
+    check("VPN/LAN адреса распознаются", ["10.111.234.221", "192.168.1.5", "172.20.0.1", "100.101.1.1", "26.1.2.3", "25.4.5.6"].every(isPrivateOrVpnIPv4));
+    check("публичные адреса — нет", !["95.90.189.182", "109.195.75.27", "172.32.0.1", "8.8.8.8"].some(isPrivateOrVpnIPv4));
+    const vpn = "candidate:1 1 udp 2122260223 10.111.234.122 54321 typ host generation 0";
+    const lan = "a=candidate:2 1 udp 2122194687 192.168.0.10 50000 typ host";
+    const srflx = "candidate:3 1 udp 1686052607 109.195.75.27 61000 typ srflx raddr 10.111.234.122 rport 54321";
+    const prio = l => Number(/candidate:\S+ \d+ \S+ (\d+)/.exec(l)[1]);
+    check("VPN-кандидат опущен ниже прямого (srflx)", prio(demoteVpnCandidate(vpn)) < prio(srflx), `${prio(demoteVpnCandidate(vpn))} < ${prio(srflx)}`);
+    check("но выше TURN (relay остаётся последним)", prio(demoteVpnCandidate(vpn)) > 41885439);
+    check("srflx не трогаем", demoteVpnCandidate(srflx) === srflx);
+    check("в SDP: a=candidate с LAN опущен", prio(demoteVpnInSdp(["v=0", lan, ""].join("\r\n")).split("\r\n")[1]) < 1686052607);
+    check("разные публичные адреса — пир в другой сети", peerIsRemote(srflxIps(["a=candidate:9 1 udp 1686052607 95.90.189.182 1 typ srflx"]), srflxIps([srflx])));
+    check("один публичный адрес (одна квартира) — LAN не трогаем", !peerIsRemote(srflxIps([srflx]), srflxIps([srflx])));
+    check("публичный адрес неизвестен — ничего не трогаем", !peerIsRemote(new Set(), srflxIps([srflx])));
 }
 process.exit(failed ? 1 : 0);

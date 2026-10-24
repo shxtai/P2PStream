@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import * as DataStore from "@api/DataStore";
 import { Logger } from "@utils/Logger";
 import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
@@ -22,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -317,14 +316,6 @@ function sdpSessionId(sdp: string): string {
     return /^o=\S+ (\S+)/m.exec(sdp)?.[1] ?? "";
 }
 
-/** Последняя рабочая скорость к зрителю (бит/с): DataStore Vencord (localStorage Discord удаляет) */
-const BWE_KEY = (uid: string) => `P2PStream_bwe_${uid}`;
-async function rememberedBps(uid: string): Promise<number> {
-    try { return Number(await DataStore.get(BWE_KEY(uid))) || 0; } catch { return 0; }
-}
-function rememberBps(uid: string, bps: number): void {
-    try { void DataStore.set(BWE_KEY(uid), Math.round(bps)); } catch { /* ignore */ }
-}
 
 /** SDP-мунж: стерео Opus + максимальная полоса для музыки/звука без потерь */
 function mungeOpusStereo(sdp: string): string {
@@ -714,7 +705,6 @@ class HostPeer {
     private rungIdx = -1;
     private effSmooth = 0;
     private startLogged = false;
-    private lastRemember = 0;
     private cpuState: CpuState | null = null;
     private aqEmergency = false;
     private aqEmergencySince = 0;
@@ -756,6 +746,7 @@ class HostPeer {
         this.pc.onicecandidate = e => {
             if (e.candidate) {
                 this.iceBuf.push(e.candidate.toJSON());
+                this.localCandLines.push(e.candidate.candidate);
                 if (!this.bundling && !this.iceTimer) {
                     this.iceTimer = setTimeout(() => this.flushIce(), 120);
                 }
@@ -857,20 +848,28 @@ class HostPeer {
             // после ICE-restart remoteDescription уже есть (от прошлого раунда) —
             // проверяем только состояние, иначе answer на рестарт игнорировался
             if (this.pc.signalingState === "have-local-offer") {
-                // Старт оценки канала: идущий сеанс — с текущей сглаженной скорости,
-                // новый — с последней рабочей к этому зрителю (или 8 Мбит/с)
+                // Старт оценки канала — со скорости, заданной стримером (идущий сеанс —
+                // с текущей): не тянет — WebRTC за ~секунду опустится до реальной
                 const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
-                const startBps = startBitrateBps(this.effSmooth || await rememberedBps(this.userId), userMax);
-                const sdp = withStartBitrate(d.sdp, Math.round(startBps / 1000));
+                const startBps = startBitrateBps(this.effSmooth, userMax);
+                const offerSdp = this.pc.localDescription?.sdp ?? "";
+                let sdp = withStartBitrate(d.sdp, Math.round(startBps / 1000));
+                // кодек отправки = первый в ответе: ставим порядок НАШЕГО оффера (иначе
+                // Chrome зрителя выбирал программный AV1)
+                sdp = reorderAnswerCodecs(sdp, offerSdp);
+                // зритель в другой сети — его VPN/LAN-адреса в конец очереди ICE
+                const peerLines = [...d.sdp.split("\r\n"), ...(d.candidates ?? []).map(c => c.candidate ?? "")];
+                this.peerRemote = peerIsRemote(srflxIps(offerSdp.split("\r\n").concat(this.localCandLines)), srflxIps(peerLines));
+                if (this.peerRemote) sdp = demoteVpnInSdp(sdp);
                 if (!this.startLogged) {
                     this.startLogged = true;
-                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с (замер 3×/6× в первую секунду)`);
+                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.peerRemote ? "; зритель в другой сети — прямой путь важнее VPN/LAN-адресов" : ""}`);
                 }
                 await this.pc.setRemoteDescription({ type: "answer", sdp });
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
                 this.pendingIce = [];
                 for (const c of queue) {
-                    try { await this.pc.addIceCandidate(c); } catch { /* ignore */ }
+                    try { await this.pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
                 }
             }
         } catch (e) {
@@ -884,8 +883,17 @@ class HostPeer {
             return;
         }
         for (const c of candidates) {
-            try { await this.pc.addIceCandidate(c); } catch { /* ignore */ }
+            try { await this.pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
         }
+    }
+
+    /** зритель в другой сети (разные публичные адреса) — см. demoteVpnCandidate */
+    private peerRemote = false;
+    /** наши кандидаты строками (для своего публичного адреса) */
+    private localCandLines: string[] = [];
+
+    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit {
+        return this.peerRemote && c.candidate ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
     }
 
     /**
@@ -987,11 +995,6 @@ class HostPeer {
                 // srcFps — сколько кадров реально подаёт захват (не путать статичный экран с провалом)
                 const srcFps = srcFrames / 2;
                 const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now(), capBps: this.effSmooth }, ladder.length - 1);
-                // запоминаем рабочую скорость к зрителю (раз в 10 с, только на чистом канале)
-                if ((loss ?? 0) < 0.02 && Date.now() - this.lastRemember > 10_000 && this.effSmooth > 0) {
-                    this.lastRemember = Date.now();
-                    rememberBps(this.userId, this.effSmooth);
-                }
                 this.cpuState = cr.state;
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
                 const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, cr.state.steps);
@@ -1346,14 +1349,19 @@ export class WatchSession {
             };
             sendSignals(this.host.channelId, answerSig);
 
+            // стример в другой сети — его VPN/LAN-адреса в конец очереди ICE (прямой путь важнее)
+            const ours = srflxIps((pc.localDescription?.sdp ?? "").split("\r\n"));
+            const theirs = srflxIps([...d.sdp.split("\r\n"), ...hostCandidates.map(c => c.candidate ?? ""), ...this.pendingIce.map(c => c.candidate ?? "")]);
+            this.hostRemote = peerIsRemote(ours, theirs);
+
             for (const c of hostCandidates) {
-                try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+                try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
             }
 
             const queue = this.pendingIce;
             this.pendingIce = [];
             for (const c of queue) {
-                try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+                try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
             }
         } catch (e) {
             logger.error("Ошибка обработки оффера:", e);
@@ -1369,8 +1377,15 @@ export class WatchSession {
             return;
         }
         for (const c of candidates) {
-            try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+            try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
         }
+    }
+
+    /** стример в другой сети (разные публичные адреса) — см. demoteVpnCandidate */
+    private hostRemote = false;
+
+    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit {
+        return this.hostRemote && c.candidate ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
     }
 
     /** Отправить накопленных кандидатов одной пачкой (батчинг как у хоста) */
@@ -1460,7 +1475,10 @@ export class WatchSession {
     audioLeadMs(): number {
         const meta: any = this.mgr.liveHosts.get(this.host.streamId)?.meta ?? this.host.meta;
         const ad = Number(meta?.ad);
-        return Number.isFinite(ad) && ad > 0 ? Math.min(500, Math.round(ad)) : 0;
+        const auto = Number.isFinite(ad) && ad > 0 ? Math.min(500, Math.round(ad)) : 0;
+        // ручная подстройка из настроек (+ — видео позже, − — раньше)
+        const extra = Number(settings.store.avSyncOffset) || 0;
+        return Math.max(0, Math.min(800, auto + extra));
     }
 
     private appliedLead = -1;
@@ -1473,11 +1491,12 @@ export class WatchSession {
         const base = this.jitterTargetMs || Number(settings.store.jitterBuffer) || 0;
         const lead = this.audioLeadMs();
         // анонс приходит раз в 8 с — мелкие колебания уровня (±20 мс) не трогаем
-        if (Math.abs(lead - this.appliedLead) < 25 && base === this.appliedBase) return;
+        if (Math.abs(lead - this.appliedLead) < 40 && base === this.appliedBase) return;
+        const loud = this.appliedLead < 0 || Math.abs(lead - this.appliedLead) >= 80 || base !== this.appliedBase;
         this.appliedLead = lead;
         this.appliedBase = base;
         applyReceiverDelays(pc, base, lead);
-        if (lead) logger.info(`Видео задержано на ${lead} мс под звук стримера (буфер ${base} мс)`);
+        if (lead && loud) logger.info(`Видео задержано на ${lead} мс под звук стримера (буфер ${base} мс)`);
     }
 
     /**
@@ -2023,7 +2042,9 @@ export class P2PManager {
         const payload = { v: 1 as const, t: "announce" as const, s: host.streamId, from: myId(), _route: route };
         // ad — задержка нативного звука на стороне стримера (мс): зритель
         // задерживает на неё видео, чтобы звук не отставал от картинки
-        const ad = Math.max(0, Math.min(500, Math.round(host.nativeAudio?.stats?.().levelMs ?? 0)));
+        // усреднённый уровень, округлённый до 10 мс: стабильный сдвиг видео у зрителя
+        const st = host.nativeAudio?.stats?.();
+        const ad = Math.max(0, Math.min(500, Math.round((st?.avgMs || st?.levelMs || 0) / 10) * 10));
         const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId, ...(ad ? { ad } : {}) };
         // Приватный стрим: публикуем announce только в топик стрима (не в канал)
         if (settings.store.privateStream) {

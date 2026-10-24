@@ -111,6 +111,17 @@ if (role === "host") {
         if (q.has("switch")) setTimeout(() => report("OUT", `switchCodec: ${peer.switchCodec("тест стенда")}`), 6000);
     }, 500);
 } else {
+    // ?viewerav1 — Chrome зрителя сам ставит AV1 первым в ответе (как Chrome 148 в Discord):
+    // стример должен всё равно слать свой первый кодек (H.264), а не программный AV1
+    if (q.has("viewerav1")) {
+        const orig = RTCPeerConnection.prototype.createAnswer;
+        RTCPeerConnection.prototype.createAnswer = function (...a) {
+            const caps = RTCRtpReceiver.getCapabilities("video").codecs;
+            const av1 = caps.filter(c => /av1/i.test(c.mimeType)), rest = caps.filter(c => !/av1/i.test(c.mimeType));
+            for (const t of this.getTransceivers()) if (t.receiver.track?.kind === "video") { try { t.setCodecPreferences([...av1, ...rest]); } catch { } }
+            return orig.apply(this, a);
+        };
+    }
     void probeNat().then(r => status(`NAT: ${r}`));
     let t0 = Date.now(); // сбрасывается в момент watch(): меряем подключение, а не ожидание анонса
     const video = Object.assign(document.createElement("video"), { muted: true, autoplay: true });
@@ -144,6 +155,13 @@ if (role === "host") {
                     w.dropCodec(droppedCodec);
                     video.srcObject = null;
                     return;
+                }
+                if (q.has("viewerav1")) {
+                    const st = await w.pc.getStats();
+                    let id = ""; st.forEach(r => { if (r.type === "inbound-rtp" && r.kind === "video") id = r.codecId; });
+                    const mime = String(st.get(id)?.mimeType ?? "").toLowerCase();
+                    if (mime.includes("av1")) { clearInterval(tick); status("FAIL: стример шлёт AV1 — порядок кодеков взят из ответа зрителя"); return; }
+                    report("IN ", `кодек при AV1-первом зрителе: ${mime}`);
                 }
                 if (q.get("ad")) {
                     // анонс с ad приходит раз в 8 с — ждём, пока сдвиг применится

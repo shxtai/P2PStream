@@ -99,7 +99,7 @@ function collectDiagnostics(): string[] {
     }
     for (const w of manager.watches.values()) {
         const { pc } = w;
-        push(`  просмотр ${w.host.name}`, `буфер ${w.jitterTargetMs} мс, state=${w.state}, ${pc ? `conn=${pc.connectionState}, ice=${pc.iceConnectionState}, sig=${pc.signalingState}` : "оффер от хоста НЕ получен"}, дорожек=${w.stream.getTracks().length}, хост v${w.host.hostVersion ?? "?"} via ${w.host.via ?? "?"}`);
+        push(`  просмотр ${w.host.name}`, `буфер ${w.jitterTargetMs} мс, сдвиг видео под звук ${w.audioLeadMs()} мс, state=${w.state}, ${pc ? `conn=${pc.connectionState}, ice=${pc.iceConnectionState}, sig=${pc.signalingState}` : "оффер от хоста НЕ получен"}, дорожек=${w.stream.getTracks().length}, хост v${w.host.hostVersion ?? "?"} via ${w.host.via ?? "?"}`);
     }
     push("нативные плитки", settings.store.nativeTiles);
     push("нативный плеер", settings.store.nativePlayer === false ? "выключен — просмотр в своём окне" : "вкл — P2P в штатном плеере Discord (фолбэк: свой)");

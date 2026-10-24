@@ -38,6 +38,9 @@ export interface NativeAudioHandle {
 export interface NativeAudioStats {
     /** текущий уровень кольцевого буфера, мс */
     levelMs: number;
+    /** усреднённый уровень (~5 с) — по нему зрители сдвигают видео: мгновенный
+     *  скакал 180–290 мс между анонсами, и сдвиг видео «плавал» */
+    avgMs: number;
     /** сколько раз хелпер перезапускался вотчдогом */
     restarts: number;
     /** main-процесс сообщил о смерти хелпера */
@@ -184,6 +187,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
 
     const st = {
         levelMs: 0,
+        avgMs: 0,
         restarts: 0,
         dead: false,
         silenceMs: 0,
@@ -233,7 +237,10 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         const dest = ctx.createMediaStreamDestination();
         node.connect(dest);
         node.port.onmessage = e => {
-            if (typeof e.data === "number") st.levelMs = e.data;
+            if (typeof e.data !== "number") return;
+            st.levelMs = e.data;
+            // ~10 замеров/с: постоянная времени ~5 с; провалы (0 = копим заново) не тянут вниз
+            if (e.data > 0) st.avgMs = st.avgMs ? st.avgMs * 0.98 + e.data * 0.02 : e.data;
         };
 
         let stopped = false;
@@ -313,6 +320,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
             stats(): NativeAudioStats {
                 return {
                     levelMs: st.levelMs,
+                    avgMs: Math.round(st.avgMs),
                     restarts: st.restarts,
                     dead: st.dead,
                     silenceMs: st.silenceMs,
