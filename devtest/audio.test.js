@@ -12,7 +12,7 @@ const { execSync } = require("child_process");
 function workletFrom(src) {
     const code = src.split("const WORKLET_SRC = `")[1].split("`;")[0];
     let Cls;
-    const g = { AudioWorkletProcessor: class { constructor() { this.port = {}; } }, registerProcessor: (_n, c) => { Cls = c; } };
+    const g = { AudioWorkletProcessor: class { constructor() { this.reported = []; this.port = { postMessage: v => this.reported.push(v) }; } }, registerProcessor: (_n, c) => { Cls = c; } };
     new Function("AudioWorkletProcessor", "registerProcessor", code)(g.AudioWorkletProcessor, g.registerProcessor);
     const pull = Number(/const PULL_INTERVAL_MS = (\d+)/.exec(src)?.[1] ?? 20);
     return { Cls, pull };
@@ -63,7 +63,10 @@ function simulate({ Cls, pull }, seed, seconds = 60) {
         }
     }
     const dropped = pushed - played - w.count / 2 - pending.reduce((a, p) => a + p.frames, 0);
-    return { dropouts, silentMs: Math.round(silentBlocks * blockMs), droppedMs: Math.round(Math.max(0, dropped) / 48), lagMs: Math.round(lagSum / lagN) };
+    // 1.23.7: ворклет сообщает уровень буфера (по нему зритель сдвигает видео под звук)
+    const rep = w.reported ?? [];
+    const reportedMs = rep.length ? Math.round(rep.slice(-50).reduce((a, v) => a + v, 0) / Math.min(50, rep.length)) : -1;
+    return { reportedMs, reports: rep.length, dropouts, silentMs: Math.round(silentBlocks * blockMs), droppedMs: Math.round(Math.max(0, dropped) / 48), lagMs: Math.round(lagSum / lagN) };
 }
 let pending = [];
 
@@ -82,4 +85,10 @@ const ok = sum(b, "dropouts") <= sum(a, "dropouts") / 3 && sum(b, "droppedMs") <
 console.log(`${ok ? "✔" : "✘"} провалов звука под нагрузкой стало минимум втрое меньше и ничего лишнего не выбрасывается`);
 const lagOk = Math.round(sum(b, "lagMs") / b.length) <= 250;
 console.log(`${lagOk ? "✔" : "✘"} добавленная задержка звука в разумных пределах (≤ 250 мс)`);
-process.exit(ok && lagOk ? 0 : 1);
+// уровень, который ворклет сообщает наружу, совпадает с реальной задержкой (±40 мс):
+// по нему зритель задерживает видео — неверное значение дало бы рассинхрон
+const repMs = Math.round(b.reduce((a, r) => a + r.reportedMs, 0) / b.length);
+const realMs = Math.round(sum(b, "lagMs") / b.length);
+const repOk = b.every(r => r.reports > 100) && Math.abs(repMs - realMs) <= 40;
+console.log(`${repOk ? "✔" : "✘"} ворклет сообщает уровень буфера: ${repMs} мс (реально ~${realMs} мс)`);
+process.exit(ok && lagOk && repOk ? 0 : 1);

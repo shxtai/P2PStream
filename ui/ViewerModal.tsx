@@ -15,11 +15,13 @@ import { openMiniPlayer } from "./MiniPlayer";
 export function openViewerModal(session: WatchSession): void {
     if (openSessions.has(session.host.streamId)) return;
     openSessions.add(session.host.streamId);
+    manager.bump(); // плашка этого эфира прячется, пока открыто окно (иначе лежит поверх его кнопок)
     openModal(
         props => <ViewerModal modalProps={props} session={session} />,
         {
             onCloseCallback: () => {
                 openSessions.delete(session.host.streamId);
+                manager.bump();
                 // закрытие модалки НЕ останавливает просмотр — эфир продолжает
                 // играть в компактном мини-плеере («панелька где-то сбоку»)
                 if (manager.watches.get(session.host.streamId) !== session) return;
@@ -35,6 +37,11 @@ export function openViewerModal(session: WatchSession): void {
 }
 
 const openSessions = new Set<string>();
+
+/** Открыто ли окно просмотра этого эфира (плашка в это время не нужна) */
+export function isViewerOpen(streamId: string): boolean {
+    return openSessions.has(streamId);
+}
 
 function useForceRender() {
     const [, force] = React.useReducer((x: number) => x + 1, 0);

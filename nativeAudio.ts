@@ -87,6 +87,7 @@ class VcP2pRing extends AudioWorkletProcessor {
            рендерера под нагрузкой игры (до 180 мс). */
         this.target = 48000 * 2 * 0.20;
         this.levelMs = 0;
+        this.reportTick = 0;
         this.buffering = true;
         this.buf = new Float32Array(this.cap);
         this.read = 0;
@@ -148,6 +149,12 @@ class VcP2pRing extends AudioWorkletProcessor {
                 }
             }
             this.levelMs = Math.round(this.count / 2 / 48);
+        }
+        /* уровень буфера наружу (~раз в 100 мс): по нему зрители задерживают видео
+           под звук, и его показывает /p2p-doctor (раньше там всегда было 0 мс) */
+        if (++this.reportTick >= 38) {
+            this.reportTick = 0;
+            this.port.postMessage(this.buffering ? 0 : this.levelMs);
         }
         return true;
     }
@@ -225,6 +232,9 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         });
         const dest = ctx.createMediaStreamDestination();
         node.connect(dest);
+        node.port.onmessage = e => {
+            if (typeof e.data === "number") st.levelMs = e.data;
+        };
 
         let stopped = false;
         let pulling = false; // запросы не внахлёст: иначе куски PCM могли прийти не по порядку

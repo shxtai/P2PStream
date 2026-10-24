@@ -17,6 +17,7 @@ import { cl } from "../css";
 import { type LiveHost, manager, type WatchSession } from "../engine";
 import { settings } from "../settings";
 import { PLUGIN_VERSION, toast } from "../utils";
+import { isViewerOpen } from "./ViewerModal";
 
 const logger = new Logger("P2PStream:Bars");
 
@@ -96,6 +97,7 @@ function BarsRoot() {
     const hosts = [...manager.liveHosts.values()]
         .filter(h => h.channelId === voiceId)
         .filter(h => !native || h.streamId !== manager.host?.streamId)
+        .filter(h => !isViewerOpen(h.streamId))
         .sort((a, b) => a.name.localeCompare(b.name));
     if (!hosts.length) return null;
 

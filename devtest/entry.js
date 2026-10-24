@@ -64,7 +64,12 @@ if (role === "host") {
         f++;
         ctx.fillStyle = "#fff"; ctx.font = "48px sans-serif"; ctx.fillText(String(f), 40, 100);
     }, 33);
-    void manager.startShareWithCapture(canvas.captureStream(30), null).then(() => status("host started"));
+    void manager.startShareWithCapture(canvas.captureStream(30), null).then(() => {
+        // ?ad=N — имитация буфера нативного звука стримера (N мс): зритель должен
+        // задержать видео на N (в браузере стенда нативного хелпера нет)
+        if (q.get("ad") && manager.host) manager.host.nativeAudio = { track: null, stats: () => ({ levelMs: Number(q.get("ad")) }), stop() { } };
+        status("host started");
+    });
     // отчёт /p2p-doctor хоста через 4 с после соединения со зрителем
     let reported = false;
     const watchPeers = setInterval(() => {
@@ -80,7 +85,14 @@ if (role === "host") {
     void probeNat().then(r => status(`NAT: ${r}`));
     let t0 = Date.now(); // сбрасывается в момент watch(): меряем подключение, а не ожидание анонса
     const video = Object.assign(document.createElement("video"), { muted: true, autoplay: true });
-    const tick = setInterval(() => {
+    let droppedCodec = "";
+    let busy = false;
+    const tick = setInterval(async () => {
+        if (busy) return;
+        busy = true;
+        try { await viewerTick(); } finally { busy = false; }
+    }, 500);
+    async function viewerTick() {
         const host = [...manager.liveHosts.values()][0];
         if (host && !manager.watches.size) { t0 = Date.now(); manager.watch(host.streamId); }
         const w = [...manager.watches.values()][0];
@@ -90,6 +102,31 @@ if (role === "host") {
                 void video.play().catch(() => { });
             }
             if (w.state === "live" && video.videoWidth > 0 && video.currentTime > 1) {
+                // ?dropcodec — сторож чёрного экрана: объявляем текущий кодек «не
+                // декодируется», ждём переподключения и видео уже другим кодеком
+                if (q.has("dropcodec") && !droppedCodec && w.pc) {
+                    const st = await w.pc.getStats();
+                    let id = ""; st.forEach(r => { if (r.type === "inbound-rtp" && r.kind === "video") id = r.codecId; });
+                    droppedCodec = String(st.get(id)?.mimeType ?? "").toLowerCase().replace("video/", "");
+                    report("IN ", `сторож: объявляю ${droppedCodec} недекодируемым`);
+                    w.dropCodec(droppedCodec);
+                    video.srcObject = null;
+                    return;
+                }
+                if (q.get("ad")) {
+                    // анонс с ad приходит раз в 8 с — ждём, пока сдвиг применится
+                    const vr = w.pc.getReceivers().find(r => r.track?.kind === "video");
+                    const jb = vr?.jitterBufferTarget;
+                    if (jb !== Number(q.get("ad"))) { if (Date.now() - t0 < 40_000) return; clearInterval(tick); status(`FAIL: видео не задержано под звук (jitterBufferTarget=${jb})`); return; }
+                    report("IN ", `видео задержано под звук: jitterBufferTarget=${jb} мс`);
+                }
+                if (droppedCodec) {
+                    const st = await w.pc.getStats();
+                    let id = ""; st.forEach(r => { if (r.type === "inbound-rtp" && r.kind === "video") id = r.codecId; });
+                    const now = String(st.get(id)?.mimeType ?? "").toLowerCase().replace("video/", "");
+                    if (now === droppedCodec) { clearInterval(tick); status(`FAIL: после сторожа всё ещё ${now}`); return; }
+                    report("IN ", `сторож: после переподключения кодек ${now}`);
+                }
                 clearInterval(tick);
                 const secs = ((Date.now() - t0) / 1000).toFixed(1);
                 void (async () => {
@@ -106,5 +143,5 @@ if (role === "host") {
             clearInterval(tick);
             status(`FAIL: state=${w?.state} pc=${w?.pc?.connectionState}`);
         }
-    }, 500);
+    }
 }

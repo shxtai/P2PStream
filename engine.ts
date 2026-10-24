@@ -576,9 +576,11 @@ function waitIceGathering(pc: RTCPeerConnection, ms: number): Promise<void> {
     });
 }
 
-function applyReceiveLatency(pc: RTCPeerConnection): void {
-    const target = Number(settings.store.jitterBuffer) || 0;
+/** Задержки приёмников: звук — baseMs, видео — baseMs + audioLeadMs (столько
+ *  звук стримера сидит в его буфере, см. meta.ad). Видео ждёт звук, а не наоборот. */
+function applyReceiverDelays(pc: RTCPeerConnection, baseMs: number, audioLeadMs = 0): void {
     for (const receiver of pc.getReceivers()) {
+        const target = Math.min(4000, baseMs + (receiver.track?.kind === "video" ? audioLeadMs : 0));
         try {
             (receiver as any).jitterBufferTarget = target;
         } catch { /* ignore */ }
@@ -720,8 +722,21 @@ class HostPeer {
         // смотрит (пир создаётся по join) — лишние JPEG, SCTP и размер оффера
         this.pc = new RTCPeerConnection(buildRtcConfig());
 
+        // Нативный звук идёт через буфер ~200 мс (ворклет), а метку времени RTP
+        // получает уже на выходе из него — для WebRTC он «снят» на 200 мс позже,
+        // чем на самом деле. Если звук и видео в одном MediaStream, синхронизация
+        // зрителя выравнивает их по этим меткам и звук стабильно отстаёт от
+        // картинки. Поэтому нативный звук — отдельным потоком (без синхрогруппы),
+        // а зритель сам задерживает видео на уровень буфера (meta.ad в анонсе).
+        const nativeTrack = host.nativeAudio?.track ?? null;
+        const audioOnly = nativeTrack ? new MediaStream() : null;
         for (const track of host.capture.getTracks()) {
-            this.pc.addTrack(track, host.capture);
+            if (audioOnly && track === nativeTrack) {
+                audioOnly.addTrack(track);
+                this.pc.addTrack(track, audioOnly);
+            } else {
+                this.pc.addTrack(track, host.capture);
+            }
         }
         applyVideoCodecPreference(this.pc, String(settings.store.codec));
 
@@ -1246,7 +1261,7 @@ export class WatchSession {
             if (this.state === "failed") this.setState("connecting");
 
             await pc.setRemoteDescription({ type: "offer", sdp: d.sdp });
-            applyReceiveLatency(pc);
+            this.applyDelays();
 
             // Кандидаты хоста добавляем ПОСЛЕ сбора своих (ниже). Проверено в Chrome:
             // если удалённые кандидаты добавлены до createAnswer, отвечающая сторона
@@ -1255,6 +1270,7 @@ export class WatchSession {
             // зрителя: соединение между разными сетями не собиралось никогда.
             const hostCandidates = d.candidates ?? [];
 
+            this.excludeBadCodecs(pc);
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
@@ -1370,6 +1386,7 @@ export class WatchSession {
             if (st === "connected") {
                 void logSelectedPair(pc, `просмотр ${this.host.name}`);
                 this.startAdaptiveBuffer(pc);
+                this.startDecodeWatch(pc);
                 this.setState("live");
             } else if (st === "disconnected") {
                 this.setState("reconnecting");
@@ -1380,6 +1397,32 @@ export class WatchSession {
             }
             this.mgr.bump();
         };
+    }
+
+    /** Сколько звук стримера сидит в его буфере (мс, из свежего анонса). 0 — у
+     *  стримера нет нативного звука или он старой версии (звук и видео там в одной
+     *  синхрогруппе, и сдвиг видео синхронизация всё равно отменила бы). */
+    audioLeadMs(): number {
+        const meta: any = this.mgr.liveHosts.get(this.host.streamId)?.meta ?? this.host.meta;
+        const ad = Number(meta?.ad);
+        return Number.isFinite(ad) && ad > 0 ? Math.min(500, Math.round(ad)) : 0;
+    }
+
+    private appliedLead = -1;
+    private appliedBase = -1;
+
+    /** Применить задержки приёмников (буфер джиттера + сдвиг видео под звук) */
+    applyDelays(): void {
+        const pc = this.pc;
+        if (!pc) return;
+        const base = this.jitterTargetMs || Number(settings.store.jitterBuffer) || 0;
+        const lead = this.audioLeadMs();
+        // анонс приходит раз в 8 с — мелкие колебания уровня (±20 мс) не трогаем
+        if (Math.abs(lead - this.appliedLead) < 25 && base === this.appliedBase) return;
+        this.appliedLead = lead;
+        this.appliedBase = base;
+        applyReceiverDelays(pc, base, lead);
+        if (lead) logger.info(`Видео задержано на ${lead} мс под звук стримера (буфер ${base} мс)`);
     }
 
     /**
@@ -1408,10 +1451,8 @@ export class WatchSession {
                 const next = nextJitterTarget(st, { freezes: newFreezes, jitterMs, now: Date.now() }, userMin());
                 if (next.targetMs !== st.targetMs) {
                     logger.info(`Буфер зрителя: ${st.targetMs} → ${next.targetMs} мс${newFreezes ? ` (заморозок +${newFreezes})` : ""}, джиттер ${Math.round(jitterMs)} мс`);
-                    for (const rcv of pc.getReceivers()) {
-                        try { (rcv as any).jitterBufferTarget = next.targetMs; } catch { /* ignore */ }
-                    }
                     this.jitterTargetMs = next.targetMs;
+                    this.applyDelays();
                 }
                 st = next;
             } catch { /* следующий тик */ }
@@ -1425,6 +1466,7 @@ export class WatchSession {
     /** Закрыть текущий pc и убрать его дорожки из stream (перед новой сессией) */
     private resetPc(): void {
         this.stopAdaptiveBuffer();
+        this.stopDecodeWatch();
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
         this.iceBuf = [];
         this.pendingIce = [];
@@ -1434,6 +1476,93 @@ export class WatchSession {
             try { this.stream.removeTrack(t); } catch { /* ignore */ }
         }
     }
+
+    // region «видео идёт, а кадров нет»
+    /** Кодеки, которые у этого зрителя не декодировались — исключаются из ответа */
+    private badCodecs = new Set<string>();
+    private decodeTimer: NodeJS.Timeout | undefined;
+
+    /**
+     * Сторож чёрного экрана. Реальный случай (1.23): байты видео идут (~5 Мбит/с),
+     * а декодировано 0 кадров — «H264 · 0×0 · 0 FPS». Похоже на аппаратный H.264
+     * стримера, который декодер зрителя не берёт; хостовая эвристика по PLI на
+     * это не срабатывала. Зритель сам решает: 3 замера подряд (≈6 с) «байты есть,
+     * кадров нет» → переподключение без этого кодека. Работает и со старой версией
+     * у стримера: что слать, решает ответ зрителя.
+     */
+    private startDecodeWatch(pc: RTCPeerConnection): void {
+        this.stopDecodeWatch();
+        let prevBytes = -1, prevDecoded = -1, strikes = 0;
+        this.decodeTimer = setInterval(async () => {
+            if (this.pc !== pc) return;
+            try {
+                let bytes = 0, decoded = 0, codecId = "";
+                const report = await pc.getStats();
+                report.forEach((r: any) => {
+                    if (r.type === "inbound-rtp" && r.kind === "video") {
+                        bytes += r.bytesReceived ?? 0;
+                        decoded += r.framesDecoded ?? 0;
+                        codecId = r.codecId ?? codecId;
+                    }
+                });
+                const mime = String((report.get(codecId) as any)?.mimeType ?? "").toLowerCase().replace("video/", "");
+                if (prevBytes >= 0) {
+                    const gotBytes = bytes - prevBytes > 50_000;
+                    const gotFrames = decoded - prevDecoded > 0;
+                    strikes = gotBytes && !gotFrames ? strikes + 1 : 0;
+                }
+                prevBytes = bytes;
+                prevDecoded = decoded;
+                if (strikes >= 3 && mime) {
+                    strikes = 0;
+                    this.dropCodec(mime);
+                }
+            } catch { /* следующий тик */ }
+        }, 2000);
+    }
+
+    private stopDecodeWatch(): void {
+        if (this.decodeTimer) { clearInterval(this.decodeTimer); this.decodeTimer = undefined; }
+    }
+
+    private dropCodec(mime: string): void {
+        this.badCodecs.add(mime);
+        const left = (RTCRtpReceiver.getCapabilities?.("video")?.codecs ?? [])
+            .map(c => c.mimeType.toLowerCase().replace("video/", ""))
+            .filter((c, i, a) => !/^(rtx|red|ulpfec|flexfec)/.test(c) && !this.badCodecs.has(c) && a.indexOf(c) === i);
+        if (!left.length) {
+            logger.warn(`Видео ${mime.toUpperCase()} не декодируется, других кодеков нет`);
+            toast("Видео приходит, но не декодируется ни одним кодеком", "critical");
+            return;
+        }
+        logger.warn(`Видео ${mime.toUpperCase()} приходит, но не декодируется — переподключаюсь без него (останутся: ${left.join(", ")})`);
+        toast(`Видео ${mime.toUpperCase()} не декодируется — переключаю кодек`);
+        // как reconnect(), но без счётчика сетевых перезапусков: сеть тут в порядке
+        this.stopJoinLoop();
+        this.resetPc();
+        this.setState("reconnecting");
+        this.startJoinLoop();
+    }
+
+    /** До createAnswer: убрать из ответа кодеки, которые здесь не декодировались */
+    private excludeBadCodecs(pc: RTCPeerConnection): void {
+        if (!this.badCodecs.size) return;
+        const caps = RTCRtpReceiver.getCapabilities?.("video")?.codecs ?? [];
+        // запасные — в том же порядке, что и у хоста при сбое (fallbackCodec): VP9 → VP8 → …
+        const order = ["vp9", "vp8", "av1", "h265", "h264"];
+        const rank = (c: RTCRtpCodec) => {
+            const i = order.indexOf(c.mimeType.toLowerCase().replace("video/", ""));
+            return i < 0 ? order.length : i;
+        };
+        const keep = caps
+            .filter(c => !this.badCodecs.has(c.mimeType.toLowerCase().replace("video/", "")))
+            .sort((a, b) => rank(a) - rank(b));
+        for (const t of pc.getTransceivers()) {
+            if (t.receiver.track?.kind !== "video") continue;
+            try { t.setCodecPreferences(keep); } catch (e) { logger.debug("setCodecPreferences (ответ):", e); }
+        }
+    }
+    // endregion
 
     private reconnect(): void {
         if (this.restarts >= 2) {
@@ -1451,6 +1580,7 @@ export class WatchSession {
     stop(sendLeave = true): void {
         this.stopJoinLoop();
         this.stopAdaptiveBuffer();
+        this.stopDecodeWatch();
         // недоставленные join/answer/ice этому хосту больше не нужны
         cancelPending(sig => sig.to === this.host.userId && sig.s === this.host.streamId && sig.t !== "leave");
         if (this.iceTimer) { clearTimeout(this.iceTimer); this.iceTimer = undefined; }
@@ -1828,7 +1958,10 @@ export class P2PManager {
             this.lastChatAnnounce = now;
         }
         const payload = { v: 1 as const, t: "announce" as const, s: host.streamId, from: myId(), _route: route };
-        const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId };
+        // ad — задержка нативного звука на стороне стримера (мс): зритель
+        // задерживает на неё видео, чтобы звук не отставал от картинки
+        const ad = Math.max(0, Math.min(500, Math.round(host.nativeAudio?.stats?.().levelMs ?? 0)));
+        const data = { ...this.host!.meta, av: PLUGIN_VERSION, channelId: host.channelId, ...(ad ? { ad } : {}) };
         // Приватный стрим: публикуем announce только в топик стрима (не в канал)
         if (settings.store.privateStream) {
             const allowedViewers = String(settings.store.allowedViewers ?? "").split(",").map(s => s.trim()).filter(Boolean);
@@ -1926,6 +2059,8 @@ export class P2PManager {
                     hostVersion: typeof sig.d?.av === "string" ? sig.d.av : undefined,
                     via
                 });
+                // свежий уровень буфера звука стримера → сдвиг видео у идущего просмотра
+                this.watches.get(sig.s)?.applyDelays();
 
                 if (!prev && channelId === voice) {
                     if (settings.store.notifyLive) {
