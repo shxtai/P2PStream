@@ -171,8 +171,11 @@ export function nextEncoderStall(count: number, s: { srcFrames: number; encFrame
 }
 
 /** Следующий кодек при сбое декодирования: от «тяжёлого/капризного» к самому совместимому */
-export function fallbackCodec(current: string, tried: string[]): string | null {
-    const chain = ["vp9", "vp8", "h264"];
+export function fallbackCodec(current: string, tried: string[], available?: string[]): string | null {
+    // (1.23.11) сначала H.265: кодируется и декодируется на видеокартах, как H.264,
+    // а программный VP9 (libvpx) на 1080p60 не тянул процессор — реальный лог: после
+    // сбоя H.264 картинка скатилась до 720p@45. VP9/VP8 — дальше, если H.265 нет.
+    const chain = ["h265", "vp9", "vp8", "h264"].filter(c => !available || available.includes(c));
     return chain.find(c => c !== current && !tried.includes(c)) ?? null;
 }
 
@@ -534,4 +537,28 @@ export function demoteVpnCandidate(line: string): string {
 
 export function demoteVpnInSdp(sdp: string): string {
     return sdp.split("\r\n").map(l => (l.startsWith("a=candidate:") ? demoteVpnCandidate(l) : l)).join("\r\n");
+}
+
+/** host-кандидат из частной/VPN-сети (строка с «a=» или без) */
+export function isVpnHostCandidate(line: string): boolean {
+    const m = /candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ host/.exec(line);
+    return !!m && isPrivateOrVpnIPv4(m[1]);
+}
+
+/** Убрать из SDP host-кандидатов частной/VPN-сети (режим «только прямой путь») */
+export function removeVpnInSdp(sdp: string): string {
+    return sdp.split("\r\n").filter(l => !(l.startsWith("a=candidate:") && isVpnHostCandidate(l))).join("\r\n");
+}
+
+/** Сводка по парам ICE из getStats: какая выбрана и пробился ли прямой путь */
+export interface PairInfo { local: string; remote: string; localType: string; remoteType: string; state: string; selected: boolean; rttMs: number; }
+
+export function directPathVerdict(pairs: PairInfo[]): { selectedPrivate: boolean; directOk: boolean } {
+    const sel = pairs.find(p => p.selected);
+    const selectedPrivate = !!sel && isPrivateOrVpnIPv4(sel.local) && isPrivateOrVpnIPv4(sel.remote);
+    // прямой путь = успешная пара на ПУБЛИЧНЫЙ адрес пира, ушедшая не с интерфейса
+    // выбранной VPN-пары (локальный адрес за NAT — частный 192.168.x, это нормально)
+    const directOk = pairs.some(p => p.state === "succeeded" && !isPrivateOrVpnIPv4(p.remote)
+        && (!sel || p.local !== sel.local) && p.localType !== "relay" && p.remoteType !== "relay");
+    return { selectedPrivate, directOk };
 }

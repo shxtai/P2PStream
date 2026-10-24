@@ -21,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -512,6 +512,12 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
             ? `${b.local?.candidateType}/${b.local?.protocol} ${b.local?.address ?? ""} ↔ ${b.remoteCand?.candidateType} ${b.remoteCand?.address ?? ""}, RTT ${Math.round((b.pair.currentRoundTripTime ?? 0) * 1000)} мс`
             : "нет выбранной пары";
         lines.push(`путь: ${path}`);
+        try {
+            const pairs = await listPairs(pc);
+            const shown = pairs.filter(p => p.state === "succeeded" || p.selected).slice(0, 8);
+            for (const p of shown) lines.push(`  пара ${p.selected ? "[выбрана]" : ""} ${p.localType} ${p.local} ↔ ${p.remoteType} ${p.remote}: ${p.state}${p.rttMs ? `, RTT ${p.rttMs} мс` : ""}`);
+            lines.push(`  пар всего ${pairs.length}, успешных ${pairs.filter(p => p.state === "succeeded").length}, неудачных ${pairs.filter(p => p.state === "failed").length}`);
+        } catch { /* ignore */ }
         if (!b.rtp) return [...lines, "видеопотока нет"];
         const r = b.rtp;
         if (direction === "out") {
@@ -542,6 +548,24 @@ export async function mediaReport(pc: RTCPeerConnection, direction: "out" | "in"
 }
 
 /** Диагностика: каким путём реально пошёл трафик (host/srflx — напрямую, relay — через TURN) */
+/** Все пары ICE (для /p2p-doctor и проверки прямого пути) */
+export async function listPairs(pc: RTCPeerConnection): Promise<PairInfo[]> {
+    const report = await pc.getStats();
+    let selId = "";
+    report.forEach((r: any) => { if (r.type === "transport" && r.selectedCandidatePairId) selId = r.selectedCandidatePairId; });
+    const out: PairInfo[] = [];
+    report.forEach((r: any) => {
+        if (r.type !== "candidate-pair") return;
+        const l: any = report.get(r.localCandidateId), rc: any = report.get(r.remoteCandidateId);
+        out.push({
+            local: l?.address ?? "?", remote: rc?.address ?? "?",
+            localType: l?.candidateType ?? "?", remoteType: rc?.candidateType ?? "?",
+            state: r.state ?? "?", selected: r.id === selId, rttMs: Math.round((r.currentRoundTripTime ?? 0) * 1000)
+        });
+    });
+    return out;
+}
+
 async function logSelectedPair(pc: RTCPeerConnection, label: string): Promise<void> {
     try {
         const report = await pc.getStats();
@@ -767,8 +791,11 @@ class HostPeer {
             if (st === "connected") {
                 void logSelectedPair(this.pc, `эфир → ${userId}`);
                 this.startAutoQuality();
+                if (!this.directChecked) setTimeout(() => void this.checkDirectPath(), 6000);
             }
-            if (st === "failed" && !this.restarted) {
+            if (st === "failed" && this.directOnly) {
+                this.fallbackFromDirect("ICE failed");
+            } else if (st === "failed" && !this.restarted) {
                 this.restarted = true;
                 void this.negotiate(true);
             } else if (st === "closed" || (st === "failed" && this.restarted)) {
@@ -817,7 +844,8 @@ class HostPeer {
                     _route: this.host.mgr.routeFor(this.userId),
                     // ice: TURN хоста — зрителю за симметричным NAT/фильтром провайдера
                     // без них не собраться (ключи настраивает только стример)
-                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates, ice: sharedRelayServers() }
+                    // nv — «только прямой путь»: зритель не добавляет наши VPN/LAN-кандидаты
+                    d: { sdp: mungeOpusStereo(desc.sdp), type: desc.type, candidates, ice: sharedRelayServers(), ...(this.directOnly ? { nv: 1 } : {}) }
                 };
                 this.lastOffer = sig;
                 this.lastOfferAt = Date.now();
@@ -860,7 +888,7 @@ class HostPeer {
                 // зритель в другой сети — его VPN/LAN-адреса в конец очереди ICE
                 const peerLines = [...d.sdp.split("\r\n"), ...(d.candidates ?? []).map(c => c.candidate ?? "")];
                 this.peerRemote = peerIsRemote(srflxIps(offerSdp.split("\r\n").concat(this.localCandLines)), srflxIps(peerLines));
-                if (this.peerRemote) sdp = demoteVpnInSdp(sdp);
+                if (this.peerRemote) sdp = this.directOnly ? removeVpnInSdp(sdp) : demoteVpnInSdp(sdp);
                 if (!this.startLogged) {
                     this.startLogged = true;
                     logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.peerRemote ? "; зритель в другой сети — прямой путь важнее VPN/LAN-адресов" : ""}`);
@@ -869,7 +897,8 @@ class HostPeer {
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
                 this.pendingIce = [];
                 for (const c of queue) {
-                    try { await this.pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
+                    const fixed = this.fixRemote(c);
+                    if (fixed) try { await this.pc.addIceCandidate(fixed); } catch { /* ignore */ }
                 }
             }
         } catch (e) {
@@ -883,17 +912,59 @@ class HostPeer {
             return;
         }
         for (const c of candidates) {
-            try { await this.pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
+            const fixed = this.fixRemote(c);
+            if (fixed) try { await this.pc.addIceCandidate(fixed); } catch { /* ignore */ }
         }
     }
 
     /** зритель в другой сети (разные публичные адреса) — см. demoteVpnCandidate */
     private peerRemote = false;
+    /** «только прямой путь»: VPN/LAN-кандидаты зрителя не используем вовсе */
+    private directOnly = false;
+    private directChecked = false;
+
+    /**
+     * Проверка прямого пути (1.23.11). Реальный лог 1.23.10: приоритет VPN понижен,
+     * а Chrome всё равно выбрал host 10.111.234.x ↔ 10.111.234.x (RTT 107 мс,
+     * оценка канала ~5.5 Мбит/с). Через 6 с после соединения смотрим пары: выбран
+     * VPN, а прямая пара (публичные адреса) тоже прошла проверку — перезапуск ICE
+     * без VPN-кандидатов. Прямой путь не собрался — возвращаем VPN.
+     */
+    private async checkDirectPath(): Promise<void> {
+        if (this.closed || this.directChecked || !this.peerRemote) return;
+        this.directChecked = true;
+        try {
+            const pairs = await listPairs(this.pc);
+            const v = directPathVerdict(pairs);
+            if (!v.selectedPrivate) return;
+            if (!v.directOk) {
+                logger.info(`Путь → ${this.userId}: через VPN/LAN, прямой путь через интернет не пробился (успешных пар ${pairs.filter(p => p.state === "succeeded").length}) — остаёмся на VPN`);
+                return;
+            }
+            logger.info(`Путь → ${this.userId}: выбран VPN/LAN, но прямой путь через интернет тоже работает — переподключаюсь напрямую`);
+            this.directOnly = true;
+            void this.negotiate(true);
+            // не собралось за 12 с — назад на VPN; итог — в лог (по нему видно, сработало ли)
+            setTimeout(() => {
+                if (this.closed || !this.directOnly) return;
+                if (this.pc.connectionState !== "connected") this.fallbackFromDirect("за 12 с не соединилось");
+                else void logSelectedPair(this.pc, `эфир → ${this.userId}, после перехода на прямой путь`);
+            }, 12_000);
+        } catch { /* ignore */ }
+    }
+
+    private fallbackFromDirect(why: string): void {
+        logger.info(`Прямой путь → ${this.userId} не сработал (${why}) — возвращаю VPN/LAN`);
+        this.directOnly = false;
+        void this.negotiate(true);
+    }
     /** наши кандидаты строками (для своего публичного адреса) */
     private localCandLines: string[] = [];
 
-    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit {
-        return this.peerRemote && c.candidate ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
+    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit | null {
+        if (!this.peerRemote || !c.candidate) return c;
+        if (this.directOnly && isVpnHostCandidate(c.candidate)) return null;
+        return { ...c, candidate: demoteVpnCandidate(c.candidate) };
     }
 
     /**
@@ -1056,7 +1127,8 @@ class HostPeer {
     switchCodec(reason: string): boolean {
         if (!this.codecName) return false;
         this.triedCodecs.push(this.codecName);
-        const next = fallbackCodec(this.codecName, this.triedCodecs);
+        const avail = (RTCRtpSender.getCapabilities?.("video")?.codecs ?? []).map(c => c.mimeType.toLowerCase().replace("video/", ""));
+        const next = fallbackCodec(this.codecName, this.triedCodecs, avail.length ? avail : undefined);
         if (!next) {
             logger.warn(`${this.codecName.toUpperCase()} → ${this.userId}: ${reason}, но других кодеков не осталось`);
             return false;
@@ -1298,8 +1370,10 @@ export class WatchSession {
         this.mgr.bump();
     }
 
-    async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[]; ice?: RTCIceServer[] }, hostPk?: string): Promise<void> {
+    async handleOffer(d: { sdp: string; type: RTCSdpType; candidates?: RTCIceCandidateInit[]; ice?: RTCIceServer[]; nv?: number }, hostPk?: string): Promise<void> {
         try {
+            // стример перешёл на «только прямой путь» — его VPN/LAN-кандидатов не берём
+            this.noVpn = !!d.nv;
             // шифруем answer/ice хосту только если его сторона распечатает:
             // старые хосты в чат-режиме ждут plain-d — шифрование их сломало бы
             if (hostPk && this.shouldSealHost()) this.hostPk = hostPk;
@@ -1355,13 +1429,15 @@ export class WatchSession {
             this.hostRemote = peerIsRemote(ours, theirs);
 
             for (const c of hostCandidates) {
-                try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
+                const fixed = this.fixRemote(c);
+                if (fixed) try { await pc.addIceCandidate(fixed); } catch { /* ignore */ }
             }
 
             const queue = this.pendingIce;
             this.pendingIce = [];
             for (const c of queue) {
-                try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
+                const fixed = this.fixRemote(c);
+                if (fixed) try { await pc.addIceCandidate(fixed); } catch { /* ignore */ }
             }
         } catch (e) {
             logger.error("Ошибка обработки оффера:", e);
@@ -1377,15 +1453,20 @@ export class WatchSession {
             return;
         }
         for (const c of candidates) {
-            try { await pc.addIceCandidate(this.fixRemote(c)); } catch { /* ignore */ }
+            const fixed = this.fixRemote(c);
+            if (fixed) try { await pc.addIceCandidate(fixed); } catch { /* ignore */ }
         }
     }
 
     /** стример в другой сети (разные публичные адреса) — см. demoteVpnCandidate */
     private hostRemote = false;
+    /** стример попросил «только прямой путь» (nv в оффере) */
+    private noVpn = false;
 
-    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit {
-        return this.hostRemote && c.candidate ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
+    private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit | null {
+        if (!c.candidate) return c;
+        if (this.noVpn && isVpnHostCandidate(c.candidate)) return null;
+        return this.hostRemote ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
     }
 
     /** Отправить накопленных кандидатов одной пачкой (батчинг как у хоста) */

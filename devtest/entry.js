@@ -91,6 +91,21 @@ if (role === "host") {
         if (!peer || peer.pc.connectionState !== "connected" || reported) return;
         reported = true;
         clearInterval(watchPeers);
+        // ?directfallback — принудительно «только прямой путь», когда прямого нет
+        // (в стенде все адреса частные): стример должен сам вернуть прежний путь
+        if (q.has("directfallback")) {
+            setTimeout(() => {
+                peer.peerRemote = true;
+                peer.directChecked = true;
+                peer.directOnly = true;
+                report("OUT", "стенд: включаю «только прямой путь» без прямого пути");
+                void peer.negotiate(true);
+                setTimeout(() => {
+                    if (peer.pc.connectionState !== "connected") peer.fallbackFromDirect("стенд: 12 с");
+                }, 12_000);
+                setTimeout(async () => { const ps = (await peer.pc.getStats()); let sel = null; ps.forEach(r => { if (r.type === "transport" && r.selectedCandidatePairId) sel = ps.get(r.selectedCandidatePairId); }); const l = sel && ps.get(sel.localCandidateId), rc = sel && ps.get(sel.remoteCandidateId); report("OUT", `стенд: через 30 с directOnly=${peer.directOnly}, conn=${peer.pc.connectionState}, пара ${l?.candidateType} ${l?.address} ↔ ${rc?.candidateType} ${rc?.address}`); }, 30_000);
+            }, 2000);
+        }
         // ?ramp — разгон: каждые 2 с оценка канала, отправка, разрешение (30 с)
         if (q.has("ramp")) {
             const t0r = Date.now(); let prevBytes = 0, prevT = Date.now();
@@ -182,7 +197,7 @@ if (role === "host") {
                 void (async () => {
                     // отчёт /p2p-doctor зрителя (VERBOSE=1 — виден в выводе)
                     // через 15 с — когда оценка канала (BWE) уже разогналась
-                    await new Promise(r => setTimeout(r, q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
+                    await new Promise(r => setTimeout(r, q.has("directfallback") ? 34000 : q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
                     for (const l of await mediaReport(w.pc, "in")) report("IN ", l);
                     status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${secs} с, путь ${await pathOf(w.pc)}`);
                 })();

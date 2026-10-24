@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -97,7 +97,8 @@ const MAX = 30e6;
     check("энкодер завис (60 кадров захвата -> 1 закодирован) ×3 -> сменить кодек", st >= DECODE_TROUBLE_LIMIT);
     check("статичный экран (захват 0 кадров) — не зависание", nextEncoderStall(2, { srcFrames: 0, encFrames: 0 }) === 0);
     check("нормальная работа — не зависание", nextEncoderStall(2, { srcFrames: 60, encFrames: 58 }) === 0);
-    check("цепочка кодеков: h264 -> vp9 -> vp8", fallbackCodec("h264", []) === "vp9" && fallbackCodec("vp9", ["h264"]) === "vp8" && fallbackCodec("vp8", ["h264", "vp9"]) === null);
+    check("цепочка кодеков: h264 -> h265 -> vp9 -> vp8", fallbackCodec("h264", []) === "h265" && fallbackCodec("h265", ["h264"]) === "vp9" && fallbackCodec("vp9", ["h264", "h265"]) === "vp8" && fallbackCodec("vp8", ["h264", "h265", "vp9"]) === null);
+    check("цепочка кодеков: без H.265 у клиента — сразу VP9", fallbackCodec("h264", [], ["h264", "vp9", "vp8"]) === "vp9");
 }
 // 4. рост очереди (RTT 100 -> 400) -> снижение
 {
@@ -267,5 +268,22 @@ const MAX = 30e6;
     check("разные публичные адреса — пир в другой сети", peerIsRemote(srflxIps(["a=candidate:9 1 udp 1686052607 95.90.189.182 1 typ srflx"]), srflxIps([srflx])));
     check("один публичный адрес (одна квартира) — LAN не трогаем", !peerIsRemote(srflxIps([srflx]), srflxIps([srflx])));
     check("публичный адрес неизвестен — ничего не трогаем", !peerIsRemote(new Set(), srflxIps([srflx])));
+}
+// --- 1.23.11: проверка прямого пути ---
+{
+    const P = (local, remote, localType, remoteType, state, selected = false) => ({ local, remote, localType, remoteType, state, selected, rttMs: 0 });
+    // реальный лог 1.23.10: выбрана VPN-пара, прямая (srflx) тоже прошла
+    let v = directPathVerdict([P("10.111.234.221", "10.111.234.122", "host", "host", "succeeded", true), P("192.168.1.5", "109.195.75.27", "host", "srflx", "succeeded")]);
+    check("VPN выбран, прямой путь работает → переходить", v.selectedPrivate && v.directOk);
+    v = directPathVerdict([P("10.111.234.221", "10.111.234.122", "host", "host", "succeeded", true), P("192.168.1.5", "109.195.75.27", "host", "srflx", "failed")]);
+    check("VPN выбран, прямой не пробился → оставаться на VPN", v.selectedPrivate && !v.directOk);
+    v = directPathVerdict([P("192.168.1.5", "109.195.75.27", "host", "srflx", "succeeded", true)]);
+    check("уже прямой путь → ничего не делать", !v.selectedPrivate);
+    v = directPathVerdict([P("10.111.234.221", "10.111.234.122", "host", "host", "succeeded", true), P("1.2.3.4", "5.6.7.8", "relay", "srflx", "succeeded")]);
+    check("TURN не считается прямым путём", !v.directOk);
+    check("VPN host-кандидат распознаётся", isVpnHostCandidate("a=candidate:1 1 udp 2122260223 10.111.234.122 54321 typ host") && !isVpnHostCandidate("candidate:3 1 udp 1686052607 109.195.75.27 61000 typ srflx raddr 10.0.0.1 rport 1"));
+    const sdp = ["v=0", "a=candidate:1 1 udp 2122260223 10.111.234.122 54321 typ host", "a=candidate:3 1 udp 1686052607 109.195.75.27 61000 typ srflx raddr 10.111.234.122 rport 54321", ""].join("\r\n");
+    const r = removeVpnInSdp(sdp);
+    check("режим «только прямой»: VPN-кандидаты убраны из SDP, srflx остался", !r.includes("10.111.234.122 54321 typ host") && r.includes("typ srflx"));
 }
 process.exit(failed ? 1 : 0);
