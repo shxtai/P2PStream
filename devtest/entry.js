@@ -10,6 +10,8 @@ const relay = q.get("relay");
 settings.store.audioMode = "off"; // нативного хелпера в браузере нет
 // ?nobroker — только Discord-транспорт (брокеры недоступны/заблокированы); ?loss=1 — наоборот, только брокер
 if (q.has("nobroker")) settings.store.brokerEnabled = false;
+// ?split — стример и зритель на РАЗНЫХ брокерах (реальный случай 1.23.7: hivemq / emqx)
+if (q.has("split") && role === "host") settings.store.brokerUrl = "wss://broker.hivemq.com:8884/mqtt";
 if (q.get("bitrate")) settings.store.videoBitrate = Number(q.get("bitrate")); // Мбит/с, как в настройках
 if (q.get("codec")) settings.store.codec = q.get("codec");
 if (q.get("fps")) settings.store.fps = String(q.get("fps"));
@@ -94,6 +96,9 @@ if (role === "host") {
     }, 500);
     async function viewerTick() {
         const host = [...manager.liveHosts.values()][0];
+        // ?stalevia — зритель «помнит» стримера по брокеру, хотя они уже на разных брокерах:
+        // первый join уходит в никуда, должен выручить повтор через Discord
+        if (host && q.has("stalevia")) host.via = "broker";
         if (host && !manager.watches.size) { t0 = Date.now(); manager.watch(host.streamId); }
         const w = [...manager.watches.values()][0];
         if (w) {

@@ -287,8 +287,6 @@ export function brokerLastError(): string {
 }
 
 let currentUrl: string | null = null;
-/** clientId, по которому открыто текущее соединение (для переподключения при смене канала). */
-let connectedClientId: string | null = null;
 
 function brokerUrls(): string[] {
     const custom = String(settings.store.brokerUrl ?? "").trim();
@@ -347,6 +345,7 @@ function connect(): Promise<void> {
         reconnectTimer = undefined;
     }
     const gen = ++wsGeneration;
+    const urlSlot = urlIndex;
     const url = nextUrl();
     ensureCspFor(url);
     const clientId = `${myId()}:${SelectedChannelStore.getVoiceChannelId?.() ?? ""}`;
@@ -468,7 +467,10 @@ function connect(): Promise<void> {
                         settled = true;
                         clearTimeout(connackTimer);
                         status = "connected";
-                        connectedClientId = clientId;
+                        // «липкий» брокер: следующее подключение (обрыв, Ctrl+R) начнётся с
+                        // этого же адреса. Раньше индекс уезжал дальше, и после переподключения
+                        // один собеседник оказывался на emqx, другой на hivemq — не видят друг друга
+                        urlIndex = urlSlot;
                         reconnectAttempts = 0;
                         logger.info(`Сигналинг через брокер ${url}`);
                         startPing();
@@ -578,25 +580,15 @@ export function brokerUnsubscribeStream(streamId: string): void {
 }
 
 /** Обновить набор нужных подписок (зовёт engine при смене голосового канала).
- *  clientId содержит channelId — при смене канала переподключаемся,
- *  иначе брокер будет считать клиента в старом канале. */
+ *  Только подписки: без переподключения (см. ниже). */
 export function brokerSetChannel(channelId: string | null): void {
     wantSubs.add(brokerInboxTopic());
     for (const t of [...wantSubs]) {
         if (t.startsWith(`${TOPIC_PREFIX}/c/`)) wantSubs.delete(t);
     }
     if (channelId) wantSubs.add(brokerChannelTopic(channelId));
-    // Переподключение при смене канала: новый clientId = myId():новыйChannelId
-    // (shutdown чистит wantSubs — подписки пересобираем ПОСЛЕ него)
-    if (brokerIsConnected() && connectedClientId) {
-        const newClientId = `${myId() || "anon"}:${channelId ?? ""}`;
-        if (connectedClientId !== newClientId) {
-            logger.info(`Смена голосового канала — переподключение к брокеру (${newClientId})`);
-            brokerShutdown();
-            wantSubs.add(brokerInboxTopic());
-            if (channelId) wantSubs.add(brokerChannelTopic(channelId));
-        }
-    }
+    // (1.23.8) Переподключения при смене канала больше нет: подписки меняются на лету,
+    // а реконнект ради clientId с каналом уводил на СЛЕДУЮЩИЙ брокер в списке.
     if (wantSubs.size > 0) brokerEnsure();
     syncSubscriptions();
 }

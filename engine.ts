@@ -1180,6 +1180,12 @@ export class WatchSession {
 
     /** Маршрут сигналов к хосту: по транспорту его анонса (совместимость со старыми версиями) */
     private hostRoute(): "broker" | "chat" | "both" {
+        // Путь, которым РЕАЛЬНО пришёл оффер/ice этого сеанса (watch() сбрасывает
+        // память о транспорте) — главнее пути анонса: анонс мог прийти через брокер
+        // давно, а сейчас стример на другом брокере и оффер пришёл через Discord.
+        // Раньше answer уходил «по анонсу» в брокер и терялся (pc навсегда connecting).
+        const learned = this.mgr.knownRoute(this.host.userId);
+        if (learned) return learned;
         if (this.host.via === "chat") return "chat";
         if (this.host.via === "broker") return "broker";
         return "both";
@@ -1206,6 +1212,19 @@ export class WatchSession {
     private startJoinLoop(): void {
         this.stopJoinLoop();
         this.sendJoin();
+        // Повторы join, пока не пришёл оффер. Раньше join уходил через брокер ОДИН
+        // раз: потерялся (или зритель и стример сидят на разных брокерах — реальный
+        // случай 1.23.7: emqx у одного, hivemq у другого) — 45 с ожидания и «хост не
+        // ответил». Со 2-й попытки — и через брокер, и через тихий Discord-транспорт.
+        let tries = 0;
+        this.joinRetryTimer = setInterval(() => {
+            if (this.pc?.remoteDescription || (this.state !== "connecting" && this.state !== "reconnecting") || ++tries > 6) {
+                if (this.joinRetryTimer) { clearInterval(this.joinRetryTimer); this.joinRetryTimer = undefined; }
+                return;
+            }
+            logger.info(`Оффер от ${this.host.name} не пришёл — повторяю join (#${tries}, брокер + Discord)`);
+            this.sendJoin("both");
+        }, 5000);
         this.joinTimer = setTimeout(() => {
             this.joinTimer = undefined;
             if (this.state !== "connecting" && this.state !== "reconnecting") return;
@@ -1215,17 +1234,23 @@ export class WatchSession {
         }, 45_000);
     }
 
+    private joinRetryTimer: NodeJS.Timeout | undefined;
+
     private stopJoinLoop(): void {
         if (this.joinTimer) {
             clearTimeout(this.joinTimer);
             this.joinTimer = undefined;
         }
+        if (this.joinRetryTimer) {
+            clearInterval(this.joinRetryTimer);
+            this.joinRetryTimer = undefined;
+        }
     }
 
-    private sendJoin(): void {
+    private sendJoin(route?: "both"): void {
         sendSignals(this.host.channelId, {
             v: 1, t: "join", s: this.host.streamId, from: myId(), to: this.host.userId,
-            _route: this.hostRoute()
+            _route: route ?? this.hostRoute()
         });
     }
 
@@ -1607,6 +1632,11 @@ export class P2PManager {
      *  по нему адресуем ответные (совместимость v1.7 ↔ старые версии). */
     private peerTransport = new Map<string, "broker" | "chat">();
 
+    /** Каким транспортом пир реально писал нам в текущем сеансе (undefined — не знаем) */
+    knownRoute(userId: string): "broker" | "chat" | undefined {
+        return this.peerTransport.get(userId);
+    }
+
     /** true пока startShare() сам ждёт gdm — пикер в этом случае не показывает
      *  кнопку «Обычный стрим Discord» (Discord своей поток не ждёт) */
     internalGdmCall = false;
@@ -1676,7 +1706,9 @@ export class P2PManager {
                 if (this.host || this.liveHosts.size > 0) return;
                 const v = currentVoiceChannelId();
                 if (!v) return;
-                sendSignals(v, { v: 1, t: "query", s: "*", from: myId() });
+                // и через брокер, и тихим сообщением в Discord: стример мог оказаться
+                // на другом брокере — тогда без этого эфир не находился вовсе
+                sendSignals(v, { v: 1, t: "query", s: "*", from: myId(), _route: "both" });
             }, (myId().charCodeAt(0) % 5) * 700);
         }, 3_000);
         // Уже в голосовом канале при старте (Ctrl+R, включение плагина): без этого
@@ -1881,8 +1913,9 @@ export class P2PManager {
         this.lastChatAnnounce = 0; // новый эфир — первый анонс уходит сразу, без троттлинга
         this.bump();
 
-        // мгновенное объявление (не ждём первого тика heartbeat)
-        this.announce();
+        // мгновенное объявление (не ждём первого тика heartbeat) — и через брокер,
+        // и одним тихим сообщением в Discord: зрители на другом брокере тоже увидят
+        this.announce("both");
         void this.checkSignalingAlive();
 
         const meta = currentMeta();
@@ -1946,7 +1979,7 @@ export class P2PManager {
 
     /** Объявить всем в канале текущее состояние эфира (announce = heartbeat).
      *  route "chat" — ответ старому зрителю, запросившему через чат. */
-    announce(route?: "chat"): void {
+    announce(route?: "chat" | "both"): void {
         const { host } = this;
         if (!host) return;
         // Чат-фолбэк при лежащем брокере: announce-хартбит раз в 8 с превращал чат
