@@ -290,7 +290,8 @@ let currentUrl: string | null = null;
 
 function brokerUrls(): string[] {
     const custom = String(settings.store.brokerUrl ?? "").trim();
-    if (custom) return [custom, ...DEFAULT_BROKERS];
+    // без дублей: адрес по умолчанию (emqx) сам входит в список публичных
+    if (custom) return [custom, ...DEFAULT_BROKERS.filter(u => u !== custom)];
     return [...DEFAULT_BROKERS];
 }
 

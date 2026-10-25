@@ -741,6 +741,8 @@ class HostPeer {
     private viewerDecode: ViewerDecodeState | null = null;
     /** отчётов зрителя подряд с «голодом» (см. viewerStarved) */
     private starved = 0;
+    /** канал обратной связи (и прямой: сдвиг видео под звук раз в 2 с) */
+    private fb: RTCDataChannel | null = null;
     private connectedAt = 0;
     /** текущий видеокодек этого зрителя (из статистики) */
     codecName = "";
@@ -757,6 +759,7 @@ class HostPeer {
         // его просто не откроют): сколько кадров его декодер реально успевает
         try {
             const fb = this.pc.createDataChannel("p2p-fb", { negotiated: true, id: 5, ordered: false, maxRetransmits: 0 });
+            this.fb = fb;
             fb.onmessage = ev => {
                 try {
                     const m = JSON.parse(String(ev.data));
@@ -998,6 +1001,13 @@ class HostPeer {
         let prevBytes = -1, prevBytesAt = 0, sentBps = 0;
         this.aqTimer = setInterval(async () => {
             if (this.closed || !this.aqState) return;
+            // (1.23.17) буфер звука стримера теперь адаптивный и меняется быстро — сдвиг
+            // видео шлём зрителю раз в 2 с прямым каналом (анонс через брокер — раз в 8 с)
+            try {
+                const ast = this.host.nativeAudio?.stats?.();
+                const ad = Math.max(0, Math.min(500, Math.round((ast?.avgMs || ast?.levelMs || 0) / 10) * 10));
+                if (this.fb?.readyState === "open") this.fb.send(JSON.stringify({ t: "ad", ms: ad }));
+            } catch { /* ignore */ }
             if (settings.store.autoQuality === false) {
                 if ((this.pc as any).__aq) { (this.pc as any).__aq = undefined; this.aqCapBps = 0; this.aqScale = 1; void applySendParameters(this.pc); }
                 return;
@@ -1538,7 +1548,18 @@ export class WatchSession {
         if (hostRelays.length) logger.info(`Хост прислал TURN (${hostRelays.length}) — ретранслятор доступен, если прямой путь не пройдёт`);
         const pc = new RTCPeerConnection(buildRtcConfig(hostRelays));
         this.pc = pc;
-        try { this.fb = pc.createDataChannel("p2p-fb", { negotiated: true, id: 5, ordered: false, maxRetransmits: 0 }); } catch { this.fb = null; }
+        try {
+            this.fb = pc.createDataChannel("p2p-fb", { negotiated: true, id: 5, ordered: false, maxRetransmits: 0 });
+            this.fb.onmessage = ev => {
+                try {
+                    const m = JSON.parse(String(ev.data));
+                    if (m?.t === "ad" && Number.isFinite(+m.ms)) {
+                        this.liveAd = { ms: Math.max(0, Math.min(500, +m.ms)), at: Date.now() };
+                        this.applyDelays();
+                    }
+                } catch { /* ignore */ }
+            };
+        } catch { this.fb = null; }
 
         pc.ondatachannel = e => {
             const dc = e.channel;
@@ -1600,9 +1621,12 @@ export class WatchSession {
     /** Сколько звук стримера сидит в его буфере (мс, из свежего анонса). 0 — у
      *  стримера нет нативного звука или он старой версии (звук и видео там в одной
      *  синхрогруппе, и сдвиг видео синхронизация всё равно отменила бы). */
+    /** буфер звука стримера по прямому каналу (свежее анонса) */
+    private liveAd: { ms: number; at: number; } | null = null;
+
     audioLeadMs(): number {
         const meta: any = this.mgr.liveHosts.get(this.host.streamId)?.meta ?? this.host.meta;
-        const ad = Number(meta?.ad);
+        const ad = this.liveAd && Date.now() - this.liveAd.at < 6000 ? this.liveAd.ms : Number(meta?.ad);
         const auto = Number.isFinite(ad) && ad > 0 ? Math.min(500, Math.round(ad)) : 0;
         // ручная подстройка из настроек (+ — видео позже, − — раньше)
         const extra = Number(settings.store.avSyncOffset) || 0;

@@ -14,7 +14,7 @@ import { brokerEnsure, brokerLabel, brokerLastError, brokerShutdown, brokerStatu
 import { manager, mediaReport, probeNat, relayStatus } from "./engine";
 import { installShareHook, isClickInterceptorInstalled, isGoLiveHijackInstalled, isShareHookInstalled, uninstallShareHook } from "./hooks";
 import { installNativeTiles, uninstallNativeTiles } from "./nativeTiles";
-import { DEFAULT_BROKER_URL, settings } from "./settings";
+import { DEAD_BROKER_URL, DEFAULT_BROKER_URL, settings } from "./settings";
 import { signalingHealth } from "./signaling";
 import managedStyle from "./styles.css?managed";
 import { AboutCard } from "./ui/AboutCard";
@@ -138,6 +138,11 @@ function migrateBroker121(): void {
             s.brokerEnabled = true;
         }
         s.brokerMigrated121 = true;
+    } catch { /* ignore */ }
+    // (1.23.17) с мёртвого брокера — на рабочий по умолчанию
+    try {
+        const s = settings.store as any;
+        if (String(s.brokerUrl ?? "").trim() === DEAD_BROKER_URL) s.brokerUrl = DEFAULT_BROKER_URL;
     } catch { /* ignore */ }
 }
 

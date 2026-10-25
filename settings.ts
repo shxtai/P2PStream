@@ -16,7 +16,10 @@ export type AudioMode = "native" | "system" | "off";
 
 /** Сигналинг-брокер по умолчанию (свой Cloudflare Worker, cf-worker/worker.js из репо).
  *  Зашит в плагин: сигналинг сразу мимо Discord, чат-коды не нужны вовсе. */
-export const DEFAULT_BROKER_URL = "wss://shrill-shape-9a12.kosyakmilya.workers.dev/mqtt";
+export const DEFAULT_BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
+/** (1.23.17) прежний брокер по умолчанию — чужой Worker, мёртв (Cloudflare error 1101):
+ *  каждое подключение начиналось с ошибки и лишней секунды. Мигрируем с него. */
+export const DEAD_BROKER_URL = "wss://shrill-shape-9a12.kosyakmilya.workers.dev/mqtt";
 
 /** Обработчик переключения «нативных плиток» (регистрируется в nativeTiles, чтобы избежать цикла импортов) */
 export let onNativeTilesChange: ((enabled: boolean) => void) | null = null;
@@ -110,7 +113,7 @@ export const settings = definePluginSettings({
     },
     contentHint: {
         type: OptionType.SELECT,
-        description: "Оптимизация контента: Motion — держать FPS в движении (игры), Detail — чёткость (фильмы, текст)",
+        description: "Оптимизация контента. Motion (рекомендуется) — плавность: при нехватке канала плагин снижает разрешение, FPS держится. Detail — чёткость любой ценой: при нехватке энкодер выкидывает кадры (рывки) — только для статичного текста/презентаций",
         options: [
             { label: "Motion (игры)", value: "motion", default: true },
             { label: "Detail (фильмы, статика)", value: "detail" },
@@ -126,7 +129,7 @@ export const settings = definePluginSettings({
     avSyncOffset: {
         type: OptionType.SLIDER,
         description: "Синхронизация звука и видео у ЗРИТЕЛЯ, мс: плагин сам задерживает видео на буфер звука стримера; если картинка всё равно отстаёт от звука — двигайте влево (−), если звук отстаёт — вправо (+)",
-        markers: [-200, -150, -100, -50, 0, 50, 100, 150, 200],
+        markers: [-200, -100, 0, 100, 200],
         default: 0,
         stickToMarkers: false
     },
@@ -166,7 +169,7 @@ export const settings = definePluginSettings({
     },
     brokerUrl: {
         type: OptionType.STRING,
-        description: "Адрес брокера сигналинга (WSS, MQTT). По умолчанию — свой Worker в Cloudflare; можно поднять свой (cf-worker/worker.js из репозитория, 2 мин) или mosquitto на своём сервере",
+        description: "Адрес брокера сигналинга (WSS, MQTT). По умолчанию — публичный broker.emqx.io (запасные: hivemq, mosquitto); можно поднять свой (cf-worker/worker.js из репозитория, 2 мин) или mosquitto на своём сервере",
         default: DEFAULT_BROKER_URL,
         placeholder: "wss://мой-брокер:8084/mqtt"
     },
