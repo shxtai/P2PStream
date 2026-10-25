@@ -128,7 +128,7 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
         next.lastCut = s.now;
         next.cleanSince = s.now;
         next.lossAtCut = lossy ? next.lossEwma : 0;
-        if (stall && !lossy && !pliStorm && !queueing) next.holdUntil = s.now + 20_000;
+        if (stall && !lossy && !pliStorm && !queueing) next.holdUntil = s.now + 8_000;
         const why = lossy ? `потери ${(next.lossEwma * 100).toFixed(1)}%` : pliStorm ? `запросы ключевых кадров ×${s.pli}` : queueing ? `очередь (RTT ${Math.round(s.rttMs!)} мс)` : "зритель недополучает кадры / замирает";
         return { state: next, reason: next.capBps !== st.capBps ? why : null };
     }
@@ -139,7 +139,12 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     // чисто: после 10 с без проблем — +15% за шаг до пользовательского максимума
     // возврат: после 6 с чистого канала +20% каждые 4 с (было +15% раз в 10 с —
     // с 40 обратно до 80 Мбит/с уходила почти минута)
-    if (next.lossEwma < 0.02 && s.now - st.cleanSince >= (st.capBps < userMaxBps && st.lastCut && s.now - st.lastCut < 10_000 ? 6_000 : 4_000) && st.capBps < userMaxBps) {
+    // (1.23.14) Растём, только если поток реально упирается в потолок. На статичной
+    // картинке энкодеру нечего слать, канал «чистый» — и потолок раньше разгонялся до
+    // 58 Мбит/с при реальных ~35 у VPN; на смене кадра энкодер выстреливал на весь
+    // потолок: «собирает 0 из 59 FPS», потери, заикался и звук.
+    const used = s.curBps == null || s.curBps >= st.capBps * 0.6;
+    if (used && next.lossEwma < 0.02 && s.now - st.cleanSince >= (st.capBps < userMaxBps && st.lastCut && s.now - st.lastCut < 10_000 ? 6_000 : 4_000) && st.capBps < userMaxBps) {
         next.capBps = Math.min(userMaxBps, Math.round(st.capBps * 1.2));
         next.cleanSince = s.now;
         return { state: next, reason: "канал чистый" };
@@ -417,7 +422,9 @@ export const MAX_JITTER_TARGET_MS = 300;
 
 /**
  * Адаптивный буфер зрителя: при заморозках/скачках задержки — +50 мс (до 300),
- * после 20 с спокойствия — −25 мс до минимума пользователя.
+ * после 6 с спокойствия — −50 мс каждые 6 с до минимума пользователя.
+ * (1.23.14: было −25 мс раз в 20 с — от 300 мс до нуля уходило 4 минуты, и после
+ * одной заморозки картинка ещё долго отставала.)
  */
 export function nextJitterTarget(st: RecvState, s: RecvSample, userMinMs: number): RecvState {
     const rough = s.freezes > 0 || s.jitterMs > 30;
@@ -425,8 +432,8 @@ export function nextJitterTarget(st: RecvState, s: RecvSample, userMinMs: number
         const want = Math.max(st.targetMs + 50, Math.min(MAX_JITTER_TARGET_MS, Math.round(s.jitterMs * 3)));
         return { targetMs: Math.min(MAX_JITTER_TARGET_MS, want), calmSince: s.now };
     }
-    if (s.now - st.calmSince >= 20_000 && st.targetMs > userMinMs) {
-        return { targetMs: Math.max(userMinMs, st.targetMs - 25), calmSince: s.now };
+    if (s.now - st.calmSince >= 6_000 && st.targetMs > userMinMs) {
+        return { targetMs: Math.max(userMinMs, st.targetMs - 50), calmSince: s.now };
     }
     return st;
 }
@@ -597,7 +604,8 @@ export function initViewerDecode(now: number): ViewerDecodeState {
 
 export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: string, now: number, maxSteps: number): { state: ViewerDecodeState; action: "codec" | "down" | "up" | null; reason: string | null; } {
     const next = { ...st };
-    const shown = rx.decFps - rx.dropFps;
+    // dropFps бывает больше decFps (Chrome считает выброшенные до декодера) — не ниже 0
+    const shown = Math.max(0, Math.min(rx.decFps, rx.decFps - rx.dropFps));
     const behind = rx.recvFps >= 20 && (shown < rx.recvFps * 0.85 || (shown < 28 && rx.recvFps >= 30));
     if (behind) {
         next.strain = st.strain + 1;

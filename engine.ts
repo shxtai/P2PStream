@@ -1139,7 +1139,10 @@ class HostPeer {
                 const scale = srcH && rung.height < srcH ? srcH / rung.height : 1;
                 // потолок энкодера: на чистом канале выше оценки — WebRTC зондирует и
                 // оценка растёт быстро; разрешение при этом выбирается по eff (см. выше)
-                const clean = (loss ?? 0) < 0.02 && !reason && (!state.lastCut || Date.now() - state.lastCut > 4000);
+                // запас 1.6× оценки — только если поток реально загружает канал (на статике он
+                // только позволял выброс выше пропускной способности при смене кадра)
+                const clean = (loss ?? 0) < 0.02 && !reason && (!state.lastCut || Date.now() - state.lastCut > 4000)
+                    && (this.aqCapBps === 0 || sentBps >= this.aqCapBps * 0.6);
                 const encCap = sendCap(state, bweBps, max, clean);
                 const capMoved = this.aqCapBps === 0 || Math.abs(encCap - this.aqCapBps) > this.aqCapBps * 0.05;
                 if (capMoved || scale !== this.aqScale || fpsCap !== this.aqFps) {

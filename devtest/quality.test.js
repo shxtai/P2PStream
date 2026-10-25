@@ -312,11 +312,29 @@ const MAX = 30e6;
     let st = initSendState(100e6, 0);
     let r = nextCap(st, { loss: 0.003, pli: 1, rttMs: 100, now: 10000, viewerStall: true, curBps: 31e6 }, 100e6);
     check("заморозки у зрителя при потерях 0.3% → срез от реальных 31 Мбит/с", r.state.capBps === Math.round(31e6 * 0.8), `${(r.state.capBps / 1e6).toFixed(1)} Мбит/с, ${r.reason}`);
-    const held = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 20000, curBps: 25e6 }, 100e6);
-    check("после среза из-за заморозок 20 с не растём", held.state.capBps === r.state.capBps);
-    const grown = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 40000, curBps: 25e6 }, 100e6);
-    check("через 20+ с чистого канала — снова растём", grown.state.capBps > r.state.capBps);
+    const held = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 15000, curBps: 25e6 }, 100e6);
+    check("после среза из-за заморозок 8 с не растём", held.state.capBps === r.state.capBps);
+    const grown = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 20000, curBps: 25e6 }, 100e6);
+    check("через 8+ с чистого канала — снова растём", grown.state.capBps > r.state.capBps);
     const noStall = nextCap(initSendState(100e6, 0), { loss: 0.003, pli: 0, rttMs: 100, now: 10000, curBps: 31e6 }, 100e6);
     check("без заморозок потери 0.3% не режут (как раньше)", noStall.state.capBps === 100e6);
+}
+// --- 1.23.14: статичная картинка, быстрый возврат буфера ---
+{
+    // статика: шлём 1 Мбит/с при потолке 30 — потолок не разгоняется
+    let st = { ...initSendState(100e6, 0), capBps: 30e6 }, t = 0;
+    for (let i = 0; i < 30; i++) { t += 2000; st = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: t, curBps: 1e6 }, 100e6).state; }
+    check("статичная картинка (1 из 30 Мбит/с) — потолок не растёт", st.capBps === 30e6, `${st.capBps / 1e6}`);
+    // движение: шлём под потолок — растём как раньше
+    st = { ...initSendState(100e6, 0), capBps: 30e6 }; t = 0;
+    for (let i = 0; i < 5; i++) { t += 2000; st = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: t, curBps: 29e6 }, 100e6).state; }
+    check("движение (29 из 30 Мбит/с) — потолок растёт", st.capBps > 30e6, `${st.capBps / 1e6}`);
+    // буфер зрителя: 300 мс → минимум за ~40 с спокойствия (было 4 минуты)
+    let j = { targetMs: 300, calmSince: 0 }; t = 0;
+    while (j.targetMs > 0 && t < 600_000) { t += 2000; j = nextJitterTarget(j, { freezes: 0, jitterMs: 5, now: t }, 0); }
+    check("буфер 300 мс возвращается к минимуму за ≤ 40 с", j.targetMs === 0 && t <= 40_000, `${t / 1000} с`);
+    // отрицательные FPS в обратной связи
+    const neg = nextViewerDecode(initViewerDecode(0), { recvFps: 41, decFps: 10, dropFps: 24, hw: false }, "h264", 10000, 14);
+    check("dropFps > decFps — «показывает» не уходит в минус", !/-\d/.test(neg.reason ?? "") , neg.reason ?? "нет действия");
 }
 process.exit(failed ? 1 : 0);
