@@ -18,6 +18,8 @@ import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, write
 import { constants as osConstants, setPriority } from "os";
 import { join } from "path";
 
+import { AudioWsServer } from "./audioWs";
+
 // Белый список CSP: свежий Vencord пускает рендерер только на перечисленные хосты
 // (connect-src). Без этого WebSocket к брокерам сигналинга блокируется
 // («violates the following Content Security Policy directive»), брокер не
@@ -29,7 +31,8 @@ for (const src of [
     "wss://*.workers.dev", // свой брокер на Cloudflare Workers (cf-worker/worker.js)
     "wss://broker.emqx.io:8084",
     "wss://broker.hivemq.com:8884",
-    "wss://test.mosquitto.org:8081"
+    "wss://test.mosquitto.org:8081",
+    "ws://127.0.0.1:*" // (1.23.23) прямая доставка звука main → Worker рендерера (audioWs.ts)
 ]) {
     CspPolicies[src] = ConnectSrc;
 }
@@ -623,6 +626,18 @@ const P2P_AUDIO_EXE_B64 =
     + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 let audioProc: ReturnType<typeof spawn> | null = null;
+/** (1.23.23) прямая доставка PCM в Worker рендерера мимо его главного потока */
+const audioWs = new AudioWsServer();
+
+/** Адрес локального WebSocket со звуком (порт + токен) или null. */
+export async function audioStream(): Promise<{ port: number; token: string; } | null> {
+    try {
+        const port = await audioWs.start();
+        return port ? { port, token: audioWs.token } : null;
+    } catch {
+        return null;
+    }
+}
 let audioQueue: Buffer[] = [];
 let audioQueuedBytes = 0;
 /** хелпер завершился ПОСЛЕ успешного старта (закрыли игру, краш, сменилось устройство) —
@@ -699,6 +714,7 @@ function stopAudioInternal(): void {
     audioQueue = [];
     audioQueuedBytes = 0;
     audioProcDead = false;
+    audioWs.resetTail();
     if (proc) {
         try { proc.kill(); } catch { /* ignore */ }
     }
@@ -792,6 +808,8 @@ export async function startAudio(_e: IpcMainInvokeEvent, opts: { mode: string; i
 
         proc.stdout?.on("data", (chunk: Buffer) => {
             if (audioProc !== proc) return;
+            // Worker рендерера подключён — звук идёт ему напрямую, без очереди опроса
+            if (audioWs.send(chunk, FRAME_BYTES)) return;
             audioQueue.push(chunk);
             audioQueuedBytes += chunk.length;
             if (audioQueuedBytes > AUDIO_QUEUE_CAP) {

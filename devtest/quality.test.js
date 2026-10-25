@@ -429,6 +429,23 @@ const MAX = 30e6;
     for (const tt of [202000, 204000, 206000, 208000, 210000]) ok = nextCeiling(ok, { bwe: 19e6, sent: 17e6, clean: true, now: tt }, M).state;
     check("удачный перезапуск сбрасывает паузу к 15 с", ok.kickFails === 0 && ok.ceiling >= 20e6, JSON.stringify(ok));
 }
+// --- 1.23.23: не лезем туда, где канал уже ломался ---
+{
+    const M = 50e6;
+    // у потолка 46.3 реально шло 42.3, обвал оценки → потолок 33.8, запомнили 42.3
+    let c = { ceiling: 46.3e6, prevBwe: 45e6, prevSent: 42.3e6, cleanSince: 0, lastKick: 0, lastTrouble: 0 };
+    let r = nextCeiling(c, { bwe: 13e6, sent: 12e6, clean: false, now: 100000 }, M);
+    check("обвал на 42.3 → потолок 33.8 и память об обвале", Math.round(r.state.ceiling / 1e5) === 338 && r.state.failAt === 42.3e6, r.reason);
+    c = r.state;
+    let t = 100000, max = 0;
+    while (t < 100000 + 170000) { t += 2000; r = nextCeiling(c, { bwe: c.ceiling, sent: c.ceiling * 0.9, clean: true, now: t }, M); c = r.state; max = Math.max(max, c.ceiling); }
+    check("3 мин после обвала проба не выше 92% от 42.3 (≈38.9)", max <= 42.3e6 * 0.92 + 1 && max >= 38e6, (max / 1e6).toFixed(1));
+    while (t < 100000 + 230000) { t += 2000; r = nextCeiling(c, { bwe: c.ceiling, sent: c.ceiling * 0.9, clean: true, now: t }, M); c = r.state; }
+    check("после выдержки снова пробуем выше", c.ceiling > 42.3e6 * 0.92 + 1, (c.ceiling / 1e6).toFixed(1));
+    // повторный обвал там же → выдержка вдвое
+    r = nextCeiling({ ...c, prevBwe: 44e6, prevSent: 42e6 }, { bwe: 12e6, sent: 11e6, clean: false, now: t + 2000 }, M);
+    check("повторный обвал там же — выдержка 6 мин", r.state.failHoldMs === 360000, String(r.state.failHoldMs));
+}
 // --- 1.23.19: ложные «декодер не успевает» ---
 {
     const v0 = initViewerDecode(0);

@@ -684,7 +684,11 @@ export function viewerStarved(rx: { recvFps: number; fz?: number }, encFps: numb
  *    растёт 8%/с — проверено на стенде: 11.5 → 25.9 Мбит/с за 2 с), не чаще раза в 15 с;
  *  - 10 с без проблем при загрузке ≥ 80% потолка → потолок +5% (пробуем выше).
  */
-export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; prevSent?: number; lastKickBps?: number; kickFails?: number; }
+export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; prevSent?: number; lastKickBps?: number; kickFails?: number; failAt?: number; failTime?: number; failHoldMs?: number; }
+
+/** (1.23.23) сколько держимся ниже уровня обвала: 3 мин, при повторном обвале там же — вдвое (до 15 мин) */
+export const FAIL_HOLD_MS = 180_000;
+const FAIL_HOLD_MAX_MS = 900_000;
 
 /** пауза между перезапусками: 15 с, после каждого неудачного вдвое (до 60 с) */
 export function kickGapMs(fails: number): number {
@@ -736,6 +740,12 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
         next.ceiling = st.ceiling ? Math.min(st.ceiling, c) : c;
         next.lastTrouble = s.now;
         next.cleanSince = s.now;
+        // (1.23.23) запоминаем, где сломалось: проба +5% больше туда не лезет (лог 1.23.22:
+        // 42 → 44 → 46 → 48.6 → обвал → 33.8 → … → снова 42 → обвал — фриз каждую минуту)
+        const again = !!(st.failAt && st.failTime && s.now - st.failTime < (st.failHoldMs ?? FAIL_HOLD_MS) * 2 && trouble >= st.failAt * 0.85);
+        next.failHoldMs = again ? Math.min(FAIL_HOLD_MAX_MS, (st.failHoldMs ?? FAIL_HOLD_MS) * 2) : FAIL_HOLD_MS;
+        next.failAt = again && st.failAt ? Math.min(st.failAt, trouble) : trouble;
+        next.failTime = s.now;
         reason = `канал не выдержал ${(trouble / 1e6).toFixed(1)} Мбит/с — держусь до ${(next.ceiling / 1e6).toFixed(1)}`;
     }
     if (!s.clean) next.cleanSince = s.now;
@@ -747,9 +757,17 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
         reason = `канал чистый — сразу возвращаюсь на ${(next.ceiling / 1e6).toFixed(1)} Мбит/с (оценка была ${(bwe / 1e6).toFixed(1)})${next.kickFails ? `; следующая попытка не раньше чем через ${kickGapMs(next.kickFails) / 1000} с` : ""}`;
     }
     if (!trouble && !kickBps && next.ceiling && next.ceiling < userMaxBps && s.clean && s.now - next.lastTrouble >= 10_000 && s.now - next.cleanSince >= 10_000 && s.sent >= next.ceiling * 0.8) {
-        next.ceiling = Math.min(userMaxBps, Math.round(next.ceiling * 1.05));
-        next.lastTrouble = s.now;
-        reason = `10 с стабильно у потолка — пробую ${(next.ceiling / 1e6).toFixed(1)} Мбит/с`;
+        let up = Math.min(userMaxBps, Math.round(next.ceiling * 1.05));
+        // недавний обвал: не выше 92% его уровня, пока не пройдёт выдержка
+        const holding = !!(next.failAt && next.failTime && s.now - next.failTime < (next.failHoldMs ?? FAIL_HOLD_MS));
+        if (holding) up = Math.min(up, Math.round(next.failAt! * 0.92));
+        if (up > next.ceiling * 1.01) {
+            next.ceiling = up;
+            next.lastTrouble = s.now;
+            reason = holding && up === Math.round(next.failAt! * 0.92)
+                ? `10 с стабильно — пробую ${(up / 1e6).toFixed(1)} Мбит/с (выше не лезу ещё ${Math.ceil(((next.failHoldMs ?? FAIL_HOLD_MS) - (s.now - next.failTime!)) / 60_000)} мин: на ${(next.failAt! / 1e6).toFixed(1)} был обвал)`
+                : `10 с стабильно у потолка — пробую ${(up / 1e6).toFixed(1)} Мбит/с`;
+        }
     }
     if (bwe) next.prevBwe = bwe;
     if (s.sent > 0) next.prevSent = s.sent;

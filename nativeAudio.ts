@@ -20,6 +20,7 @@
 
 import { Logger } from "@utils/Logger";
 
+import { AUDIO_WS_WORKER_SRC } from "./audioWsWorker";
 import { toast } from "./utils";
 
 const logger = new Logger("P2PStream:NativeAudio");
@@ -45,6 +46,8 @@ export interface NativeAudioStats {
     underruns: number;
     /** паузы источника (в системе было тихо — хелпер ничего не слал) */
     srcPauses: number;
+    /** звук идёт напрямую main → Worker → ворклет (true) или опросом через главный поток */
+    direct: boolean;
     /** сколько раз хелпер перезапускался вотчдогом */
     restarts: number;
     /** main-процесс сообщил о смерти хелпера */
@@ -60,6 +63,7 @@ interface Helpers {
     pullAudio(): Promise<Uint8Array | null>;
     stopAudio(): Promise<void>;
     audioStatus?(): Promise<{ dead?: boolean; hasProc?: boolean }>;
+    audioStream?(): Promise<{ port: number; token: string } | null>;
 }
 
 function helpers(): Helpers | null {
@@ -110,21 +114,17 @@ class VcP2pRing extends AudioWorkletProcessor {
         this.count = 0;                 /* кол-во валидных float-значений */
         this.judge = false;
         this.gapBlocks = 0;
-        this.port.onmessage = e => {
+        /* решение «застряло / источник молчал» — по сумме данных за ~10 мс после
+           возврата: застрявшее приходит пачкой, иногда несколькими сообщениями подряд */
+        this.judgeLeft = -1;
+        this.judgeFrames = 0;
+        const onData = e => {
             const d = e.data;
             if (!d || !d.length) return;
             const n = d.length - (d.length % 2); /* только целые стерео-кадры */
             if (this.judge) {
-                this.judge = false;
-                const gapFrames = this.gapBlocks * 128;
-                const gapMs = Math.round(gapFrames / 48);
-                if (n / 2 >= gapFrames * 0.5 || gapFrames < 48000 * 0.05) {
-                    this.setTarget(this.target + 48000 * 2 * 0.05);
-                    this.calm = 0;
-                    this.port.postMessage({ u: 1, ms: gapMs });
-                } else {
-                    this.port.postMessage({ p: 1, ms: gapMs });
-                }
+                this.judgeFrames += n / 2;
+                if (this.judgeLeft < 0) this.judgeLeft = 4;
             }
             for (let i = 0; i < n; i++) {
                 if (this.count >= this.cap) {
@@ -141,6 +141,12 @@ class VcP2pRing extends AudioWorkletProcessor {
                 this.read = (this.read + drop) % this.cap;
                 this.count -= drop;
             }
+        };
+        /* (1.23.23) данные идут либо из главного потока (опрос), либо напрямую из
+           Worker через присланный MessagePort — мимо главного потока окна */
+        this.port.onmessage = e => {
+            if (e.data && e.data.port) { e.data.port.onmessage = onData; return; }
+            onData(e);
         };
     }
     setTarget(t) {
@@ -170,8 +176,25 @@ class VcP2pRing extends AudioWorkletProcessor {
             this.buffering = true;
             this.judge = true;
             this.gapBlocks = 0;
+            this.judgeLeft = -1;
+            this.judgeFrames = 0;
         }
-        if (this.judge) this.gapBlocks++;
+        if (this.judge) {
+            if (this.judgeLeft < 0) this.gapBlocks++;
+            else if (--this.judgeLeft <= 0) {
+                this.judge = false;
+                this.judgeLeft = -1;
+                const gapFrames = this.gapBlocks * 128;
+                const gapMs = Math.round(gapFrames / 48);
+                if (this.judgeFrames >= gapFrames * 0.5 || gapFrames < 48000 * 0.05) {
+                    this.setTarget(this.target + 48000 * 2 * 0.05);
+                    this.calm = 0;
+                    this.port.postMessage({ u: 1, ms: gapMs });
+                } else {
+                    this.port.postMessage({ p: 1, ms: gapMs });
+                }
+            }
+        }
         /* 20 с без провалов — сжимаемся на 10 мс, дальше каждые 5 с (375 блоков/с) */
         if (++this.calm >= 375 * 20 && this.target > this.minT) {
             this.setTarget(this.target - 48000 * 2 * 0.01);
@@ -244,6 +267,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         avgMs: 0,
         underruns: 0,
         srcPauses: 0,
+        direct: false,
         restarts: 0,
         dead: false,
         silenceMs: 0,
@@ -312,6 +336,46 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         };
 
         let lastStallLog = 0;
+        // (1.23.23) прямая доставка: main → WebSocket → Worker → ворклет (главный поток
+        // окна Discord не участвует; его зависания на 250+ мс и давали провалы звука)
+        let worker: Worker | null = null;
+        let workerUrl = "";
+        const stopWorker = () => {
+            try { worker?.postMessage({ stop: 1 }); } catch { /* ignore */ }
+            try { worker?.terminate(); } catch { /* ignore */ }
+            worker = null;
+            if (workerUrl) URL.revokeObjectURL(workerUrl);
+            workerUrl = "";
+            st.direct = false;
+        };
+        try {
+            const ep = await Native.audioStream?.();
+            if (ep?.port && ep.token) {
+                const ch = new MessageChannel();
+                node.port.postMessage({ port: ch.port2 }, [ch.port2]);
+                workerUrl = URL.createObjectURL(new Blob([AUDIO_WS_WORKER_SRC], { type: "text/javascript" }));
+                worker = new Worker(workerUrl);
+                let announced = false;
+                worker.onmessage = e => {
+                    const d = e.data ?? {};
+                    if (d.open) {
+                        st.direct = true;
+                        if (!announced) logger.info("Звук: прямая доставка из main-процесса (мимо главного потока окна)");
+                        announced = true;
+                    }
+                    if (d.closed) st.direct = false;
+                    if (d.beat) lastDataAt = Date.now();
+                };
+                worker.onerror = e => {
+                    logger.info("Звук: Worker прямой доставки упал — остаётся опрос:", (e as ErrorEvent).message ?? e);
+                    stopWorker();
+                };
+                worker.postMessage({ url: `ws://127.0.0.1:${ep.port}/${ep.token}`, port: ch.port1 }, [ch.port1]);
+            }
+        } catch (e) {
+            logger.info("Звук: прямая доставка недоступна — остаётся опрос:", e);
+            stopWorker();
+        }
         let stopped = false;
         let pulling = false; // запросы не внахлёст: иначе куски PCM могли прийти не по порядку
         const pullTimer = setInterval(() => {
@@ -375,6 +439,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         const track = dest.stream.getAudioTracks()[0];
         if (!track) {
             stopped = true;
+            stopWorker();
             clearInterval(pullTimer);
             clearInterval(watchdog);
             node.disconnect();
@@ -392,6 +457,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
                     avgMs: Math.round(st.avgMs),
                     underruns: st.underruns,
                     srcPauses: st.srcPauses,
+                    direct: st.direct,
                     restarts: st.restarts,
                     dead: st.dead,
                     silenceMs: st.silenceMs,
@@ -401,6 +467,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
             stop() {
                 if (stopped) return;
                 stopped = true;
+                stopWorker();
                 clearInterval(pullTimer);
                 clearInterval(watchdog);
                 try { track.stop(); } catch { /* ignore */ }
