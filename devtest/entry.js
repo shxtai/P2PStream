@@ -137,6 +137,17 @@ if (role === "host") {
             return orig.apply(this, a);
         };
     }
+    // ?stall — зритель сообщает стримеру «собираю мало кадров, замираю» (как на VPN
+    // с потерями): стример должен снизить битрейт
+    if (q.has("stall")) {
+        const origSend = RTCDataChannel.prototype.send;
+        RTCDataChannel.prototype.send = function (data) {
+            if (this.label === "p2p-fb") {
+                try { const m = JSON.parse(data); if (m.t === "rx") data = JSON.stringify({ ...m, recv: 10, dec: 10, fz: 1 }); } catch { }
+            }
+            return origSend.call(this, data);
+        };
+    }
     void probeNat().then(r => status(`NAT: ${r}`));
     let t0 = Date.now(); // сбрасывается в момент watch(): меряем подключение, а не ожидание анонса
     const video = Object.assign(document.createElement("video"), { muted: true, autoplay: true });
@@ -197,7 +208,7 @@ if (role === "host") {
                 void (async () => {
                     // отчёт /p2p-doctor зрителя (VERBOSE=1 — виден в выводе)
                     // через 15 с — когда оценка канала (BWE) уже разогналась
-                    await new Promise(r => setTimeout(r, q.has("directfallback") ? 34000 : q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
+                    await new Promise(r => setTimeout(r, q.has("stall") ? 20000 : q.has("directfallback") ? 34000 : q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
                     for (const l of await mediaReport(w.pc, "in")) report("IN ", l);
                     status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${secs} с, путь ${await pathOf(w.pc)}`);
                 })();

@@ -18,6 +18,10 @@
 export interface SendSample {
     /** доля потерь по отчёту зрителя (0..1), null — нет данных */
     loss: number | null;
+    /** зритель недополучает кадры / замирает (его обратная связь, см. viewerStarved) */
+    viewerStall?: boolean;
+    /** текущий реальный потолок отправки, бит/с: урезаем от него, а не от настроек */
+    curBps?: number;
     /** запросов ключевого кадра (PLI) за интервал */
     pli: number;
     /** RTT, мс (null — нет данных) */
@@ -43,6 +47,8 @@ export interface SendState {
     lossAtCut: number;
     /** снижений подряд, после которых потери НЕ уменьшились */
     uselessCuts: number;
+    /** до этого момента не растём (после среза из-за заморозок у зрителя) */
+    holdUntil?: number;
 }
 
 export const MIN_CAP_BPS = 1_500_000;
@@ -107,17 +113,27 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     }
     if (next.uselessCuts >= 2) lossy = false;
 
-    if ((lossy || pliStorm || queueing) && (!st.lastCut || s.now - st.lastCut >= 4000)) {
+    // (1.23.13) Зритель недополучает кадры или замирает — это перегрузка, даже если
+    // потери «всего» 0.3%: реальный лог — отправлено 58 FPS, собрано 29, показано 9,
+    // 5 заморозок за минуту; на VPN с RTT 100 мс каждый потерянный пакет держит кадр
+    // до повторной пересылки. Порог потерь (2–5%) этого не ловил.
+    const stall = !!s.viewerStall;
+    if ((lossy || pliStorm || queueing || stall) && (!st.lastCut || s.now - st.lastCut >= 4000)) {
         // резко — только при реально плохом канале, иначе мягко
         const factor = next.lossEwma > 0.15 || (pliStorm && s.pli >= 4) ? 0.6 : 0.8;
-        next.capBps = Math.max(MIN_CAP_BPS, Math.round(st.capBps * factor));
+        // режем от реальной скорости: потолок мог стоять на 100 Мбит/с из настроек при
+        // фактических 31 — тогда пять срезов подряд ничего не меняли (~20 с заморозок)
+        const base = s.curBps && s.curBps > 0 ? Math.min(st.capBps, s.curBps) : st.capBps;
+        next.capBps = Math.max(MIN_CAP_BPS, Math.round(base * factor));
         next.lastCut = s.now;
         next.cleanSince = s.now;
         next.lossAtCut = lossy ? next.lossEwma : 0;
-        const why = lossy ? `потери ${(next.lossEwma * 100).toFixed(1)}%` : pliStorm ? `запросы ключевых кадров ×${s.pli}` : `очередь (RTT ${Math.round(s.rttMs!)} мс)`;
+        if (stall && !lossy && !pliStorm && !queueing) next.holdUntil = s.now + 20_000;
+        const why = lossy ? `потери ${(next.lossEwma * 100).toFixed(1)}%` : pliStorm ? `запросы ключевых кадров ×${s.pli}` : queueing ? `очередь (RTT ${Math.round(s.rttMs!)} мс)` : "зритель недополучает кадры / замирает";
         return { state: next, reason: next.capBps !== st.capBps ? why : null };
     }
-    if (lossy || pliStorm || queueing) return { state: next, reason: null };
+    if (lossy || pliStorm || queueing || stall) return { state: next, reason: null };
+    if (st.holdUntil && s.now < st.holdUntil) return { state: next, reason: null };
 
     if (next.lossEwma < 0.01) next.uselessCuts = 0;
     // чисто: после 10 с без проблем — +15% за шаг до пользовательского максимума
@@ -609,4 +625,13 @@ export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: str
         return { state: next, action: "up", reason: "зритель успевает — пробую ступень выше" };
     }
     return { state: next, action: null, reason: null };
+}
+
+/**
+ * Зритель «голодает»: собирает < 70% отправленных кадров (остальные приходят
+ * с дырками и ждут повторной пересылки) или за интервал были заморозки.
+ * Статичный экран (энкодер выдаёт < 20 FPS) — не голод.
+ */
+export function viewerStarved(rx: { recvFps: number; fz?: number }, encFps: number): boolean {
+    return (encFps >= 20 && rx.recvFps < encFps * 0.7) || (rx.fz ?? 0) >= 1;
 }

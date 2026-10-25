@@ -21,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -737,8 +737,10 @@ class HostPeer {
     private encoderStall = 0;
     private triedCodecs: string[] = [];
     /** обратная связь от зрителя: как его декодер справляется (последний замер) */
-    viewerRx: (ViewerRx & { impl: string; at: number; }) | null = null;
+    viewerRx: (ViewerRx & { impl: string; at: number; fz?: number; }) | null = null;
     private viewerDecode: ViewerDecodeState | null = null;
+    /** отчётов зрителя подряд с «голодом» (см. viewerStarved) */
+    private starved = 0;
     /** текущий видеокодек этого зрителя (из статистики) */
     codecName = "";
     private lastOfferAt = 0;
@@ -757,7 +759,7 @@ class HostPeer {
             fb.onmessage = ev => {
                 try {
                     const m = JSON.parse(String(ev.data));
-                    if (m?.t === "rx") this.viewerRx = { recvFps: +m.recv || 0, decFps: +m.dec || 0, dropFps: +m.drop || 0, hw: !!m.hw, impl: String(m.impl ?? "?"), at: Date.now() };
+                    if (m?.t === "rx") this.viewerRx = { recvFps: +m.recv || 0, decFps: +m.dec || 0, dropFps: +m.drop || 0, fz: +m.fz || 0, hw: !!m.hw, impl: String(m.impl ?? "?"), at: Date.now() };
                 } catch { /* ignore */ }
             };
         } catch { /* ignore */ }
@@ -991,6 +993,7 @@ class HostPeer {
         const userMax = () => Math.round(Number(settings.store.videoBitrate) * 1_000_000);
         this.aqState = initSendState(userMax(), Date.now());
         let prevPli = -1, prevSrc = -1, prevEnc = -1, prevLost = -1, prevSent = -1, prevNack = -1;
+        let prevBytes = -1, prevBytesAt = 0, sentBps = 0;
         this.aqTimer = setInterval(async () => {
             if (this.closed || !this.aqState) return;
             if (settings.store.autoQuality === false) {
@@ -1000,7 +1003,7 @@ class HostPeer {
             try {
                 let loss: number | null = null, rttMs: number | null = null, pliTotal = 0, codecId = "";
                 let srcTotal = 0, encTotal = 0, encFps = 0, cpuLimited = false;
-                let lostTotal = 0, sentTotal = 0, nackTotal = 0, bweBps: number | null = null, fraction: number | null = null;
+                let bytesTotal = 0, lostTotal = 0, sentTotal = 0, nackTotal = 0, bweBps: number | null = null, fraction: number | null = null;
                 const report = await this.pc.getStats();
                 report.forEach((r: any) => {
                     if (r.kind !== "video") return;
@@ -1014,6 +1017,7 @@ class HostPeer {
                         encTotal = r.framesEncoded ?? 0;
                         encFps = r.framesPerSecond ?? 0;
                         sentTotal = r.packetsSent ?? 0;
+                        bytesTotal = r.bytesSent ?? 0;
                         nackTotal = r.nackCount ?? 0;
                         cpuLimited = r.qualityLimitationReason === "cpu";
                     } else if (r.type === "media-source") {
@@ -1062,7 +1066,18 @@ class HostPeer {
                 }
                 const max = userMax();
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
-                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now() }, max);
+                // фактическая скорость отправки видео (от неё режем при заморозках у зрителя)
+                const nowT = Date.now();
+                if (prevBytes >= 0 && nowT > prevBytesAt) sentBps = Math.max(0, bytesTotal - prevBytes) * 8 * 1000 / (nowT - prevBytesAt);
+                prevBytes = bytesTotal;
+                prevBytesAt = nowT;
+                // зритель недополучает кадры / замирает (2 отчёта подряд — не случайность)
+                const rxNow = this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
+                const starvedNow = !!rxNow && viewerStarved(rxNow, encFps);
+                this.starved = starvedNow ? this.starved + 1 : 0;
+                const viewerStall = this.starved >= 2;
+                if (this.starved === 2 && rxNow) logger.info(`Зритель ${this.userId}: собирает ${Math.round(rxNow.recvFps)} из ${Math.round(encFps)} FPS${rxNow.fz ? `, заморозок +${rxNow.fz}` : ""} — снижаю битрейт`);
+                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now(), viewerStall, curBps: sentBps > 0 ? sentBps : undefined }, max);
                 this.aqState = state;
                 const userFps = Number(settings.store.fps) || 60;
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
@@ -1618,14 +1633,15 @@ export class WatchSession {
         const userMin = () => Number(settings.store.jitterBuffer) || 0;
         let st: RecvState = { targetMs: userMin(), calmSince: Date.now() };
         let prevFreezes = -1;
-        let prev: { recv: number; dec: number; drop: number; at: number; } | null = null;
+        let prev: { recv: number; dec: number; drop: number; fz: number; at: number; } | null = null;
         this.jbTimer = setInterval(async () => {
             if (this.pc !== pc) return;
             // обратная связь стримеру: сколько кадров декодер реально успевает
             try {
-                let recv = 0, dec = 0, drop = 0, impl = "?", hw = false;
+                let recv = 0, dec = 0, drop = 0, fzTotal = 0, impl = "?", hw = false;
                 (await pc.getStats()).forEach((r: any) => {
                     if (r.type === "inbound-rtp" && r.kind === "video") {
+                        fzTotal = r.freezeCount ?? 0;
                         recv = r.framesReceived ?? 0;
                         dec = r.framesDecoded ?? 0;
                         drop = r.framesDropped ?? 0;
@@ -1636,9 +1652,9 @@ export class WatchSession {
                 const now = Date.now();
                 if (prev && this.fb?.readyState === "open" && now > prev.at) {
                     const k = 1000 / (now - prev.at);
-                    this.fb.send(JSON.stringify({ t: "rx", recv: (recv - prev.recv) * k, dec: (dec - prev.dec) * k, drop: Math.max(0, drop - prev.drop) * k, hw, impl }));
+                    this.fb.send(JSON.stringify({ t: "rx", recv: (recv - prev.recv) * k, dec: (dec - prev.dec) * k, drop: Math.max(0, drop - prev.drop) * k, fz: Math.max(0, fzTotal - prev.fz), hw, impl }));
                 }
-                prev = { recv, dec, drop, at: now };
+                prev = { recv, dec, drop, fz: fzTotal, at: now };
             } catch { /* ignore */ }
             if (settings.store.autoQuality === false) return;
             try {

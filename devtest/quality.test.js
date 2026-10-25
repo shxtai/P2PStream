@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -301,5 +301,22 @@ const MAX = 30e6;
     check("45 с без проблем -> ступень выше", back.action === "up" && back.state.steps === 0);
     const stat = nextViewerDecode(initViewerDecode(0), { recvFps: 5, decFps: 5, dropFps: 0, hw: false }, "av1", 10000, 14);
     check("статичный экран (5 FPS приходит) -> не проблема", stat.action === null && stat.state.strain === 0);
+}
+// --- 1.23.13: зритель недополучает кадры при «мелких» потерях ---
+{
+    check("голод: собрано 29 из 58 FPS", viewerStarved({ recvFps: 29 }, 58));
+    check("голод: заморозка за интервал", viewerStarved({ recvFps: 58, fz: 1 }, 58));
+    check("не голод: собрано 55 из 58", !viewerStarved({ recvFps: 55, fz: 0 }, 58));
+    check("не голод: статичный экран (энкодер 5 FPS)", !viewerStarved({ recvFps: 2 }, 5));
+    // реальный случай: потолок 100 из настроек, реально 31, потери 0.3% — режем от 31
+    let st = initSendState(100e6, 0);
+    let r = nextCap(st, { loss: 0.003, pli: 1, rttMs: 100, now: 10000, viewerStall: true, curBps: 31e6 }, 100e6);
+    check("заморозки у зрителя при потерях 0.3% → срез от реальных 31 Мбит/с", r.state.capBps === Math.round(31e6 * 0.8), `${(r.state.capBps / 1e6).toFixed(1)} Мбит/с, ${r.reason}`);
+    const held = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 20000, curBps: 25e6 }, 100e6);
+    check("после среза из-за заморозок 20 с не растём", held.state.capBps === r.state.capBps);
+    const grown = nextCap(r.state, { loss: 0, pli: 0, rttMs: 100, now: 40000, curBps: 25e6 }, 100e6);
+    check("через 20+ с чистого канала — снова растём", grown.state.capBps > r.state.capBps);
+    const noStall = nextCap(initSendState(100e6, 0), { loss: 0.003, pli: 0, rttMs: 100, now: 10000, curBps: 31e6 }, 100e6);
+    check("без заморозок потери 0.3% не режут (как раньше)", noStall.state.capBps === 100e6);
 }
 process.exit(failed ? 1 : 0);
