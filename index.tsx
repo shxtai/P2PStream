@@ -127,6 +127,12 @@ function migrateLegacyAudio(): void {
  *  один раз проставляем новые значения. Свой брокер, настроенный вручную,
  *  не трогаем: раз адрес вписан, выбор был осознанным. */
 function migrateBroker121(): void {
+    // (1.23.17/18) с мёртвого брокера — на рабочий по умолчанию. ДО раннего return ниже:
+    // в 1.23.17 стояло после него и у всех, кто уже мигрировал в 1.21, не срабатывало
+    try {
+        const s = settings.store as any;
+        if (String(s.brokerUrl ?? "").trim() === DEAD_BROKER_URL) s.brokerUrl = DEFAULT_BROKER_URL;
+    } catch { /* ignore */ }
     try {
         const s = settings.store as any;
         if (s.brokerMigrated121) return;
@@ -138,11 +144,6 @@ function migrateBroker121(): void {
             s.brokerEnabled = true;
         }
         s.brokerMigrated121 = true;
-    } catch { /* ignore */ }
-    // (1.23.17) с мёртвого брокера — на рабочий по умолчанию
-    try {
-        const s = settings.store as any;
-        if (String(s.brokerUrl ?? "").trim() === DEAD_BROKER_URL) s.brokerUrl = DEFAULT_BROKER_URL;
     } catch { /* ignore */ }
 }
 

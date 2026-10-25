@@ -21,7 +21,7 @@ const ROOT = path.resolve(__dirname, "..");
 /** «relay» в сценарии: поднимается локальный TURN, зритель ходит ТОЛЬКО через него */
 const SCENARIOS = process.argv.slice(2).length
     ? process.argv.slice(2)
-    : ["delay=300", "delay=800&loss=0.3", "delay=1000&loss=0.5", "delay=300&relay", "delay=300&loss=1", "delay=300&nobroker", "delay=300&dropcodec", "delay=300&ad=200", "delay=300&split", "delay=300&split&stalevia", "delay=300&viewerav1", "delay=300&directfallback", "delay=300&stall"];
+    : ["delay=300", "delay=800&loss=0.3", "delay=1000&loss=0.5", "delay=300&relay", "delay=300&loss=1", "delay=300&nobroker", "delay=300&dropcodec", "delay=300&ad=200", "delay=300&split", "delay=300&split&stalevia", "delay=300&viewerav1", "delay=300&directfallback", "delay=300&stall", "delay=300&heavy&kick"];
 
 function lanIp() {
     for (const list of Object.values(os.networkInterfaces())) {

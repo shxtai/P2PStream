@@ -106,6 +106,8 @@ if (role === "host") {
                 setTimeout(async () => { const ps = (await peer.pc.getStats()); let sel = null; ps.forEach(r => { if (r.type === "transport" && r.selectedCandidatePairId) sel = ps.get(r.selectedCandidatePairId); }); const l = sel && ps.get(sel.localCandidateId), rc = sel && ps.get(sel.remoteCandidateId); report("OUT", `стенд: через 30 с directOnly=${peer.directOnly}, conn=${peer.pc.connectionState}, пара ${l?.candidateType} ${l?.address} ↔ ${rc?.candidateType} ${rc?.address}`); }, 30_000);
             }, 2000);
         }
+        // ?kick — через 10 с пересогласовать с «стартом» 25 Мбит/с: оценка должна прыгнуть
+        if (q.has("kick")) setTimeout(() => { peer.effSmooth = 25e6; report("OUT", "стенд: пересогласование со стартом 25 Мбит/с"); void peer.negotiate(false); }, 10_000);
         // ?ramp — разгон: каждые 2 с оценка канала, отправка, разрешение (30 с)
         if (q.has("ramp")) {
             const t0r = Date.now(); let prevBytes = 0, prevT = Date.now();

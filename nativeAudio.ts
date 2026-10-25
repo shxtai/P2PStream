@@ -130,8 +130,10 @@ class VcP2pRing extends AudioWorkletProcessor {
         /* после провала копим сразу до рабочего уровня (иначе дрейф-коррекция
            набирала бы его секундами); перелив режем выше target + 150 мс */
         this.prefill = this.target;
-        this.maxLag = this.target + 48000 * 2 * 0.15;
-        this.trimTo = this.target + 48000 * 2 * 0.04;
+        /* (1.23.18) перелив режем уже выше target + 80 мс (было +150: в логе буфер
+           раздувался до 324 мс, и видео ждало звук на столько же) */
+        this.maxLag = this.target + 48000 * 2 * 0.08;
+        this.trimTo = this.target + 48000 * 2 * 0.02;
     }
     process(_inputs, outputs) {
         const out = outputs[0];

@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved, initCeil, nextCeiling } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -364,5 +364,33 @@ const MAX = 30e6;
     const need = rungNeedBps(L[i1080], 16 / 9);
     check("на 1080p60: битрейт просел до 90% нужного — держим ступень", pickRung(L, need * 0.9, 16 / 9, i1080) === i1080);
     check("на 1080p60: просел до 80% нужного — спускаемся", pickRung(L, need * 0.8, 16 / 9, i1080) > i1080);
+}
+// --- 1.23.18: потолок канала ---
+{
+    const M = 40e6;
+    // старт 40, канал не выдержал (оценка 5) → потолок 32
+    let c = initCeil(0);
+    let r = nextCeiling(c, { bwe: 5e6, sent: 4e6, clean: false, startBps: 40e6, now: 2000 }, M);
+    check("старт 40 не выдержан → потолок 32", r.state.ceiling === 32e6, r.reason);
+    c = r.state;
+    // 4 с чистого канала → перезапуск оценки на 32
+    r = nextCeiling(c, { bwe: 6e6, sent: 5e6, clean: true, now: 4000 }, M); c = r.state;
+    check("2 с чисто — ещё не перезапускаем", r.kickBps === null);
+    r = nextCeiling(c, { bwe: 7e6, sent: 6e6, clean: true, now: 6000 }, M); c = r.state;
+    check("4 с чисто, оценка 7 < 60% потолка → перезапуск на 32", r.kickBps === 32e6, r.reason);
+    r = nextCeiling(c, { bwe: 8e6, sent: 6e6, clean: true, now: 10000 }, M); c = r.state;
+    check("повторный перезапуск не раньше 15 с", r.kickBps === null);
+    // работаем у потолка, обвал 31 → 6 → потолок 24.8
+    r = nextCeiling({ ...c, prevBwe: 31e6 }, { bwe: 6e6, sent: 5e6, clean: false, now: 40000 }, M);
+    check("обвал 31 → 6 → потолок 24.8", Math.round(r.state.ceiling / 1e5) === 248, r.reason);
+    // 30 с стабильно у потолка → +5%
+    let s = { ceiling: 30e6, prevBwe: 30e6, cleanSince: 0, lastKick: 0, lastTrouble: 0 };
+    r = nextCeiling(s, { bwe: 30e6, sent: 27e6, clean: true, now: 8000 }, M);
+    check("8 с у потолка — ещё не пробуем выше", r.state.ceiling === 30e6);
+    r = nextCeiling(s, { bwe: 30e6, sent: 27e6, clean: true, now: 11000 }, M);
+    check("10 с стабильно у потолка → +5%", r.state.ceiling === 31.5e6, r.reason);
+    // мелкие колебания оценки — не обвал
+    r = nextCeiling({ ...s, prevBwe: 30e6 }, { bwe: 22e6, sent: 20e6, clean: true, now: 5000 }, M);
+    check("30 → 22 — не обвал", r.state.ceiling === 30e6 && !r.kickBps);
 }
 process.exit(failed ? 1 : 0);

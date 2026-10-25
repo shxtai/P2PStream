@@ -21,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -741,6 +741,10 @@ class HostPeer {
     private viewerDecode: ViewerDecodeState | null = null;
     /** отчётов зрителя подряд с «голодом» (см. viewerStarved) */
     private starved = 0;
+    /** потолок канала (nextCeiling) и стартовая скорость для «перезапуска» оценки */
+    private ceil: CeilState | null = null;
+    private kickStartBps = 0;
+    private startedBps = 0;
     /** канал обратной связи (и прямой: сдвиг видео под звук раз в 2 с) */
     private fb: RTCDataChannel | null = null;
     private connectedAt = 0;
@@ -900,7 +904,10 @@ class HostPeer {
                 // Старт оценки канала — со скорости, заданной стримером (идущий сеанс —
                 // с текущей): не тянет — WebRTC за ~секунду опустится до реальной
                 const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
-                const startBps = startBitrateBps(this.effSmooth, userMax);
+                // «перезапуск» оценки на потолке канала (nextCeiling) — иначе обычный старт
+                const startBps = this.kickStartBps || startBitrateBps(this.effSmooth, userMax);
+                this.kickStartBps = 0;
+                if (!this.startedBps) this.startedBps = startBps;
                 const offerSdp = this.pc.localDescription?.sdp ?? "";
                 let sdp = withStartBitrate(d.sdp, Math.round(startBps / 1000));
                 // кодек отправки = первый в ответе: ставим порядок НАШЕГО оффера (иначе
@@ -1076,7 +1083,8 @@ class HostPeer {
                     this.encoderStall = 0;
                     if (this.switchCodec(broken)) return;
                 }
-                const max = userMax();
+                // потолок канала (nextCeiling ниже, по прошлому замеру) — дальше него не лезем
+                const max = this.ceil?.ceiling ? Math.min(userMax(), this.ceil.ceiling) : userMax();
                 if (this.aqState.capBps > max) this.aqState = { ...this.aqState, capBps: max }; // максимум снизили в настройках
                 // фактическая скорость отправки видео (от неё режем при заморозках у зрителя)
                 const nowT = Date.now();
@@ -1091,6 +1099,15 @@ class HostPeer {
                 this.starved = starvedNow ? this.starved + 1 : 0;
                 const viewerStall = this.starved >= 2;
                 if (this.starved === 2 && rxNow) logger.info(`Зритель ${this.userId}: собирает ${Math.round(rxNow.recvFps)} из ${Math.round(encFps)} FPS${rxNow.fz ? `, заморозок +${rxNow.fz}` : ""} — снижаю битрейт`);
+                // потолок канала: обвал → держимся ниже, после обвала — сразу «перезапуск» оценки
+                this.ceil ??= initCeil(Date.now());
+                const ce = nextCeiling(this.ceil, { bwe: bweBps, sent: sentBps, clean: (loss ?? 0) < 0.02 && !viewerStall, startBps: this.startedBps || undefined, now: Date.now() }, userMax());
+                this.ceil = ce.state;
+                if (ce.reason) logger.info(`Канал → ${this.userId}: ${ce.reason}`);
+                if (ce.kickBps) {
+                    this.kickStartBps = ce.kickBps;
+                    void this.negotiate(false);
+                }
                 const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now(), viewerStall, curBps: sentBps > 0 ? sentBps : undefined }, max);
                 this.aqState = state;
                 const userFps = Number(settings.store.fps) || 60;
