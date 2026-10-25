@@ -21,7 +21,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, demoteVpnInSdp, demoteVpnCandidate, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -336,7 +336,7 @@ function mungeOpusStereo(sdp: string): string {
             if (fm && opusPts.has(fm[1]) && !fm[2].includes("stereo=1")) {
                 // useinbandfec=1: Opus сам чинит потери пакетов — на нестабильных
                 // сетях звук не осыпается (для музыки stereo+fec — правильная связка)
-                lines[i] = `a=fmtp:${fm[1]} ${fm[2]};stereo=1;sprop-stereo=1;maxaveragebandwidth=510000;useinbandfec=1`;
+                lines[i] = `a=fmtp:${fm[1]} ${fm[2]};stereo=1;sprop-stereo=1;maxaveragebitrate=510000;useinbandfec=1`;
             }
         }
         return lines.join("\r\n");
@@ -606,6 +606,10 @@ function waitIceGathering(pc: RTCPeerConnection, ms: number): Promise<void> {
 function applyReceiverDelays(pc: RTCPeerConnection, baseMs: number, audioLeadMs = 0): void {
     for (const receiver of pc.getReceivers()) {
         const target = Math.min(4000, baseMs + (receiver.track?.kind === "video" ? audioLeadMs : 0));
+        // (1.23.21) каждое изменение цели — растяжение/сжатие звука в NetEq (слышно на
+        // музыке); одно и то же значение не переставляем
+        if ((receiver as any).__p2pDelay === target) continue;
+        (receiver as any).__p2pDelay = target;
         try {
             (receiver as any).jitterBufferTarget = target;
         } catch { /* ignore */ }
@@ -911,17 +915,21 @@ class HostPeer {
                 this.kickStartBps = 0;
                 if (!this.startedBps) this.startedBps = startBps;
                 const offerSdp = this.pc.localDescription?.sdp ?? "";
-                let sdp = withStartBitrate(d.sdp, Math.round(startBps / 1000));
+                // (1.23.21) stereo=1 в ОТВЕТЕ зрителя: энкодер Opus стримера смотрит на удалённое
+                // описание, а в ответе Chrome stereo нет — проверено на стенде (заголовки Opus):
+                // без этого 0 из 426 кадров стерео, звук всё время шёл в МОНО
+                let sdp = withStartBitrate(mungeOpusStereo(d.sdp), Math.round(startBps / 1000));
                 // кодек отправки = первый в ответе: ставим порядок НАШЕГО оффера (иначе
                 // Chrome зрителя выбирал программный AV1)
                 sdp = reorderAnswerCodecs(sdp, offerSdp);
-                // зритель в другой сети — его VPN/LAN-адреса в конец очереди ICE
+                // (1.23.21) порядок путей — как решает WebRTC; VPN не понижаем: лог 1.23.20 —
+                // прямой путь через интернет держал 5–16 Мбит/с, VPN — 30–47
                 const peerLines = [...d.sdp.split("\r\n"), ...(d.candidates ?? []).map(c => c.candidate ?? "")];
                 this.peerRemote = peerIsRemote(srflxIps(offerSdp.split("\r\n").concat(this.localCandLines)), srflxIps(peerLines));
-                if (this.peerRemote) sdp = this.directOnly ? removeVpnInSdp(sdp) : demoteVpnInSdp(sdp);
+                if (this.directOnly) sdp = removeVpnInSdp(sdp);
                 if (!this.startLogged) {
                     this.startLogged = true;
-                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.peerRemote ? "; зритель в другой сети — прямой путь важнее VPN/LAN-адресов" : ""}`);
+                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.peerRemote ? "; зритель в другой сети" : ""}`);
                 }
                 await this.pc.setRemoteDescription({ type: "answer", sdp });
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
@@ -952,6 +960,7 @@ class HostPeer {
     /** «только прямой путь»: VPN/LAN-кандидаты зрителя не используем вовсе */
     private directOnly = false;
     private directChecked = false;
+    private lastPairId = "";
 
     /**
      * Проверка прямого пути (1.23.11). Реальный лог 1.23.10: приоритет VPN понижен,
@@ -971,15 +980,8 @@ class HostPeer {
                 logger.info(`Путь → ${this.userId}: через VPN/LAN, прямой путь через интернет не пробился (успешных пар ${pairs.filter(p => p.state === "succeeded").length}) — остаёмся на VPN`);
                 return;
             }
-            logger.info(`Путь → ${this.userId}: выбран VPN/LAN, но прямой путь через интернет тоже работает — переподключаюсь напрямую`);
-            this.directOnly = true;
-            void this.negotiate(true);
-            // не собралось за 12 с — назад на VPN; итог — в лог (по нему видно, сработало ли)
-            setTimeout(() => {
-                if (this.closed || !this.directOnly) return;
-                if (this.pc.connectionState !== "connected") this.fallbackFromDirect("за 12 с не соединилось");
-                else void logSelectedPair(this.pc, `эфир → ${this.userId}, после перехода на прямой путь`);
-            }, 12_000);
+            // (1.23.21) только в лог: переход на прямой путь в 1.23.20 сделал хуже (см. handleAnswer)
+            logger.info(`Путь → ${this.userId}: через VPN/LAN; прямой путь через интернет тоже доступен — остаёмся на VPN`);
         } catch { /* ignore */ }
     }
 
@@ -992,9 +994,9 @@ class HostPeer {
     private localCandLines: string[] = [];
 
     private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit | null {
-        if (!this.peerRemote || !c.candidate) return c;
+        if (!c.candidate) return c;
         if (this.directOnly && isVpnHostCandidate(c.candidate)) return null;
-        return { ...c, candidate: demoteVpnCandidate(c.candidate) };
+        return c;
     }
 
     /**
@@ -1050,6 +1052,8 @@ class HostPeer {
                     if (r.type === "transport" && r.selectedCandidatePairId) {
                         const pair: any = report.get(r.selectedCandidatePairId);
                         if (pair?.availableOutgoingBitrate) bweBps = pair.availableOutgoingBitrate;
+                        if (this.lastPairId && r.selectedCandidatePairId !== this.lastPairId) void logSelectedPair(this.pc, `эфир → ${this.userId}, путь сменился`);
+                        this.lastPairId = r.selectedCandidatePairId;
                     }
                 });
                 // Потери — по НАКОПЛЕННЫМ счётчикам за интервал (потеряно / отправлено),
@@ -1481,7 +1485,9 @@ export class WatchSession {
 
             this.excludeBadCodecs(pc);
             const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+            // (1.23.21) stereo=1 в СВОЁМ ответе: по нему Chrome настраивает и декодер приёма —
+            // без этого стерео сводилось в моно даже при стерео-кадрах (проверено на стенде)
+            await pc.setLocalDescription({ type: "answer", sdp: mungeOpusStereo(answer.sdp ?? "") });
 
             // NON-TRICKLE: все наши кандидаты едут вместе с answer одним сообщением.
             // localDescription после сбора уже содержит их строками a=candidate —
@@ -1543,7 +1549,7 @@ export class WatchSession {
     private fixRemote(c: RTCIceCandidateInit): RTCIceCandidateInit | null {
         if (!c.candidate) return c;
         if (this.noVpn && isVpnHostCandidate(c.candidate)) return null;
-        return this.hostRemote ? { ...c, candidate: demoteVpnCandidate(c.candidate) } : c;
+        return c;
     }
 
     /** Отправить накопленных кандидатов одной пачкой (батчинг как у хоста) */

@@ -447,7 +447,9 @@ export const MAX_JITTER_TARGET_MS = 300;
  * одной заморозки картинка ещё долго отставала.)
  */
 export function nextJitterTarget(st: RecvState, s: RecvSample, userMinMs: number): RecvState {
-    const rough = s.freezes > 0 || s.jitterMs > 30;
+    // (1.23.21) только джиттер: заморозки — от провалов канала (лог: джиттер 1–10 мс),
+    // буфер их не лечит, а каждая смена цели — растяжение звука у зрителя (слышно)
+    const rough = s.jitterMs > 30;
     if (rough) {
         const want = Math.max(st.targetMs + 50, Math.min(MAX_JITTER_TARGET_MS, Math.round(s.jitterMs * 3)));
         return { targetMs: Math.min(MAX_JITTER_TARGET_MS, want), calmSince: s.now };
@@ -682,7 +684,12 @@ export function viewerStarved(rx: { recvFps: number; fz?: number }, encFps: numb
  *    растёт 8%/с — проверено на стенде: 11.5 → 25.9 Мбит/с за 2 с), не чаще раза в 15 с;
  *  - 10 с без проблем при загрузке ≥ 80% потолка → потолок +5% (пробуем выше).
  */
-export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; prevSent?: number; lastKickBps?: number; }
+export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; prevSent?: number; lastKickBps?: number; kickFails?: number; }
+
+/** пауза между перезапусками: 15 с, после каждого неудачного вдвое (до 60 с) */
+export function kickGapMs(fails: number): number {
+    return Math.min(60_000, 15_000 * 2 ** Math.max(0, fails));
+}
 
 export function initCeil(now: number): CeilState {
     return { ceiling: 0, prevBwe: 0, cleanSince: now, lastKick: 0, lastTrouble: 0 };
@@ -701,7 +708,20 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
     else if (bwe && !st.prevBwe && s.startBps && s.startBps > 8e6 && bwe < s.startBps * 0.5) trouble = s.startBps;
     // перезапуск на потолок не выдержан (заморозки/потери в первые 10 с после него) —
     // потолок 85% от уровня перезапуска; иначе прыгали бы на него снова и снова
-    if (!trouble && !s.clean && st.lastKick && s.now - st.lastKick < 10_000 && st.lastKickBps) {
+    // (1.23.21) неудача — и когда оценка так и не поднялась (лог 1.23.20: перезапуск на 20.7,
+    // а оценка 10–12 и обвал до 5–7; раньше ловили только потери/заморозки)
+    const sinceKick = s.now - st.lastKick;
+    const kickFlop = !!(st.lastKick && st.lastKickBps && sinceKick < 10_000 && (!s.clean || (sinceKick >= 4000 && bwe && bwe < st.lastKickBps * 0.6)));
+    if (st.lastKick && st.lastKickBps && sinceKick >= 10_000 && !kickFlop) {
+        next.lastKickBps = 0;
+        next.kickFails = 0; // перезапуск удался
+    }
+    // обвал сразу после перезапуска — тоже неудача (пауза до следующего растёт)
+    if (kickFlop || (trouble && st.lastKickBps && sinceKick < 10_000)) {
+        next.kickFails = (st.kickFails ?? 0) + 1;
+        next.lastKickBps = 0;
+    }
+    if (!trouble && kickFlop && st.lastKickBps) {
         const c = Math.max(2 * MIN_CAP_BPS, Math.round(st.lastKickBps * 0.85));
         if (!st.ceiling || c < st.ceiling) {
             next.ceiling = c;
@@ -720,11 +740,11 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
     }
     if (!s.clean) next.cleanSince = s.now;
     let kickBps: number | null = null;
-    if (!trouble && next.ceiling && bwe && bwe < next.ceiling * 0.6 && s.now - next.cleanSince >= 4000 && (!st.lastKick || s.now - st.lastKick >= 15_000)) {
+    if (!trouble && next.ceiling && bwe && bwe < next.ceiling * 0.6 && s.now - next.cleanSince >= 4000 && (!st.lastKick || s.now - st.lastKick >= kickGapMs(next.kickFails ?? 0))) {
         kickBps = next.ceiling;
         next.lastKick = s.now;
         next.lastKickBps = next.ceiling;
-        reason = `канал чистый — сразу возвращаюсь на ${(next.ceiling / 1e6).toFixed(1)} Мбит/с (оценка была ${(bwe / 1e6).toFixed(1)})`;
+        reason = `канал чистый — сразу возвращаюсь на ${(next.ceiling / 1e6).toFixed(1)} Мбит/с (оценка была ${(bwe / 1e6).toFixed(1)})${next.kickFails ? `; следующая попытка не раньше чем через ${kickGapMs(next.kickFails) / 1000} с` : ""}`;
     }
     if (!trouble && !kickBps && next.ceiling && next.ceiling < userMaxBps && s.clean && s.now - next.lastTrouble >= 10_000 && s.now - next.cleanSince >= 10_000 && s.sent >= next.ceiling * 0.8) {
         next.ceiling = Math.min(userMaxBps, Math.round(next.ceiling * 1.05));

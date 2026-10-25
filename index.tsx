@@ -106,7 +106,7 @@ function collectDiagnostics(): string[] {
     push("звук", settings.store.audioMode);
     const audioSt = manager.host?.nativeAudio?.stats?.();
     if (audioSt) {
-        push("нативный звук (сейчас)", `режим ${audioSt.mode} · буфер ${audioSt.levelMs} мс · рестартов ${audioSt.restarts} · тишина ${Math.round(audioSt.silenceMs / 1000)} с${audioSt.dead ? " · ХЕЛПЕР МЁРТВ (перезапуск)" : ""}`);
+        push("нативный звук (сейчас)", `режим ${audioSt.mode} · буфер ${audioSt.levelMs} мс · провалов ${audioSt.underruns ?? 0} · рестартов ${audioSt.restarts} · тишина ${Math.round(audioSt.silenceMs / 1000)} с${audioSt.dead ? " · ХЕЛПЕР МЁРТВ (перезапуск)" : ""}`);
     }
     return lines;
 }

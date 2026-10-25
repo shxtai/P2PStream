@@ -65,7 +65,7 @@ function simulate({ Cls, pull }, seed, seconds = 60, light = false) {
     }
     const dropped = pushed - played - w.count / 2 - pending.reduce((a, p) => a + p.frames, 0);
     // 1.23.7: ворклет сообщает уровень буфера (по нему зритель сдвигает видео под звук)
-    const rep = w.reported ?? [];
+    const rep = (w.reported ?? []).filter(v => typeof v === "number");
     const reportedMs = rep.length ? Math.round(rep.slice(-50).reduce((a, v) => a + v, 0) / Math.min(50, rep.length)) : -1;
     return { reportedMs, reports: rep.length, dropouts, silentMs: Math.round(silentBlocks * blockMs), droppedMs: Math.round(Math.max(0, dropped) / 48), lagMs: Math.round(lagSum / lagN) };
 }

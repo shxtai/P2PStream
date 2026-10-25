@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved, initCeil, nextCeiling } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved, initCeil, nextCeiling, kickGapMs } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -401,6 +401,33 @@ const MAX = 30e6;
     // мелкие колебания оценки — не обвал
     r = nextCeiling({ ...s, prevBwe: 30e6 }, { bwe: 22e6, sent: 20e6, clean: true, now: 5000 }, M);
     check("30 → 22 — не обвал", r.state.ceiling === 30e6 && !r.kickBps);
+}
+// --- 1.23.21: звук не трогаем из-за заморозок; перезапуски с паузой ---
+{
+    let j = { targetMs: 150, calmSince: 0 };
+    for (let i = 1; i <= 5; i++) j = nextJitterTarget(j, { freezes: 2, jitterMs: 5, now: i * 2000 }, 150);
+    check("заморозки при джиттере 5 мс не меняют буфер (звук не растягивается)", j.targetMs === 150, `${j.targetMs} мс`);
+    j = nextJitterTarget(j, { freezes: 0, jitterMs: 40, now: 12000 }, 150);
+    check("джиттер 40 мс — буфер растёт", j.targetMs > 150, `${j.targetMs} мс`);
+    const M = 40e6;
+    // перезапуск на 20.7, через 4 с оценка всего 10 (канал чистый) — неудача
+    let c = { ceiling: 20.7e6, prevBwe: 9e6, prevSent: 8e6, cleanSince: 0, lastKick: 100000, lastTrouble: 0, lastKickBps: 20.7e6, kickFails: 0 };
+    let r = nextCeiling(c, { bwe: 9e6, sent: 8e6, clean: true, now: 102000 }, M);
+    check("2 с после перезапуска — рано судить", r.state.ceiling === 20.7e6 && !r.state.kickFails);
+    r = nextCeiling(r.state, { bwe: 10e6, sent: 9e6, clean: true, now: 104000 }, M);
+    check("оценка не поднялась (10 из 20.7) → неудача, потолок 17.6", Math.round(r.state.ceiling / 1e5) === 176 && r.state.kickFails === 1, r.reason);
+    // следующий перезапуск — не через 15 с, а через 30
+    let st = r.state, t = 104000, kicks = [];
+    while (t < 104000 + 40000) { t += 2000; const q = nextCeiling(st, { bwe: 6e6, sent: 5e6, clean: true, now: t }, M); st = q.state; if (q.kickBps) kicks.push(t); }
+    check("после неудачи следующий перезапуск через ≥ 30 с", kicks.length >= 1 && kicks[0] - 100000 >= 30000, kicks.map(k => (k - 100000) / 1000).join(","));
+    check("пауза растёт 15 → 30 → 60 → 60 с", kickGapMs(0) === 15000 && kickGapMs(1) === 30000 && kickGapMs(2) === 60000 && kickGapMs(5) === 60000);
+    // обвал сразу после перезапуска (оценка 20 → 6) — тоже неудача
+    const cr = nextCeiling({ ceiling: 20.7e6, prevBwe: 20e6, prevSent: 18e6, cleanSince: 0, lastKick: 300000, lastTrouble: 0, lastKickBps: 20.7e6, kickFails: 0 }, { bwe: 6e6, sent: 5e6, clean: false, now: 304000 }, M);
+    check("обвал после перезапуска считается неудачей (пауза 30 с)", cr.state.kickFails === 1, JSON.stringify(cr.state));
+    // удачный перезапуск: через 4 с оценка 19 из 20 → счётчик неудач сбрасывается через 10 с
+    let ok = { ceiling: 20e6, prevBwe: 8e6, prevSent: 7e6, cleanSince: 0, lastKick: 200000, lastTrouble: 0, lastKickBps: 20e6, kickFails: 2 };
+    for (const tt of [202000, 204000, 206000, 208000, 210000]) ok = nextCeiling(ok, { bwe: 19e6, sent: 17e6, clean: true, now: tt }, M).state;
+    check("удачный перезапуск сбрасывает паузу к 15 с", ok.kickFails === 0 && ok.ceiling >= 20e6, JSON.stringify(ok));
 }
 // --- 1.23.19: ложные «декодер не успевает» ---
 {
