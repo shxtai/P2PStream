@@ -337,7 +337,10 @@ export function rungNeedBps(r: Rung, aspect: number): number {
 export function pickRung(ladder: Rung[], capBps: number, aspect: number, prevIdx: number, cpuSteps = 0): number {
     let idx = ladder.length - 1;
     for (let i = 0; i < ladder.length; i++) {
-        const need = rungNeedBps(ladder[i], aspect) * (prevIdx >= 0 && i < prevIdx ? 1.15 : 1);
+        // гистерезис в обе стороны: вверх — с запасом 15%, удержать текущую — до 85% нужного
+        // (1.23.16: спуск без запаса — на колеблющемся канале лестница скакала вверх-вниз,
+        // каждая смена разрешения = тяжёлый ключевой кадр и провал)
+        const need = rungNeedBps(ladder[i], aspect) * (prevIdx >= 0 && i < prevIdx ? 1.15 : prevIdx >= 0 && i === prevIdx ? 0.85 : 1);
         if (need <= capBps) { idx = i; break; }
     }
     return Math.min(ladder.length - 1, idx + Math.max(0, cpuSteps));

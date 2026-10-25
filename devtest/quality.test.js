@@ -357,4 +357,12 @@ const MAX = 30e6;
     for (let i = 0; i < 20; i++) { t += 2000; st = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: t, curBps: 1e6 }, 100e6).state; }
     check("статика — потолок по-прежнему не растёт", st.capBps === 30e6);
 }
+// --- 1.23.16: гистерезис спуска ---
+{
+    const L = buildLadder(1080, 60);
+    const i1080 = L.findIndex(r => r.height === 1080 && r.fps === 60);
+    const need = rungNeedBps(L[i1080], 16 / 9);
+    check("на 1080p60: битрейт просел до 90% нужного — держим ступень", pickRung(L, need * 0.9, 16 / 9, i1080) === i1080);
+    check("на 1080p60: просел до 80% нужного — спускаемся", pickRung(L, need * 0.8, 16 / 9, i1080) > i1080);
+}
 process.exit(failed ? 1 : 0);

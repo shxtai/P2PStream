@@ -21,7 +21,7 @@ function workletFrom(src) {
 /** детерминированный ГПСЧ — одинаковые задержки для старого и нового варианта */
 function rng(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32); }
 
-function simulate({ Cls, pull }, seed, seconds = 60) {
+function simulate({ Cls, pull }, seed, seconds = 60, light = false) {
     const rand = rng(seed);
     const w = new Cls();
     let mainQueue = 0;            // кадров в очереди main-процесса
@@ -33,7 +33,8 @@ function simulate({ Cls, pull }, seed, seconds = 60) {
         if (t % 10 === 0) mainQueue += 480;                 // хелпер: 10 мс звука
         if (t >= nextPull) {                                 // рендерер забирает (с опозданием под нагрузкой)
             const r = rand();
-            const stall = r < 0.85 ? rand() * 4 : r < 0.97 ? 20 + rand() * 40 : 100 + rand() * 80;
+            // light — без игры: рывки редкие и короткие
+            const stall = light ? (r < 0.98 ? rand() * 4 : 15 + rand() * 20) : r < 0.85 ? rand() * 4 : r < 0.97 ? 20 + rand() * 40 : 100 + rand() * 80;
             const deliverAt = t + stall;
             const frames = mainQueue; mainQueue = 0;
             if (frames) {
@@ -91,4 +92,10 @@ const repMs = Math.round(b.reduce((a, r) => a + r.reportedMs, 0) / b.length);
 const realMs = Math.round(sum(b, "lagMs") / b.length);
 const repOk = b.every(r => r.reports > 100) && Math.abs(repMs - realMs) <= 40;
 console.log(`${repOk ? "✔" : "✘"} ворклет сообщает уровень буфера: ${repMs} мс (реально ~${realMs} мс)`);
-process.exit(ok && lagOk && repOk ? 0 : 1);
+// без игры (рабочий стол, видео): адаптивный запас держит малую задержку без провалов
+const lightRuns = [1, 2, 3, 4, 5].map(seed => { pending = []; return simulate(cur, seed, 60, true); });
+const lightLag = Math.round(sum(lightRuns, "lagMs") / lightRuns.length);
+const lightOk = lightLag <= 120 && sum(lightRuns, "dropouts") <= 5;
+console.log(`без игры: провалов ${sum(lightRuns, "dropouts")}, задержка ~${lightLag} мс`);
+console.log(`${lightOk ? "✔" : "✘"} без нагрузки задержка звука ≤ 120 мс и почти без провалов`);
+process.exit(ok && lagOk && repOk && lightOk ? 0 : 1);

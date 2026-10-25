@@ -1641,6 +1641,7 @@ export class WatchSession {
         let st: RecvState = { targetMs: userMin(), calmSince: Date.now() };
         let prevFreezes = -1;
         let prev: { recv: number; dec: number; drop: number; fz: number; at: number; } | null = null;
+        const bufStart = Date.now();
         this.jbTimer = setInterval(async () => {
             if (this.pc !== pc) return;
             // обратная связь стримеру: сколько кадров декодер реально успевает
@@ -1672,7 +1673,9 @@ export class WatchSession {
                         jitterMs = (r.jitter ?? 0) * 1000;
                     }
                 });
-                const newFreezes = prevFreezes < 0 ? 0 : Math.max(0, freezes - prevFreezes);
+                // первые 6 с не считаем: заморозка до первого ключевого кадра — норма, а не повод
+                // сразу добавлять 50 мс задержки на весь просмотр
+                const newFreezes = prevFreezes < 0 || Date.now() - bufStart < 6000 ? 0 : Math.max(0, freezes - prevFreezes);
                 prevFreezes = freezes;
                 const next = nextJitterTarget(st, { freezes: newFreezes, jitterMs, now: Date.now() }, userMin());
                 if (next.targetMs !== st.targetMs) {

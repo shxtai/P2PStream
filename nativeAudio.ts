@@ -79,7 +79,7 @@ class VcP2pRing extends AudioWorkletProcessor {
            Копим 120 мс перед стартом и после провала, обрезаем накопления > 350 мс
            (до 240 мс), а дрейф-коррекция ниже держит рабочий уровень ~200 мс —
            его хватает на рывки рендерера, и он больше не растёт без предела. */
-        this.prefill = 48000 * 2 * 0.12;
+        this.prefill = 48000 * 2 * 0.08;
         this.maxLag = 48000 * 2 * 0.35;
         this.trimTo = 48000 * 2 * 0.24;
         /* v1.20 дрейф-коррекция: часы хелпера (устройство захвата) и AudioContext
@@ -89,6 +89,15 @@ class VcP2pRing extends AudioWorkletProcessor {
            неслышно, рассинхрон исчезает, а запас переживает рывки
            рендерера под нагрузкой игры (до 180 мс). */
         this.target = 48000 * 2 * 0.20;
+        /* (1.23.16) АДАПТИВНЫЙ запас, как jitter buffer в самом WebRTC: стартуем с
+           минимума и растём только после реального провала, без провалов —
+           медленно сжимаемся. Без игры рывков нет — звук (а с ним и видео, которое
+           ждёт звук) идёт с задержкой ~80 мс вместо постоянных 200; под игрой после
+           первых провалов запас вырастает до прежнего уровня. */
+        this.minT = 48000 * 2 * 0.08;
+        this.maxT = 48000 * 2 * 0.24;
+        this.calm = 0;
+        this.setTarget(this.minT);
         this.levelMs = 0;
         this.reportTick = 0;
         this.buffering = true;
@@ -116,13 +125,31 @@ class VcP2pRing extends AudioWorkletProcessor {
             }
         };
     }
+    setTarget(t) {
+        this.target = Math.max(this.minT, Math.min(this.maxT, t));
+        /* после провала копим сразу до рабочего уровня (иначе дрейф-коррекция
+           набирала бы его секундами); перелив режем выше target + 150 мс */
+        this.prefill = this.target;
+        this.maxLag = this.target + 48000 * 2 * 0.15;
+        this.trimTo = this.target + 48000 * 2 * 0.04;
+    }
     process(_inputs, outputs) {
         const out = outputs[0];
         const L = out[0];
         const R = out[1] || out[0];
         const n = L.length;
         if (this.buffering && this.count >= this.prefill) this.buffering = false;
-        if (!this.buffering && this.count < n * 2) this.buffering = true; /* провал: копим заново */
+        if (!this.buffering && this.count < n * 2) {
+            /* провал: копим заново и прибавляем запас (+50 мс) */
+            this.buffering = true;
+            this.setTarget(this.target + 48000 * 2 * 0.05);
+            this.calm = 0;
+        }
+        /* 20 с без провалов — сжимаемся на 10 мс, дальше каждые 5 с (375 блоков/с) */
+        if (++this.calm >= 375 * 20 && this.target > this.minT) {
+            this.setTarget(this.target - 48000 * 2 * 0.01);
+            this.calm = 375 * 15;
+        }
         for (let i = 0; i < n; i++) {
             if (!this.buffering && this.count >= 2) {
                 L[i] = this.buf[this.read];
