@@ -466,6 +466,21 @@ const MAX = 30e6;
     check("минуту держимся выше предела без обвалов → предел выше", nextRemembered(42.3e6, highSt, true, 200000) === Math.round(46e6 * 1.05));
     check("без известного предела «держимся» не пишем", nextRemembered(0, { ...highSt, failAt: undefined }, true, 200000) === null);
 }
+// --- 1.23.25: статичный кадр — не обвал ---
+{
+    const M = 50e6;
+    let c = { ...initCeil(0), ceiling: 40e6, prevBwe: 40e6, prevSent: 38e6, cleanSince: 0 };
+    let kicks = 0, low = false;
+    // 30 с статики: оценка WebRTC падает 40 → 5, отправка ~0.3
+    for (let t = 2000; t <= 30000; t += 2000) {
+        const r = nextCeiling(c, { bwe: Math.max(5e6, 40e6 - t * 1200), sent: 0.3e6, clean: true, now: t, idle: true }, M);
+        c = r.state; if (r.kickBps) kicks++; if (c.ceiling < 40e6) low = true;
+    }
+    check("статика: потолок 40 не снижается и перезапусков нет", !low && kicks === 0 && !c.failAt, JSON.stringify(c));
+    // движение вернулось: оценка 5 при потолке 40 → сразу перезапуск на 40, а не «обвал»
+    const r = nextCeiling(c, { bwe: 5e6, sent: 4e6, clean: true, now: 32000 }, M);
+    check("после статики — сразу перезапуск оценки на 40, без снижения потолка", r.kickBps === 40e6 && r.state.ceiling === 40e6 && !/не выдержал/.test(r.reason ?? ""), r.reason ?? "");
+}
 // --- 1.23.19: ложные «декодер не успевает» ---
 {
     const v0 = initViewerDecode(0);

@@ -727,9 +727,21 @@ export function nextRemembered(stored: number, st: CeilState, clean: boolean, no
     return null;
 }
 
-export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number; clean: boolean; startBps?: number; now: number; }, userMaxBps: number): { state: CeilState; kickBps: number | null; reason: string | null; } {
+export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number; clean: boolean; startBps?: number; now: number; idle?: boolean; }, userMaxBps: number): { state: CeilState; kickBps: number | null; reason: string | null; } {
     const next: CeilState = { ...st };
     const bwe = s.bwe && s.bwe > 0 ? s.bwe : 0;
+    // (1.23.25) статичный кадр / простой: оценка WebRTC проседает без нагрузки — это не
+    // канал. Ни обвалов, ни перезапусков, ни проб; запоминаем текущие оценку/отправку
+    // (чтобы возврат движения не выглядел «обвалом») и считаем канал чистым уже 4 с —
+    // при возврате движения перезапуск оценки на потолке сразу.
+    if (s.idle) {
+        if (bwe) next.prevBwe = bwe;
+        if (s.sent > 0) next.prevSent = s.sent;
+        next.cleanSince = Math.min(st.cleanSince, s.now - 4000);
+        next.lastKickBps = 0;
+        next.lastTrouble = s.now;
+        return { state: next, kickBps: null, reason: null };
+    }
     let reason: string | null = null;
     let trouble = 0;
     /** обвал на стартовой проверке (старт на скорости из настроек) — это не предел канала */

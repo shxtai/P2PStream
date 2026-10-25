@@ -21,6 +21,7 @@ import {
     setBrokerMessageHandler
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
+import { createFrameRepeater, type FrameRepeater } from "./frameRepeat";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
 import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling, initCeilFromLimit, startFromLimit, nextRemembered } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
@@ -386,6 +387,9 @@ export async function applyCaptureConstraints(track: MediaStreamTrack): Promise<
     }
 }
 
+/** клиент не знает "maintain-framerate-and-resolution" (старый Chrome) — прежний режим */
+let degradationFallback = false;
+
 /** Применить битрейт/FPS к видеосендеру (можно вызывать на живую) */
 async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
     const wantFps = Number(settings.store.fps) || 60;
@@ -396,8 +400,13 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
     // "maintain-resolution": Chrome сам ронял FPS при просадке канала — прямо
     // вопреки требованию «FPS не ниже 45» и лестнице, жертвующей разрешением.
     // "Detail" (фильмы/статика) — наоборот, держим чёткость, FPS может подсесть.
-    const hint = String(settings.store.contentHint) === "detail"
+    // (1.23.25) Chrome 124+: "maintain-framerate-and-resolution" — WebRTC сам не режет
+    // НИ разрешение, НИ FPS (этим управляет только наша лестница). Стенд: на статичном
+    // кадре его оценка канала проседает, и "maintain-framerate" ронял 720p → 360p,
+    // а обратно поднимал десятками секунд. Старый клиент — прежний режим (запасной).
+    const legacyHint = String(settings.store.contentHint) === "detail"
         ? "maintain-resolution" : "maintain-framerate";
+    const hint = degradationFallback ? legacyHint : "maintain-framerate-and-resolution";
 
     for (const sender of pc.getSenders()) {
         try {
@@ -415,7 +424,15 @@ async function applySendParameters(pc: RTCPeerConnection): Promise<void> {
                 params.encodings[0].scaleResolutionDownBy = aq.scale ?? 1;
                 params.encodings[0].networkPriority = "high";
                 params.encodings[0].priority = "high";
-                await sender.setParameters(params);
+                try {
+                    await sender.setParameters(params);
+                } catch (e) {
+                    if (degradationFallback || !(e instanceof TypeError)) throw e;
+                    degradationFallback = true;
+                    logger.info("Режим без авто-снижения разрешения/FPS не поддерживается — прежний режим");
+                    if (!aq.emergency) params.degradationPreference = legacyHint as RTCDegradationPreference;
+                    await sender.setParameters(params);
+                }
             } else if (sender.track?.kind === "audio") {
                 const params = sender.getParameters();
                 if (!params.encodings?.length) params.encodings = [{}];
@@ -752,6 +769,10 @@ class HostPeer {
     /** лестница качества: текущая ступень, сглаженный битрейт, ступени из-за процессора */
     private rungIdx = -1;
     private effSmooth = 0;
+    /** (1.23.25) статичный кадр / простой канала на прошлом тике */
+    private wasIdle = false;
+    /** после статики — до этого момента качество не снижаем (оценка догоняет) */
+    private resumeUntil = 0;
     private startLogged = false;
     private cpuState: CpuState | null = null;
     private aqEmergency = false;
@@ -812,7 +833,8 @@ class HostPeer {
                 audioOnly.addTrack(track);
                 this.pc.addTrack(track, audioOnly);
             } else {
-                this.pc.addTrack(track, host.capture);
+                // видео — через повтор кадров (постоянный FPS на статике), если он есть
+                this.pc.addTrack(track.kind === "video" ? host.encodeTrack(track) : track, host.capture);
             }
         }
         applyVideoCodecPreference(this.pc, String(settings.store.codec));
@@ -1089,6 +1111,9 @@ class HostPeer {
                 prevLost = lostTotal; prevSent = sentTotal; prevNack = nackTotal;
                 if (dSent > 0) loss = Math.max(dLost / dSent, fraction ?? 0);
                 else loss = fraction;
+                // с повтором кадров media-source считает и повторы — берём настоящие кадры захвата
+                const realSrc = this.host.realSourceFrames;
+                if (realSrc != null) srcTotal = realSrc;
                 const srcFrames = prevSrc < 0 ? 0 : Math.max(0, srcTotal - prevSrc);
                 const encFrames = prevEnc < 0 ? 0 : Math.max(0, encTotal - prevEnc);
                 prevSrc = srcTotal;
@@ -1131,8 +1156,26 @@ class HostPeer {
                 if (this.starved === 2 && rxNow) logger.info(`Зритель ${this.userId}: собирает ${Math.round(rxNow.recvFps)} из ${Math.round(encFps)} FPS${rxNow.fz ? `, заморозок +${rxNow.fz}` : ""} — снижаю битрейт`);
                 // потолок канала: обвал → держимся ниже, после обвала — сразу «перезапуск» оценки
                 this.ceil ??= this.memLimit ? initCeilFromLimit(Date.now(), this.memLimit, userMax()) : initCeil(Date.now());
-                const ceilClean = (loss ?? 0) < 0.02 && !viewerStall;
-                const ce = nextCeiling(this.ceil, { bwe: bweBps, sent: sentBps, clean: ceilClean, startBps: this.startedBps || undefined, now: Date.now() }, userMax());
+                // (1.23.25) статичный кадр / простой: захват почти не даёт кадров или поток
+                // шлёт много меньше разрешённого. Оценка WebRTC тогда проседает, но это не
+                // канал — качество и потолки не трогаем, а при возврате движения сразу
+                // «перезапуск» оценки на потолке (nextCeiling idle) и 6 с без снижений.
+                const srcFpsNow = srcFrames / 2;
+                const idle = this.connectedAt > 0 && (this.host.repeating || srcFpsNow < 10 || (this.aqCapBps > 0 && sentBps < this.aqCapBps * 0.3));
+                const resumed = this.wasIdle && !idle;
+                if (resumed) this.resumeUntil = Date.now() + 6000;
+                if (idle && !this.wasIdle) logger.info(`Качество → ${this.userId}: статичный кадр / простой (${Math.round(srcFpsNow)} кадр/с, ${(sentBps / 1e6).toFixed(1)} Мбит/с) — держу разрешение и битрейт`);
+                this.wasIdle = idle;
+                const holdQuality = idle || Date.now() < this.resumeUntil;
+                // сразу после статики «зритель недополучает» — от того, что оценка канала
+                // ещё не догнала (энкодеру мало битрейта), а не от сети: 6 с не считаем
+                const stall = viewerStall && !holdQuality;
+                const ceilClean = (loss ?? 0) < 0.02 && !stall;
+                // движение вернулось, а оценка WebRTC за статику просела — сразу «перезапуск»
+                // оценки на уровне до статики (как после обвала), а не разгон по 8%/с
+                const preIdleBps = Math.min(userMax(), this.ceil?.ceiling || Infinity, Math.round(this.effSmooth / 0.9));
+                const resumeKick = resumed && this.effSmooth > 0 && bweBps != null && bweBps < preIdleBps * 0.6 && Date.now() - this.lastNegotiateAt > 3000;
+                const ce = nextCeiling(this.ceil, { bwe: bweBps, sent: sentBps, clean: ceilClean, startBps: this.startedBps || undefined, now: Date.now(), idle }, userMax());
                 this.ceil = ce.state;
                 const remember = nextRemembered(knownLimit(this.userId), ce.state, ceilClean, Date.now());
                 if (remember) rememberLimit(this.userId, remember);
@@ -1140,8 +1183,12 @@ class HostPeer {
                 if (ce.kickBps) {
                     this.kickStartBps = ce.kickBps;
                     void this.negotiate(false);
+                } else if (resumeKick) {
+                    logger.info(`Канал → ${this.userId}: движение после статики — сразу возвращаю оценку на ${(preIdleBps / 1e6).toFixed(1)} Мбит/с (была ${((bweBps ?? 0) / 1e6).toFixed(1)})`);
+                    this.kickStartBps = preIdleBps;
+                    void this.negotiate(false);
                 }
-                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now(), viewerStall, curBps: sentBps > 0 ? sentBps : undefined }, max);
+                const { state, reason } = nextCap(this.aqState, { loss, pli, rttMs, bweBps, now: Date.now(), viewerStall: stall, curBps: sentBps > 0 ? sentBps : undefined }, max);
                 this.aqState = state;
                 const userFps = Number(settings.store.fps) || 60;
                 const src = this.host.capture.getVideoTracks()[0]?.getSettings?.() ?? {};
@@ -1152,13 +1199,17 @@ class HostPeer {
                 // на которую хватает битрейта (сглаженного: оценка канала колеблется, а смена
                 // разрешения = ключевой кадр). Процессор не успевает — ступень ниже по
                 // разрешению, FPS ≥ 60 сохраняется.
-                this.effSmooth = this.effSmooth ? this.effSmooth * 0.7 + eff * 0.3 : eff;
+                const effNext = this.effSmooth ? this.effSmooth * 0.7 + eff * 0.3 : eff;
+                // на статике / сразу после неё (без потерь) сглаженная скорость только растёт
+                this.effSmooth = holdQuality && !reason && this.effSmooth ? Math.max(this.effSmooth, effNext) : effNext;
                 const ladder = buildLadder(srcH || 1080, userFps);
                 const curRung = ladder[Math.min(this.rungIdx < 0 ? 0 : this.rungIdx, ladder.length - 1)];
                 this.cpuState ??= initCpuState(Date.now());
                 // srcFps — сколько кадров реально подаёт захват (не путать статичный экран с провалом)
                 const srcFps = srcFrames / 2;
-                const cr = nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now(), capBps: this.effSmooth }, ladder.length - 1);
+                // на статике и 6 с после неё выкинутые энкодером кадры — от нехватки битрейта
+                // (оценка догоняет), не от процессора: ступень по процессору не меняем
+                const cr = holdQuality && !reason ? { state: this.cpuState, reason: null as string | null } : nextCpuSteps(this.cpuState, { encFps, targetFps: curRung.fps, cpuLimited, srcFps, now: Date.now(), capBps: this.effSmooth }, ladder.length - 1);
                 this.cpuState = cr.state;
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
                 // декодер зрителя не успевает (по его обратной связи) — лестница вниз / смена кодека
@@ -1166,14 +1217,16 @@ class HostPeer {
                 // (1.23.19) первые 6 с после соединения и 5 с после пересогласования (новый
                 // ключевой кадр) отчёты зрителя не считаем: «1 из 41 FPS» на старте — не декодер
                 const rx = settled && this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
-                if (rx) {
+                if (rx && !holdQuality) {
                     const vd = nextViewerDecode(this.viewerDecode, rx, this.codecName, Date.now(), ladder.length - 1);
                     this.viewerDecode = vd.state;
                     if (vd.action === "codec" && this.switchCodec(`${vd.reason} — нужен кодек с аппаратным декодированием`)) return;
                     if (vd.reason && vd.action !== "codec") logger.info(`Качество → ${this.userId}: ${vd.reason}`);
                 }
                 const steps = Math.min(ladder.length - 1, cr.state.steps + this.viewerDecode.steps);
-                const idx = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, steps);
+                const idx0 = pickRung(ladder, this.effSmooth, aspect, this.rungIdx, steps);
+                // статика / сразу после неё без потерь в сети — ступень только вверх
+                const idx = holdQuality && !reason && this.rungIdx >= 0 ? Math.min(idx0, this.rungIdx) : idx0;
                 const rung = ladder[idx];
                 if (idx !== this.rungIdx && this.rungIdx >= 0) {
                     const why = cr.reason ?? (idx > this.rungIdx
@@ -1193,7 +1246,7 @@ class HostPeer {
                 // или раз в 20 с пробуем без аварийного режима (иначе он «маскирует» себя)
                 const emergency = this.aqEmergency
                     ? atBottom && Date.now() - this.aqEmergencySince < 20_000
-                    : atBottom && srcFps >= 20 && encFps < srcLive * 0.5;
+                    : !holdQuality && atBottom && srcFps >= 20 && encFps < srcLive * 0.5;
                 if (emergency && !this.aqEmergency) this.aqEmergencySince = Date.now();
                 if (emergency !== this.aqEmergency) {
                     this.aqEmergency = emergency;
@@ -1209,7 +1262,9 @@ class HostPeer {
                 // только позволял выброс выше пропускной способности при смене кадра)
                 const clean = (loss ?? 0) < 0.02 && !reason && (!state.lastCut || Date.now() - state.lastCut > 4000)
                     && (this.aqCapBps === 0 || sentBps >= this.aqCapBps * 0.6);
-                const encCap = sendCap(state, bweBps, max, clean);
+                let encCap = sendCap(state, bweBps, max, clean);
+                // статика: потолок энкодера не опускаем (без потерь) — первый кадр движения в полном качестве
+                if (holdQuality && !reason && this.aqCapBps > 0) encCap = Math.max(encCap, this.aqCapBps);
                 const capMoved = this.aqCapBps === 0 || Math.abs(encCap - this.aqCapBps) > this.aqCapBps * 0.05;
                 if (capMoved || scale !== this.aqScale || fpsCap !== this.aqFps) {
                     const first = this.aqCapBps === 0;
@@ -1264,6 +1319,34 @@ export class HostSession {
     readonly peers = new Map<string, HostPeer>();
     /** Нативный аудио-хелпер (v1.4): хранится здесь, чтобы stop() всё закрыл */
     nativeAudio: NativeAudioHandle | null = null;
+    /** (1.23.25) повтор кадров для энкодера: одна дорожка на весь эфир */
+    private repeater: FrameRepeater | null = null;
+    private repeaterTried = false;
+
+    /** Дорожка для энкодера: захват с повтором последнего кадра на статике
+     *  (иначе на стоящей картинке ~2 кадр/с). Исходный захват остаётся для превью,
+     *  настроек разрешения и плиток. */
+    encodeTrack(video: MediaStreamTrack): MediaStreamTrack {
+        if (!this.repeaterTried) {
+            this.repeaterTried = true;
+            if (settings.store.constantFps !== false) {
+                const fps = Number(settings.store.fps) || 60;
+                this.repeater = createFrameRepeater(video, fps, m => logger.info(m));
+                if (this.repeater) logger.info(`Видео: постоянные ${fps} FPS — на статичной картинке повторяю последний кадр`);
+            }
+        }
+        return this.repeater?.track ?? video;
+    }
+
+    /** (1.23.25) статика по повтору кадров: захват молчит, Worker повторяет кадр */
+    get repeating(): boolean {
+        return !!this.repeater?.repeating;
+    }
+
+    /** настоящих кадров от захвата (без повторов) или null, если повтора нет */
+    get realSourceFrames(): number | null {
+        return this.repeater ? this.repeater.passed : null;
+    }
 
     constructor(
         readonly mgr: P2PManager,
@@ -1292,6 +1375,7 @@ export class HostSession {
         if (video) {
             try {
                 video.contentHint = String(settings.store.contentHint) === "detail" ? "detail" : "motion";
+                if (this.repeater) this.repeater.track.contentHint = video.contentHint;
             } catch { /* ignore */ }
             void applyCaptureConstraints(video);
         }
@@ -1362,6 +1446,8 @@ export class HostSession {
         for (const track of this.capture.getTracks()) {
             try { track.stop(); } catch { /* ignore */ }
         }
+        this.repeater?.stop();
+        this.repeater = null;
         this.nativeAudio?.stop();
         this.nativeAudio = null;
     }

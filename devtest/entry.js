@@ -60,7 +60,10 @@ if (role === "host") {
     const sctx = small?.getContext("2d");
     const noise = big ? sctx.createImageData(320, 180) : heavy ? ctx.createImageData(W, H) : null;
     let f = 0;
+    // ?static — статичный кадр: с 20-й по 50-ю секунду canvas не меняется (как стоящий экран)
+    const tStart = Date.now();
     setInterval(() => {
+        if (q.has("static")) { const el = Date.now() - tStart; if (el > 20000 && el < 50000) return; }
         if (big) {
             const d = noise.data;
             for (let i = 0; i < d.length; i += 4) { const v = Math.random() * 255; d[i] = v; d[i + 1] = (v + f) % 255; d[i + 2] = 255 - v; d[i + 3] = 255; }
@@ -210,6 +213,28 @@ if (role === "host") {
                 void (async () => {
                     // отчёт /p2p-doctor зрителя (VERBOSE=1 — виден в выводе)
                     // через 15 с — когда оценка канала (BWE) уже разогналась
+                    if (q.has("static")) {
+                        // качество до статики, во время и после: после возврата движения разрешение не ниже прежнего
+                        const seq = []; let prevDec = 0;
+                        for (let i = 0; i < 31; i++) {
+                            await new Promise(r => setTimeout(r, 2000));
+                            let h = 0, dec = 0; (await w.pc.getStats()).forEach(r => { if (r.type === "inbound-rtp" && r.kind === "video") { h = r.frameHeight ?? 0; dec = r.framesDecoded ?? 0; } });
+                            seq.push({ h, fps: Math.round((dec - prevDec) / 2) }); prevDec = dec;
+                        }
+                        report("IN ", "статика: " + seq.map(x => x.h + "p/" + x.fps).join(" "));
+                        // (1.23.25) на статике ни разрешение, ни FPS не проседают (повтор кадров)
+                        const tail = seq.slice(3);
+                        const maxH = Math.max(...tail.map(x => x.h)), minH = Math.min(...tail.map(x => x.h));
+                        // статика на стенде — замеры 11..19 (с 20-й по 50-ю с у стримера, с запасом на
+                        // сдвиг часов): там повтор кадров должен держать ≥ 45 FPS (источник даёт 0)
+                        const staticFps = Math.min(...seq.slice(11, 20).map(x => x.fps));
+                        // после возврата движения — не больше одного замера (2 с) с провалом
+                        const lowAfter = seq.slice(20).filter(x => x.fps < 20).length;
+                        if (minH < maxH) { status(`FAIL: разрешение проседало ${maxH}p → ${minH}p`); return; }
+                        if (staticFps < 45) { status(`FAIL: на статике FPS ${staticFps}`); return; }
+                        if (lowAfter > 1) { status(`FAIL: после статики FPS долго не восстанавливался (${lowAfter} замера)`); return; }
+                        report("IN ", `статика: разрешение ${maxH}p всё время, на статике FPS не ниже ${staticFps}`);
+                    }
                     await new Promise(r => setTimeout(r, q.has("stall") ? 20000 : q.has("directfallback") ? 34000 : q.has("ramp") ? 32000 : q.has("heavy") ? 15000 : 0));
                     for (const l of await mediaReport(w.pc, "in")) report("IN ", l);
                     status(`OK: видео ${video.videoWidth}x${video.videoHeight} через ${secs} с, путь ${await pathOf(w.pc)}`);
