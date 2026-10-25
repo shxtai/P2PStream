@@ -298,7 +298,7 @@ const MAX = 30e6;
     const ok = nextViewerDecode(b.state, { recvFps: 60, decFps: 60, dropFps: 0, hw: true }, "vp9", 14000, 14);
     check("зритель успевает -> сразу назад не прыгаем", ok.action === null && ok.state.steps === 1);
     const back = nextViewerDecode(ok.state, { recvFps: 60, decFps: 60, dropFps: 0, hw: true }, "vp9", 60000, 14);
-    check("45 с без проблем -> ступень выше", back.action === "up" && back.state.steps === 0);
+    check("15+ с без проблем -> ступень выше", back.action === "up" && back.state.steps === 0);
     const stat = nextViewerDecode(initViewerDecode(0), { recvFps: 5, decFps: 5, dropFps: 0, hw: false }, "av1", 10000, 14);
     check("статичный экран (5 FPS приходит) -> не проблема", stat.action === null && stat.state.strain === 0);
 }
@@ -392,5 +392,14 @@ const MAX = 30e6;
     // мелкие колебания оценки — не обвал
     r = nextCeiling({ ...s, prevBwe: 30e6 }, { bwe: 22e6, sent: 20e6, clean: true, now: 5000 }, M);
     check("30 → 22 — не обвал", r.state.ceiling === 30e6 && !r.kickBps);
+}
+// --- 1.23.19: ложные «декодер не успевает» ---
+{
+    const v0 = initViewerDecode(0);
+    const a = nextViewerDecode(v0, { recvFps: 46, decFps: 37, dropFps: 0, hw: false, fz: 2 }, "h264", 10000, 14);
+    const b = nextViewerDecode(a.state, { recvFps: 46, decFps: 37, dropFps: 0, hw: false, fz: 1 }, "h264", 12000, 14);
+    check("«37 из 46» во время сетевых заморозок — не декодер, ступень не снижаем", b.action === null && b.state.steps === 0);
+    const c = nextViewerDecode({ strain: 0, steps: 1, calmSince: 0, lastAct: 0 }, { recvFps: 45, decFps: 45, dropFps: 0, hw: false }, "h264", 16000, 14);
+    check("ступень по декодеру возвращается через 15 с", c.action === "up" && c.state.steps === 0);
 }
 process.exit(failed ? 1 : 0);

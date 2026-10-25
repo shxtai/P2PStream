@@ -745,6 +745,7 @@ class HostPeer {
     private ceil: CeilState | null = null;
     private kickStartBps = 0;
     private startedBps = 0;
+    private lastNegotiateAt = 0;
     /** канал обратной связи (и прямой: сдвиг видео под звук раз в 2 с) */
     private fb: RTCDataChannel | null = null;
     private connectedAt = 0;
@@ -849,6 +850,7 @@ class HostPeer {
 
     private async negotiate(iceRestart: boolean): Promise<void> {
         if (this.closed || this.makingOffer) return;
+        this.lastNegotiateAt = Date.now();
         this.makingOffer = true;
         this.bundling = true;
         try {
@@ -1094,7 +1096,7 @@ class HostPeer {
                 // зритель недополучает кадры / замирает (2 отчёта подряд — не случайность)
                 const rxNow = this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
                 // первые 6 с после соединения не считаем: заморозка до первого ключевого кадра нормальна
-                const settled = this.connectedAt > 0 && Date.now() - this.connectedAt > 6000;
+                const settled = this.connectedAt > 0 && Date.now() - this.connectedAt > 6000 && Date.now() - this.lastNegotiateAt > 5000;
                 const starvedNow = settled && !!rxNow && viewerStarved(rxNow, encFps);
                 this.starved = starvedNow ? this.starved + 1 : 0;
                 const viewerStall = this.starved >= 2;
@@ -1130,7 +1132,9 @@ class HostPeer {
                 const aspect = srcW && srcH ? srcW / srcH : 16 / 9;
                 // декодер зрителя не успевает (по его обратной связи) — лестница вниз / смена кодека
                 this.viewerDecode ??= initViewerDecode(Date.now());
-                const rx = this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
+                // (1.23.19) первые 6 с после соединения и 5 с после пересогласования (новый
+                // ключевой кадр) отчёты зрителя не считаем: «1 из 41 FPS» на старте — не декодер
+                const rx = settled && this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
                 if (rx) {
                     const vd = nextViewerDecode(this.viewerDecode, rx, this.codecName, Date.now(), ladder.length - 1);
                     this.viewerDecode = vd.state;
@@ -1155,9 +1159,9 @@ class HostPeer {
                 const srcLive = srcFps >= 20 ? Math.min(rung.fps, srcFps) : rung.fps;
                 const atBottom = idx === ladder.length - 1;
                 // вход — дно лестницы и провал < 50% кадров; выход — лестница поднялась со дна
-                // или раз в минуту пробуем без аварийного режима (иначе он «маскирует» себя)
+                // или раз в 20 с пробуем без аварийного режима (иначе он «маскирует» себя)
                 const emergency = this.aqEmergency
-                    ? atBottom && Date.now() - this.aqEmergencySince < 60_000
+                    ? atBottom && Date.now() - this.aqEmergencySince < 20_000
                     : atBottom && srcFps >= 20 && encFps < srcLive * 0.5;
                 if (emergency && !this.aqEmergency) this.aqEmergencySince = Date.now();
                 if (emergency !== this.aqEmergency) {

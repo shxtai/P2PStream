@@ -283,7 +283,8 @@ export function nextFpsCap(st: FpsState, s: { encFps: number; cpuLimited: boolea
     }
     next.strain = 0;
     if (s.cpuLimited) { next.easySince = s.now; return { state: next, reason: null }; }
-    if (idx > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
+    // (1.23.19) 10 с спокойно и 20 с после спуска (было 30/60 — минута заниженного качества)
+    if (idx > 0 && s.now - next.easySince >= 10_000 && s.now - st.lastDown >= 20_000) {
         next.capFps = steps[idx - 1];
         next.easySince = s.now;
         return { state: next, reason: `процессор свободен — пробую ${next.capFps} FPS` };
@@ -413,7 +414,8 @@ export function nextCpuSteps(st: CpuState, s: { encFps: number; targetFps: numbe
     }
     next.strain = 0;
     if (s.cpuLimited) { next.easySince = s.now; return { state: next, reason: null }; }
-    if (next.steps > 0 && s.now - next.easySince >= 30_000 && s.now - st.lastDown >= 60_000) {
+    // (1.23.19) 10 с спокойно и 20 с после спуска (было 30/60 — минута заниженного качества)
+    if (next.steps > 0 && s.now - next.easySince >= 10_000 && s.now - st.lastDown >= 20_000) {
         next.steps--;
         if ((next.bwSteps ?? 0) > next.steps) next.bwSteps = next.steps;
         next.easySince = s.now;
@@ -611,9 +613,9 @@ export function directPathVerdict(pairs: PairInfo[]): { selectedPrivate: boolean
  * Реальный лог 1.23.11: стример отдаёт 1080p58 / 31 Мбит/с, а у зрителя 9 FPS и
  * 5 заморозок — стример этого не знал и держал ту же ступень.
  *  - программный декодер AV1 не успевает → сразу сменить кодек;
- *  - иначе 2 замера подряд → ступень лестницы ниже; 45 с без проблем → назад.
+ *  - иначе 2 замера подряд → ступень лестницы ниже; 15 с без проблем → назад.
  */
-export interface ViewerRx { recvFps: number; decFps: number; dropFps: number; hw: boolean; }
+export interface ViewerRx { recvFps: number; decFps: number; dropFps: number; hw: boolean; fz?: number; }
 export interface ViewerDecodeState { strain: number; steps: number; calmSince: number; lastAct: number; }
 
 export function initViewerDecode(now: number): ViewerDecodeState {
@@ -624,7 +626,9 @@ export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: str
     const next = { ...st };
     // dropFps бывает больше decFps (Chrome считает выброшенные до декодера) — не ниже 0
     const shown = Math.max(0, Math.min(rx.decFps, rx.decFps - rx.dropFps));
-    const behind = rx.recvFps >= 20 && (shown < rx.recvFps * 0.85 || (shown < 28 && rx.recvFps >= 30));
+    // (1.23.19) заморозки в том же интервале = сеть (кадры ждали пересылки), а не декодер:
+    // реальный лог — «37 из 46 FPS» во время сетевых заморозок держал 900p при 29 Мбит/с
+    const behind = !(rx.fz && rx.fz > 0) && rx.recvFps >= 20 && (shown < rx.recvFps * 0.85 || (shown < 28 && rx.recvFps >= 30));
     if (behind) {
         next.strain = st.strain + 1;
         next.calmSince = now;
@@ -644,7 +648,8 @@ export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: str
         return { state: next, action: null, reason: null };
     }
     next.strain = 0;
-    if (next.steps > 0 && now - st.calmSince >= 45_000 && now - st.lastAct >= 45_000) {
+    // возврат через 15 с без проблем (было 45: ложная ступень держала 900p минуту)
+    if (next.steps > 0 && now - st.calmSince >= 15_000 && now - st.lastAct >= 15_000) {
         next.steps--;
         next.lastAct = now;
         next.calmSince = now;

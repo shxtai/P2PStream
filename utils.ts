@@ -7,7 +7,7 @@
 import { showToast, UserStore } from "@webpack/common";
 
 /** Версия плагина (видна в консоли, /p2p-doctor и анонсах) */
-export const PLUGIN_VERSION = "1.23.18";
+export const PLUGIN_VERSION = "1.23.19";
 
 /** Сравнение версий «1.10.0»: true, если v >= major.minor.
  *  Используется для гейтинга шифрования сигналов по версии пира. */
