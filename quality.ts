@@ -682,7 +682,7 @@ export function viewerStarved(rx: { recvFps: number; fz?: number }, encFps: numb
  *    растёт 8%/с — проверено на стенде: 11.5 → 25.9 Мбит/с за 2 с), не чаще раза в 15 с;
  *  - 10 с без проблем при загрузке ≥ 80% потолка → потолок +5% (пробуем выше).
  */
-export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; }
+export interface CeilState { ceiling: number; prevBwe: number; cleanSince: number; lastKick: number; lastTrouble: number; prevSent?: number; lastKickBps?: number; }
 
 export function initCeil(now: number): CeilState {
     return { ceiling: 0, prevBwe: 0, cleanSince: now, lastKick: 0, lastTrouble: 0 };
@@ -693,8 +693,24 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
     const bwe = s.bwe && s.bwe > 0 ? s.bwe : 0;
     let reason: string | null = null;
     let trouble = 0;
-    if (bwe && st.prevBwe > 8e6 && bwe < st.prevBwe * 0.5) trouble = st.prevBwe;
+    // (1.23.20) обвал меряем по РЕАЛЬНО отправленному: оценка WebRTC бывает раздута
+    // (лог: «не выдержал 61.5» при реальных ~30) — тогда и потолок выходил завышенным.
+    // Обвал = оценка упала > 2 раз И стала ниже 80% того, что реально шло.
+    const prevSent = st.prevSent ?? 0;
+    if (bwe && st.prevBwe > 8e6 && bwe < st.prevBwe * 0.5 && (!prevSent || bwe < prevSent * 0.8)) trouble = prevSent > 4e6 ? prevSent : st.prevBwe;
     else if (bwe && !st.prevBwe && s.startBps && s.startBps > 8e6 && bwe < s.startBps * 0.5) trouble = s.startBps;
+    // перезапуск на потолок не выдержан (заморозки/потери в первые 10 с после него) —
+    // потолок 85% от уровня перезапуска; иначе прыгали бы на него снова и снова
+    if (!trouble && !s.clean && st.lastKick && s.now - st.lastKick < 10_000 && st.lastKickBps) {
+        const c = Math.max(2 * MIN_CAP_BPS, Math.round(st.lastKickBps * 0.85));
+        if (!st.ceiling || c < st.ceiling) {
+            next.ceiling = c;
+            next.lastTrouble = s.now;
+            next.cleanSince = s.now;
+            next.lastKickBps = 0;
+            reason = `перезапуск на ${(st.lastKickBps / 1e6).toFixed(1)} Мбит/с не выдержан — держусь до ${(c / 1e6).toFixed(1)}`;
+        }
+    }
     if (trouble) {
         const c = Math.max(2 * MIN_CAP_BPS, Math.min(userMaxBps, Math.round(trouble * 0.8)));
         next.ceiling = st.ceiling ? Math.min(st.ceiling, c) : c;
@@ -707,6 +723,7 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
     if (!trouble && next.ceiling && bwe && bwe < next.ceiling * 0.6 && s.now - next.cleanSince >= 4000 && (!st.lastKick || s.now - st.lastKick >= 15_000)) {
         kickBps = next.ceiling;
         next.lastKick = s.now;
+        next.lastKickBps = next.ceiling;
         reason = `канал чистый — сразу возвращаюсь на ${(next.ceiling / 1e6).toFixed(1)} Мбит/с (оценка была ${(bwe / 1e6).toFixed(1)})`;
     }
     if (!trouble && !kickBps && next.ceiling && next.ceiling < userMaxBps && s.clean && s.now - next.lastTrouble >= 10_000 && s.now - next.cleanSince >= 10_000 && s.sent >= next.ceiling * 0.8) {
@@ -715,5 +732,6 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
         reason = `10 с стабильно у потолка — пробую ${(next.ceiling / 1e6).toFixed(1)} Мбит/с`;
     }
     if (bwe) next.prevBwe = bwe;
+    if (s.sent > 0) next.prevSent = s.sent;
     return { state: next, kickBps, reason };
 }

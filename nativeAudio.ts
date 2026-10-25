@@ -130,10 +130,12 @@ class VcP2pRing extends AudioWorkletProcessor {
         /* после провала копим сразу до рабочего уровня (иначе дрейф-коррекция
            набирала бы его секундами); перелив режем выше target + 150 мс */
         this.prefill = this.target;
-        /* (1.23.18) перелив режем уже выше target + 80 мс (было +150: в логе буфер
-           раздувался до 324 мс, и видео ждало звук на столько же) */
-        this.maxLag = this.target + 48000 * 2 * 0.08;
-        this.trimTo = this.target + 48000 * 2 * 0.02;
+        /* (1.23.20) жёсткая обрезка — только при крайнем переливе (+200 мс): каждая
+           обрезка = слышимый пропуск звука, а при +80 мс (1.23.18) после каждого рывка
+           рендерера звук «херовил». Умеренный перелив сдувает дрейф-коррекция ниже
+           (±2 кадра на блок — неслышно), теперь чуть быстрее (до ±3). */
+        this.maxLag = this.target + 48000 * 2 * 0.20;
+        this.trimTo = this.target + 48000 * 2 * 0.06;
     }
     process(_inputs, outputs) {
         const out = outputs[0];
@@ -168,7 +170,7 @@ class VcP2pRing extends AudioWorkletProcessor {
            последний кадр. Ошибка делится на 240 блоков/с — плавно и неслышно */
         if (!this.buffering) {
             let corr = Math.round((this.count - this.target) / 2 / 240);
-            if (corr > 2) corr = 2;
+            if (corr > 3) corr = 3;
             if (corr < -2) corr = -2;
             if (corr > 0 && this.count >= corr * 2) {
                 this.read = (this.read + corr * 2) % this.cap;

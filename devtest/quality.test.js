@@ -380,9 +380,18 @@ const MAX = 30e6;
     check("4 с чисто, оценка 7 < 60% потолка → перезапуск на 32", r.kickBps === 32e6, r.reason);
     r = nextCeiling(c, { bwe: 8e6, sent: 6e6, clean: true, now: 10000 }, M); c = r.state;
     check("повторный перезапуск не раньше 15 с", r.kickBps === null);
-    // работаем у потолка, обвал 31 → 6 → потолок 24.8
-    r = nextCeiling({ ...c, prevBwe: 31e6 }, { bwe: 6e6, sent: 5e6, clean: false, now: 40000 }, M);
+    // работаем у потолка (реально шло 31), обвал оценки 31 → 6 → потолок 24.8
+    r = nextCeiling({ ...c, prevBwe: 31e6, prevSent: 31e6 }, { bwe: 6e6, sent: 5e6, clean: false, now: 40000 }, M);
     check("обвал 31 → 6 → потолок 24.8", Math.round(r.state.ceiling / 1e5) === 248, r.reason);
+    // раздутая оценка 61.5 при реальных 30 → потолок от реальных 30 (24), а не от 61.5
+    r = nextCeiling({ ceiling: 0, prevBwe: 61.5e6, prevSent: 30e6, cleanSince: 0, lastKick: 0, lastTrouble: 0 }, { bwe: 5.7e6, sent: 5e6, clean: false, now: 50000 }, M);
+    check("раздутая оценка 61.5 при реальных 30 → потолок 24, не 49", r.state.ceiling === 24e6, r.reason);
+    // оценка упала 60 → 28, но реально шло 25 — это не обвал
+    r = nextCeiling({ ceiling: 30e6, prevBwe: 60e6, prevSent: 25e6, cleanSince: 0, lastKick: 0, lastTrouble: 0 }, { bwe: 28e6, sent: 25e6, clean: true, now: 50000 }, M);
+    check("оценка 60 → 28 при реальных 25 — не обвал (потолок не снижен)", r.state.ceiling >= 30e6 && !/не выдержал/.test(r.reason ?? ""), r.reason ?? "");
+    // перезапуск на 33.5 → через 4 с заморозки → потолок 28.5
+    r = nextCeiling({ ceiling: 33.5e6, prevBwe: 7e6, prevSent: 6e6, cleanSince: 0, lastKick: 60000, lastTrouble: 0, lastKickBps: 33.5e6 }, { bwe: 15.8e6, sent: 14e6, clean: false, now: 64000 }, M);
+    check("перезапуск на 33.5 не выдержан → потолок 28.5", Math.round(r.state.ceiling / 1e5) === 285, r.reason);
     // 30 с стабильно у потолка → +5%
     let s = { ceiling: 30e6, prevBwe: 30e6, cleanSince: 0, lastKick: 0, lastTrouble: 0 };
     r = nextCeiling(s, { bwe: 30e6, sent: 27e6, clean: true, now: 8000 }, M);
