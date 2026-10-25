@@ -195,7 +195,7 @@ if (role === "host") {
                     // анонс с ad приходит раз в 8 с — ждём, пока сдвиг применится
                     const vr = w.pc.getReceivers().find(r => r.track?.kind === "video");
                     const jb = vr?.jitterBufferTarget;
-                    if (jb !== Number(q.get("ad"))) { if (Date.now() - t0 < 40_000) return; clearInterval(tick); status(`FAIL: видео не задержано под звук (jitterBufferTarget=${jb})`); return; }
+                    if (!(jb >= Number(q.get("ad")) && jb <= Number(q.get("ad")) + 300)) { if (Date.now() - t0 < 40_000) return; clearInterval(tick); status(`FAIL: видео не задержано под звук (jitterBufferTarget=${jb})`); return; }
                     report("IN ", `видео задержано под звук: jitterBufferTarget=${jb} мс`);
                 }
                 if (droppedCodec) {

@@ -603,9 +603,9 @@ function waitIceGathering(pc: RTCPeerConnection, ms: number): Promise<void> {
 
 /** Задержки приёмников: звук — baseMs, видео — baseMs + audioLeadMs (столько
  *  звук стримера сидит в его буфере, см. meta.ad). Видео ждёт звук, а не наоборот. */
-function applyReceiverDelays(pc: RTCPeerConnection, baseMs: number, audioLeadMs = 0): void {
+function applyReceiverDelays(pc: RTCPeerConnection, audioMs: number, videoMs: number): void {
     for (const receiver of pc.getReceivers()) {
-        const target = Math.min(4000, baseMs + (receiver.track?.kind === "video" ? audioLeadMs : 0));
+        const target = Math.min(4000, Math.max(0, Math.round(receiver.track?.kind === "video" ? videoMs : audioMs)));
         // (1.23.21) каждое изменение цели — растяжение/сжатие звука в NetEq (слышно на
         // музыке); одно и то же значение не переставляем
         if ((receiver as any).__p2pDelay === target) continue;
@@ -1660,8 +1660,10 @@ export class WatchSession {
         return Math.max(0, Math.min(800, auto + extra));
     }
 
-    private appliedLead = -1;
+    private appliedVideo = -1;
     private appliedBase = -1;
+    /** (1.23.22) реальная задержка звука в буфере джиттера ЗРИТЕЛЯ, мс (из getStats) */
+    private audioRxMs = 0;
 
     /** Применить задержки приёмников (буфер джиттера + сдвиг видео под звук) */
     applyDelays(): void {
@@ -1669,13 +1671,18 @@ export class WatchSession {
         if (!pc) return;
         const base = this.jitterTargetMs || Number(settings.store.jitterBuffer) || 0;
         const lead = this.audioLeadMs();
-        // анонс приходит раз в 8 с — мелкие колебания уровня (±20 мс) не трогаем
-        if (Math.abs(lead - this.appliedLead) < 40 && base === this.appliedBase) return;
-        const loud = this.appliedLead < 0 || Math.abs(lead - this.appliedLead) >= 80 || base !== this.appliedBase;
-        this.appliedLead = lead;
+        // Видео ждёт звук целиком: буфер стримера (lead) + РЕАЛЬНЫЙ буфер звука здесь.
+        // Раньше бралась только цель (base, часто 0), а Chrome сам держит звук на
+        // 40–200 мс в зависимости от сети — эта часть гуляла и давала рассинхрон.
+        const audioHere = Math.max(base, Math.round(this.audioRxMs / 10) * 10);
+        const video = audioHere + lead;
+        // мелкие колебания (±40 мс) не трогаем
+        if (Math.abs(video - this.appliedVideo) < 40 && base === this.appliedBase) return;
+        const loud = this.appliedVideo < 0 || Math.abs(video - this.appliedVideo) >= 80 || base !== this.appliedBase;
+        this.appliedVideo = video;
         this.appliedBase = base;
-        applyReceiverDelays(pc, base, lead);
-        if (lead && loud) logger.info(`Видео задержано на ${lead} мс под звук стримера (буфер ${base} мс)`);
+        applyReceiverDelays(pc, base, video);
+        if (video && loud) logger.info(`Видео задержано на ${video} мс под звук (буфер стримера ${lead} мс, звук здесь ~${audioHere} мс)`);
     }
 
     /**
@@ -1692,13 +1699,19 @@ export class WatchSession {
         let st: RecvState = { targetMs: userMin(), calmSince: Date.now() };
         let prevFreezes = -1;
         let prev: { recv: number; dec: number; drop: number; fz: number; at: number; } | null = null;
+        let prevAudio: { d: number; n: number; } | null = null;
         const bufStart = Date.now();
         this.jbTimer = setInterval(async () => {
             if (this.pc !== pc) return;
             // обратная связь стримеру: сколько кадров декодер реально успевает
             try {
                 let recv = 0, dec = 0, drop = 0, fzTotal = 0, impl = "?", hw = false;
+                let aD = -1, aN = -1;
                 (await pc.getStats()).forEach((r: any) => {
+                    if (r.type === "inbound-rtp" && r.kind === "audio" && Number.isFinite(r.jitterBufferDelay) && Number.isFinite(r.jitterBufferEmittedCount)) {
+                        aD = r.jitterBufferDelay;
+                        aN = r.jitterBufferEmittedCount;
+                    }
                     if (r.type === "inbound-rtp" && r.kind === "video") {
                         fzTotal = r.freezeCount ?? 0;
                         recv = r.framesReceived ?? 0;
@@ -1708,6 +1721,17 @@ export class WatchSession {
                         hw = !!r.powerEfficientDecoder;
                     }
                 });
+                // средняя задержка звука в буфере за 2 с (сглаженная) → сдвиг видео
+                if (aN >= 0) {
+                    if (prevAudio && aN - prevAudio.n > 4800) {
+                        const ms = (aD - prevAudio.d) / (aN - prevAudio.n) * 1000;
+                        if (ms >= 0 && ms < 2000) {
+                            this.audioRxMs = this.audioRxMs ? this.audioRxMs * 0.7 + ms * 0.3 : ms;
+                            this.applyDelays();
+                        }
+                    }
+                    prevAudio = { d: aD, n: aN };
+                }
                 const now = Date.now();
                 if (prev && this.fb?.readyState === "open" && now > prev.at) {
                     const k = 1000 / (now - prev.at);

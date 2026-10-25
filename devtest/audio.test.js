@@ -98,4 +98,22 @@ const lightLag = Math.round(sum(lightRuns, "lagMs") / lightRuns.length);
 const lightOk = lightLag <= 120 && sum(lightRuns, "dropouts") <= 5;
 console.log(`без игры: провалов ${sum(lightRuns, "dropouts")}, задержка ~${lightLag} мс`);
 console.log(`${lightOk ? "✔" : "✘"} без нагрузки задержка звука ≤ 120 мс и почти без провалов`);
-process.exit(ok && lagOk && repOk && lightOk ? 0 : 1);
+// (1.23.22) пауза источника (в системе тишина, хелпер молчит 2 с) не раздувает запас,
+// а застрявшая доставка (300 мс ничего, потом пачкой) — раздувает
+function pauseRun(stall) {
+    const w = new cur.Cls();
+    const out = [[new Float32Array(128), new Float32Array(128)]];
+    let t = 0;
+    const feed = ms => w.port.onmessage({ data: new Float32Array(Math.round(ms * 48) * 2).fill(0.3) });
+    const play = ms => { for (let b = 0; b < ms / (128 / 48); b++) w.process([], out); };
+    for (let i = 0; i < 300; i++) { feed(20); play(20); }   // 6 с ровного звука
+    const before = w.target;
+    if (stall) { play(300); feed(300); play(20); }           // застряло, потом пачкой
+    else { play(2000); feed(20); play(20); }                 // тишина в источнике, вернулся маленьким куском
+    for (let i = 0; i < 20; i++) { feed(20); play(20); }
+    return { grew: w.target > before, msgs: w.reported.filter(v => typeof v === "object") };
+}
+const pz = pauseRun(false), st = pauseRun(true);
+const pauseOk = !pz.grew && pz.msgs.some(m => m.p) && st.grew && st.msgs.some(m => m.u);
+console.log(`${pauseOk ? "✔" : "✘"} пауза источника не растит задержку, застрявшая доставка — растит (${JSON.stringify(pz.msgs)} / ${JSON.stringify(st.msgs)})`);
+process.exit(ok && lagOk && repOk && lightOk && pauseOk ? 0 : 1);

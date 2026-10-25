@@ -41,8 +41,10 @@ export interface NativeAudioStats {
     /** усреднённый уровень (~5 с) — по нему зрители сдвигают видео: мгновенный
      *  скакал 180–290 мс между анонсами, и сдвиг видео «плавал» */
     avgMs: number;
-    /** провалы буфера (звук прерывался, копим заново) с начала эфира */
+    /** провалы доставки (данные застряли между хелпером и ворклетом) с начала эфира */
     underruns: number;
+    /** паузы источника (в системе было тихо — хелпер ничего не слал) */
+    srcPauses: number;
     /** сколько раз хелпер перезапускался вотчдогом */
     restarts: number;
     /** main-процесс сообщил о смерти хелпера */
@@ -106,10 +108,24 @@ class VcP2pRing extends AudioWorkletProcessor {
         this.buf = new Float32Array(this.cap);
         this.read = 0;
         this.count = 0;                 /* кол-во валидных float-значений */
+        this.judge = false;
+        this.gapBlocks = 0;
         this.port.onmessage = e => {
             const d = e.data;
             if (!d || !d.length) return;
             const n = d.length - (d.length % 2); /* только целые стерео-кадры */
+            if (this.judge) {
+                this.judge = false;
+                const gapFrames = this.gapBlocks * 128;
+                const gapMs = Math.round(gapFrames / 48);
+                if (n / 2 >= gapFrames * 0.5 || gapFrames < 48000 * 0.05) {
+                    this.setTarget(this.target + 48000 * 2 * 0.05);
+                    this.calm = 0;
+                    this.port.postMessage({ u: 1, ms: gapMs });
+                } else {
+                    this.port.postMessage({ p: 1, ms: gapMs });
+                }
+            }
             for (let i = 0; i < n; i++) {
                 if (this.count >= this.cap) {
                     /* переполнение: роняем самый старый КАДР (2 значения) — раньше
@@ -146,12 +162,16 @@ class VcP2pRing extends AudioWorkletProcessor {
         const n = L.length;
         if (this.buffering && this.count >= this.prefill) this.buffering = false;
         if (!this.buffering && this.count < n * 2) {
-            /* провал: копим заново и прибавляем запас (+50 мс) */
+            /* провал: копим заново. Запас (+50 мс) растёт, только если данные потом
+               пришли ПАЧКОЙ — значит, застряли по дороге (рендерер/main). Хелпер
+               молчит, когда в системе тишина (WASAPI не шлёт пакетов), — тогда
+               вернутся маленьким куском, и задержку не трогаем (1.23.22: «провалов 25»
+               раздували буфер до максимума, а с ним и сдвиг видео у зрителя). */
             this.buffering = true;
-            this.port.postMessage({ u: 1 });
-            this.setTarget(this.target + 48000 * 2 * 0.05);
-            this.calm = 0;
+            this.judge = true;
+            this.gapBlocks = 0;
         }
+        if (this.judge) this.gapBlocks++;
         /* 20 с без провалов — сжимаемся на 10 мс, дальше каждые 5 с (375 блоков/с) */
         if (++this.calm >= 375 * 20 && this.target > this.minT) {
             this.setTarget(this.target - 48000 * 2 * 0.01);
@@ -223,6 +243,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         levelMs: 0,
         avgMs: 0,
         underruns: 0,
+        srcPauses: 0,
         restarts: 0,
         dead: false,
         silenceMs: 0,
@@ -272,13 +293,25 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
         const dest = ctx.createMediaStreamDestination();
         node.connect(dest);
         node.port.onmessage = e => {
-            if (e.data && typeof e.data === "object" && e.data.u) { st.underruns++; return; }
+            if (e.data && typeof e.data === "object") {
+                const now = Date.now();
+                if (e.data.u) {
+                    st.underruns++;
+                    // в лог — не чаще раза в 20 с (по нему видно, где рвётся звук)
+                    if (now - lastStallLog > 20_000) {
+                        lastStallLog = now;
+                        logger.info(`Звук: данные от захвата не приходили ${e.data.ms} мс (застряли по дороге) — запас буфера +50 мс; всего таких ${st.underruns}`);
+                    }
+                } else if (e.data.p) st.srcPauses++;
+                return;
+            }
             if (typeof e.data !== "number") return;
             st.levelMs = e.data;
             // ~10 замеров/с: постоянная времени ~5 с; провалы (0 = копим заново) не тянут вниз
             if (e.data > 0) st.avgMs = st.avgMs ? st.avgMs * 0.98 + e.data * 0.02 : e.data;
         };
 
+        let lastStallLog = 0;
         let stopped = false;
         let pulling = false; // запросы не внахлёст: иначе куски PCM могли прийти не по порядку
         const pullTimer = setInterval(() => {
@@ -358,6 +391,7 @@ export async function startNativeAudio(opts: { mode: NativeAudioMode; sourceId?:
                     levelMs: st.levelMs,
                     avgMs: Math.round(st.avgMs),
                     underruns: st.underruns,
+                    srcPauses: st.srcPauses,
                     restarts: st.restarts,
                     dead: st.dead,
                     silenceMs: st.silenceMs,
