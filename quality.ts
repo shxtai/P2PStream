@@ -49,6 +49,10 @@ export interface SendState {
     uselessCuts: number;
     /** до этого момента не растём (после среза из-за заморозок у зрителя) */
     holdUntil?: number;
+    /** лучшая скорость, реально прошедшая чисто в этом сеансе (бит/с): к ней возвращаемся быстро */
+    bestClean?: number;
+    /** скорость, на которой последний раз начались потери/очередь: возле неё растём осторожно */
+    troubleAt?: number;
 }
 
 export const MIN_CAP_BPS = 1_500_000;
@@ -123,8 +127,11 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
         const factor = next.lossEwma > 0.15 || (pliStorm && s.pli >= 4) ? 0.6 : 0.8;
         // режем от реальной скорости: потолок мог стоять на 100 Мбит/с из настроек при
         // фактических 31 — тогда пять срезов подряд ничего не меняли (~20 с заморозок)
-        const base = s.curBps && s.curBps > 0 ? Math.min(st.capBps, s.curBps) : st.capBps;
+        // (1.23.15) но только если поток реально идёт: на статике шлётся ~0.1 Мбит/с,
+        // и срез «от реальной» ронял потолок сразу на минимум 1.5 Мбит/с
+        const base = s.curBps && s.curBps >= 2 * MIN_CAP_BPS ? Math.min(st.capBps, s.curBps) : st.capBps;
         next.capBps = Math.max(MIN_CAP_BPS, Math.round(base * factor));
+        if (lossy || pliStorm || queueing) next.troubleAt = base;
         next.lastCut = s.now;
         next.cleanSince = s.now;
         next.lossAtCut = lossy ? next.lossEwma : 0;
@@ -144,10 +151,18 @@ export function nextCap(st: SendState, s: SendSample, userMaxBps: number): { sta
     // 58 Мбит/с при реальных ~35 у VPN; на смене кадра энкодер выстреливал на весь
     // потолок: «собирает 0 из 59 FPS», потери, заикался и звук.
     const used = s.curBps == null || s.curBps >= st.capBps * 0.6;
-    if (used && next.lossEwma < 0.02 && s.now - st.cleanSince >= (st.capBps < userMaxBps && st.lastCut && s.now - st.lastCut < 10_000 ? 6_000 : 4_000) && st.capBps < userMaxBps) {
-        next.capBps = Math.min(userMaxBps, Math.round(st.capBps * 1.2));
+    // запоминаем, сколько реально прошло чисто
+    if (s.curBps && next.lossEwma < 0.01) next.bestClean = Math.max(st.bestClean ?? 0, s.curBps);
+    // (1.23.15) рост быстрее: +25% каждые 2 с (раньше +20% раз в 4–6 с — с 1.5 до 12 Мбит/с
+    // уходила минута, а сама оценка WebRTC растёт ~8%/с и упирается в наш потолок);
+    // ниже уже проверенного в сеансе уровня — сразу ×1.5 («ретест с поднятием»)
+    if (used && next.lossEwma < 0.02 && s.now - st.cleanSince >= 2_000 && st.capBps < userMaxBps) {
+        const below = (next.bestClean ?? 0) > 0 && st.capBps < next.bestClean! * 0.7;
+        // возле скорости, где недавно (≤ 60 с) были потери, — осторожно (+10%), иначе перескок
+        const nearTrouble = !!st.troubleAt && st.lastCut > 0 && s.now - st.lastCut < 60_000 && st.capBps * 1.25 > st.troubleAt * 0.9;
+        next.capBps = Math.min(userMaxBps, Math.round(st.capBps * (below && !nearTrouble ? 1.5 : nearTrouble ? 1.1 : 1.25)));
         next.cleanSince = s.now;
-        return { state: next, reason: "канал чистый" };
+        return { state: next, reason: below ? "канал чистый — возвращаюсь к проверенной скорости" : "канал чистый" };
     }
     return { state: next, reason: null };
 }
@@ -641,5 +656,8 @@ export function nextViewerDecode(st: ViewerDecodeState, rx: ViewerRx, codec: str
  * Статичный экран (энкодер выдаёт < 20 FPS) — не голод.
  */
 export function viewerStarved(rx: { recvFps: number; fz?: number }, encFps: number): boolean {
-    return (encFps >= 20 && rx.recvFps < encFps * 0.7) || (rx.fz ?? 0) >= 1;
+    // (1.23.15) заморозки — только на движущейся картинке: на статике кадры идут раз в
+    // секунду, и Chrome считает «заморозкой» каждую паузу — потолок рушился до 1.5 Мбит/с
+    if (encFps < 20) return false;
+    return rx.recvFps < encFps * 0.7 || ((rx.fz ?? 0) >= 1 && rx.recvFps >= 15);
 }

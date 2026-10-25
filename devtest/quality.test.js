@@ -308,6 +308,7 @@ const MAX = 30e6;
     check("голод: заморозка за интервал", viewerStarved({ recvFps: 58, fz: 1 }, 58));
     check("не голод: собрано 55 из 58", !viewerStarved({ recvFps: 55, fz: 0 }, 58));
     check("не голод: статичный экран (энкодер 5 FPS)", !viewerStarved({ recvFps: 2 }, 5));
+    check("не голод: статика с «заморозкой» (1 FPS, fz=2) — реальный лог 1.23.14", !viewerStarved({ recvFps: 2, fz: 2 }, 1));
     // реальный случай: потолок 100 из настроек, реально 31, потери 0.3% — режем от 31
     let st = initSendState(100e6, 0);
     let r = nextCap(st, { loss: 0.003, pli: 1, rttMs: 100, now: 10000, viewerStall: true, curBps: 31e6 }, 100e6);
@@ -336,5 +337,24 @@ const MAX = 30e6;
     // отрицательные FPS в обратной связи
     const neg = nextViewerDecode(initViewerDecode(0), { recvFps: 41, decFps: 10, dropFps: 24, hw: false }, "h264", 10000, 14);
     check("dropFps > decFps — «показывает» не уходит в минус", !/-\d/.test(neg.reason ?? "") , neg.reason ?? "нет действия");
+}
+// --- 1.23.15: ложные срезы и медленный рост ---
+{
+    // срез на статике не роняет потолок в минимум
+    let st = { ...initSendState(100e6, 0), capBps: 6e6 };
+    const r = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: 10000, viewerStall: true, curBps: 0.1e6 }, 100e6);
+    check("срез при почти нулевой отправке — от потолка, не в минимум", r.state.capBps === Math.round(6e6 * 0.8), `${r.state.capBps / 1e6}`);
+    // рост: с 6 до 30 Мбит/с на чистом загруженном канале — быстрее 20 с
+    st = { ...initSendState(100e6, 0), capBps: 6e6 }; let t = 0;
+    while (st.capBps < 30e6 && t < 120_000) { t += 2000; st = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: t, curBps: st.capBps * 0.9 }, 100e6).state; }
+    check("рост 6 → 30 Мбит/с на чистом канале ≤ 20 с", st.capBps >= 30e6 && t <= 20_000, `${t / 1000} с`);
+    // возврат к проверенной скорости ×1.5
+    st = { ...initSendState(100e6, 0), capBps: 10e6, bestClean: 35e6 };
+    const back = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: 4000, curBps: 9e6 }, 100e6);
+    check("ниже проверенных 35 Мбит/с — шаг ×1.5", back.state.capBps === 15e6, back.reason);
+    // статика: не растём (как в 1.23.14)
+    st = { ...initSendState(100e6, 0), capBps: 30e6 }; t = 0;
+    for (let i = 0; i < 20; i++) { t += 2000; st = nextCap(st, { loss: 0, pli: 0, rttMs: 100, now: t, curBps: 1e6 }, 100e6).state; }
+    check("статика — потолок по-прежнему не растёт", st.capBps === 30e6);
 }
 process.exit(failed ? 1 : 0);

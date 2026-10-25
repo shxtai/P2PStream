@@ -741,6 +741,7 @@ class HostPeer {
     private viewerDecode: ViewerDecodeState | null = null;
     /** отчётов зрителя подряд с «голодом» (см. viewerStarved) */
     private starved = 0;
+    private connectedAt = 0;
     /** текущий видеокодек этого зрителя (из статистики) */
     codecName = "";
     private lastOfferAt = 0;
@@ -806,6 +807,7 @@ class HostPeer {
             logger.info(`Пир ${userId}: ${st}`);
             if (st === "connected") {
                 void logSelectedPair(this.pc, `эфир → ${userId}`);
+                this.connectedAt = Date.now();
                 this.startAutoQuality();
                 if (!this.directChecked) setTimeout(() => void this.checkDirectPath(), 6000);
             }
@@ -1073,7 +1075,9 @@ class HostPeer {
                 prevBytesAt = nowT;
                 // зритель недополучает кадры / замирает (2 отчёта подряд — не случайность)
                 const rxNow = this.viewerRx && Date.now() - this.viewerRx.at < 5000 ? this.viewerRx : null;
-                const starvedNow = !!rxNow && viewerStarved(rxNow, encFps);
+                // первые 6 с после соединения не считаем: заморозка до первого ключевого кадра нормальна
+                const settled = this.connectedAt > 0 && Date.now() - this.connectedAt > 6000;
+                const starvedNow = settled && !!rxNow && viewerStarved(rxNow, encFps);
                 this.starved = starvedNow ? this.starved + 1 : 0;
                 const viewerStall = this.starved >= 2;
                 if (this.starved === 2 && rxNow) logger.info(`Зритель ${this.userId}: собирает ${Math.round(rxNow.recvFps)} из ${Math.round(encFps)} FPS${rxNow.fz ? `, заморозок +${rxNow.fz}` : ""} — снижаю битрейт`);
