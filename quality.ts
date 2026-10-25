@@ -699,17 +699,50 @@ export function initCeil(now: number): CeilState {
     return { ceiling: 0, prevBwe: 0, cleanSince: now, lastKick: 0, lastTrouble: 0 };
 }
 
+/**
+ * (1.23.24) Старт по памяти: предел канала до этого зрителя из прошлых эфиров.
+ * Потолок сразу 90% предела, первые 3 мин проба не выше 92% — без обвала на старте
+ * и без повторного фриза на том же месте; дальше пробуем выше как обычно.
+ */
+export function initCeilFromLimit(now: number, limitBps: number, userMaxBps: number): CeilState {
+    return {
+        ...initCeil(now),
+        ceiling: Math.max(2 * MIN_CAP_BPS, Math.min(userMaxBps, Math.round(limitBps * 0.9))),
+        failAt: limitBps,
+        failTime: now,
+        failHoldMs: FAIL_HOLD_MS
+    };
+}
+
+/** старт оценки канала по памяти: 90% известного предела (не выше скорости из настроек) */
+export function startFromLimit(limitBps: number, userMaxBps: number): number {
+    return Math.round(Math.max(2_500_000, Math.min(userMaxBps, limitBps * 0.9)));
+}
+
+/** Обновлять ли память о пределе: новый обвал (failAt сменился) или долго держались выше. */
+export function nextRemembered(stored: number, st: CeilState, clean: boolean, now: number): number | null {
+    if (st.failAt && st.failTime != null && now - st.failTime < 3000 && Math.abs(st.failAt - stored) > stored * 0.03) return st.failAt;
+    // держимся выше записанного предела минуту без обвалов — предел выше, чем думали
+    if (stored > 0 && clean && st.ceiling > stored * 1.03 && (st.failTime == null || now - st.failTime > 60_000) && now - st.lastTrouble > 20_000) return Math.round(st.ceiling * 1.05);
+    return null;
+}
+
 export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number; clean: boolean; startBps?: number; now: number; }, userMaxBps: number): { state: CeilState; kickBps: number | null; reason: string | null; } {
     const next: CeilState = { ...st };
     const bwe = s.bwe && s.bwe > 0 ? s.bwe : 0;
     let reason: string | null = null;
     let trouble = 0;
+    /** обвал на стартовой проверке (старт на скорости из настроек) — это не предел канала */
+    let startTrouble = false;
     // (1.23.20) обвал меряем по РЕАЛЬНО отправленному: оценка WebRTC бывает раздута
     // (лог: «не выдержал 61.5» при реальных ~30) — тогда и потолок выходил завышенным.
     // Обвал = оценка упала > 2 раз И стала ниже 80% того, что реально шло.
     const prevSent = st.prevSent ?? 0;
     if (bwe && st.prevBwe > 8e6 && bwe < st.prevBwe * 0.5 && (!prevSent || bwe < prevSent * 0.8)) trouble = prevSent > 4e6 ? prevSent : st.prevBwe;
-    else if (bwe && !st.prevBwe && s.startBps && s.startBps > 8e6 && bwe < s.startBps * 0.5) trouble = s.startBps;
+    else if (bwe && !st.prevBwe && s.startBps && s.startBps > 8e6 && bwe < s.startBps * 0.5) {
+        trouble = s.startBps;
+        startTrouble = true;
+    }
     // перезапуск на потолок не выдержан (заморозки/потери в первые 10 с после него) —
     // потолок 85% от уровня перезапуска; иначе прыгали бы на него снова и снова
     // (1.23.21) неудача — и когда оценка так и не поднялась (лог 1.23.20: перезапуск на 20.7,
@@ -742,10 +775,14 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
         next.cleanSince = s.now;
         // (1.23.23) запоминаем, где сломалось: проба +5% больше туда не лезет (лог 1.23.22:
         // 42 → 44 → 46 → 48.6 → обвал → 33.8 → … → снова 42 → обвал — фриз каждую минуту)
-        const again = !!(st.failAt && st.failTime && s.now - st.failTime < (st.failHoldMs ?? FAIL_HOLD_MS) * 2 && trouble >= st.failAt * 0.85);
-        next.failHoldMs = again ? Math.min(FAIL_HOLD_MAX_MS, (st.failHoldMs ?? FAIL_HOLD_MS) * 2) : FAIL_HOLD_MS;
-        next.failAt = again && st.failAt ? Math.min(st.failAt, trouble) : trouble;
-        next.failTime = s.now;
+        // (1.23.24) стартовая проверка (50 Мбит/с из настроек) — не предел: лог 1.23.23 —
+        // «не лезу выше, на 50.0 был обвал», а реальный предел ~42, и проба дошла до 46 → фриз
+        if (!startTrouble) {
+            const again = !!(st.failAt && st.failTime != null && s.now - st.failTime < (st.failHoldMs ?? FAIL_HOLD_MS) * 2 && trouble >= st.failAt * 0.85);
+            next.failHoldMs = again ? Math.min(FAIL_HOLD_MAX_MS, (st.failHoldMs ?? FAIL_HOLD_MS) * 2) : FAIL_HOLD_MS;
+            next.failAt = again && st.failAt ? Math.min(st.failAt, trouble) : trouble;
+            next.failTime = s.now;
+        }
         reason = `канал не выдержал ${(trouble / 1e6).toFixed(1)} Мбит/с — держусь до ${(next.ceiling / 1e6).toFixed(1)}`;
     }
     if (!s.clean) next.cleanSince = s.now;
@@ -759,7 +796,7 @@ export function nextCeiling(st: CeilState, s: { bwe: number | null; sent: number
     if (!trouble && !kickBps && next.ceiling && next.ceiling < userMaxBps && s.clean && s.now - next.lastTrouble >= 10_000 && s.now - next.cleanSince >= 10_000 && s.sent >= next.ceiling * 0.8) {
         let up = Math.min(userMaxBps, Math.round(next.ceiling * 1.05));
         // недавний обвал: не выше 92% его уровня, пока не пройдёт выдержка
-        const holding = !!(next.failAt && next.failTime && s.now - next.failTime < (next.failHoldMs ?? FAIL_HOLD_MS));
+        const holding = !!(next.failAt && next.failTime != null && s.now - next.failTime < (next.failHoldMs ?? FAIL_HOLD_MS));
         if (holding) up = Math.min(up, Math.round(next.failAt! * 0.92));
         if (up > next.ceiling * 1.01) {
             next.ceiling = up;

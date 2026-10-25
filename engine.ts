@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import * as DataStore from "@api/DataStore";
 import { Logger } from "@utils/Logger";
 import { ApplicationStreamingStore, ChannelStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
@@ -21,7 +22,7 @@ import {
 } from "./broker";
 import type { P2PSourceInfo } from "./capture";
 import { type NativeAudioHandle,startNativeAudio } from "./nativeAudio";
-import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling } from "./quality";
+import { buildLadder, type CpuState, DECODE_TROUBLE_LIMIT, effectiveCap, fallbackCodec, initCpuState, initSendState, nextCap, nextCpuSteps, nextDecodeTrouble, nextEncoderStall, nextJitterTarget, pickRung, type RecvState, sendCap, type SendState, startBitrateBps, withStartBitrate, reorderAnswerCodecs, peerIsRemote, srflxIps, directPathVerdict, isVpnHostCandidate, type PairInfo, removeVpnInSdp, initViewerDecode, nextViewerDecode, type ViewerDecodeState, type ViewerRx, viewerStarved, type CeilState, initCeil, nextCeiling, initCeilFromLimit, startFromLimit, nextRemembered } from "./quality";
 import { AUTO_CODEC_ORDER, settings } from "./settings";
 import {
     acceptReliable,
@@ -707,6 +708,25 @@ export function createStatsTracker(direction: "out" | "in") {
 // endregion
 
 // region HostPeer (стример → один зритель)
+// (1.23.24) Память о пределе канала до каждого зрителя (между эфирами, 7 дней):
+// новый эфир сразу стартует чуть ниже известного предела, без обвала и фриза на старте.
+const LIMITS_KEY = "P2PStream_channelLimits";
+const LIMIT_TTL_MS = 7 * 24 * 3600_000;
+let channelLimits: Record<string, { bps: number; at: number; }> = {};
+void DataStore.get(LIMITS_KEY).then(v => {
+    if (v && typeof v === "object") channelLimits = { ...(v as any), ...channelLimits };
+}).catch(() => { /* нет хранилища — без памяти */ });
+
+function knownLimit(userId: string): number {
+    const e = channelLimits[userId];
+    return e && Date.now() - e.at < LIMIT_TTL_MS && e.bps > 0 ? e.bps : 0;
+}
+
+function rememberLimit(userId: string, bps: number): void {
+    channelLimits[userId] = { bps: Math.round(bps), at: Date.now() };
+    void DataStore.set(LIMITS_KEY, channelLimits).catch(() => { /* ignore */ });
+}
+
 class HostPeer {
     pc: RTCPeerConnection;
     closed = false;
@@ -747,6 +767,8 @@ class HostPeer {
     private starved = 0;
     /** потолок канала (nextCeiling) и стартовая скорость для «перезапуска» оценки */
     private ceil: CeilState | null = null;
+    /** предел канала до зрителя из прошлых эфиров (0 — неизвестен) */
+    private memLimit = 0;
     private kickStartBps = 0;
     private startedBps = 0;
     private lastNegotiateAt = 0;
@@ -911,7 +933,9 @@ class HostPeer {
                 // с текущей): не тянет — WebRTC за ~секунду опустится до реальной
                 const userMax = Math.round(Number(settings.store.videoBitrate) * 1_000_000);
                 // «перезапуск» оценки на потолке канала (nextCeiling) — иначе обычный старт
-                const startBps = this.kickStartBps || startBitrateBps(this.effSmooth, userMax);
+                // (1.23.24) предел канала до этого зрителя известен по прошлым эфирам — старт с 90% от него
+                if (!this.startedBps) this.memLimit = knownLimit(this.userId);
+                const startBps = this.kickStartBps || (this.memLimit && !this.effSmooth ? startFromLimit(this.memLimit, userMax) : startBitrateBps(this.effSmooth, userMax));
                 this.kickStartBps = 0;
                 if (!this.startedBps) this.startedBps = startBps;
                 const offerSdp = this.pc.localDescription?.sdp ?? "";
@@ -929,7 +953,7 @@ class HostPeer {
                 if (this.directOnly) sdp = removeVpnInSdp(sdp);
                 if (!this.startLogged) {
                     this.startLogged = true;
-                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.peerRemote ? "; зритель в другой сети" : ""}`);
+                    logger.info(`Старт оценки канала → ${this.userId}: ${(startBps / 1e6).toFixed(1)} Мбит/с${this.memLimit ? ` (по прошлым эфирам предел ~${(this.memLimit / 1e6).toFixed(1)})` : ""}${this.peerRemote ? "; зритель в другой сети" : ""}`);
                 }
                 await this.pc.setRemoteDescription({ type: "answer", sdp });
                 const queue = [...this.pendingIce, ...(d.candidates ?? [])];
@@ -1106,9 +1130,12 @@ class HostPeer {
                 const viewerStall = this.starved >= 2;
                 if (this.starved === 2 && rxNow) logger.info(`Зритель ${this.userId}: собирает ${Math.round(rxNow.recvFps)} из ${Math.round(encFps)} FPS${rxNow.fz ? `, заморозок +${rxNow.fz}` : ""} — снижаю битрейт`);
                 // потолок канала: обвал → держимся ниже, после обвала — сразу «перезапуск» оценки
-                this.ceil ??= initCeil(Date.now());
-                const ce = nextCeiling(this.ceil, { bwe: bweBps, sent: sentBps, clean: (loss ?? 0) < 0.02 && !viewerStall, startBps: this.startedBps || undefined, now: Date.now() }, userMax());
+                this.ceil ??= this.memLimit ? initCeilFromLimit(Date.now(), this.memLimit, userMax()) : initCeil(Date.now());
+                const ceilClean = (loss ?? 0) < 0.02 && !viewerStall;
+                const ce = nextCeiling(this.ceil, { bwe: bweBps, sent: sentBps, clean: ceilClean, startBps: this.startedBps || undefined, now: Date.now() }, userMax());
                 this.ceil = ce.state;
+                const remember = nextRemembered(knownLimit(this.userId), ce.state, ceilClean, Date.now());
+                if (remember) rememberLimit(this.userId, remember);
                 if (ce.reason) logger.info(`Канал → ${this.userId}: ${ce.reason}`);
                 if (ce.kickBps) {
                     this.kickStartBps = ce.kickBps;

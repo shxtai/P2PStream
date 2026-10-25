@@ -9,7 +9,7 @@ const out = esbuild.buildSync({
 });
 const mod = { exports: {} };
 new Function("module", "exports", out.outputFiles[0].text)(mod, mod.exports);
-const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved, initCeil, nextCeiling, kickGapMs } = mod.exports;
+const { initSendState, nextCap, scaleFor, nextJitterTarget, MIN_CAP_BPS, nextDecodeTrouble, nextEncoderStall, fallbackCodec, DECODE_TROUBLE_LIMIT, initFpsState, nextFpsCap, fpsSteps, effectiveCap, qualityFpsCap, buildLadder, pickRung, rungNeedBps, initCpuState, nextCpuSteps, sendCap, startBitrateBps, withStartBitrate, BW_STEP_RECOVER, reorderAnswerCodecs, demoteVpnCandidate, demoteVpnInSdp, isPrivateOrVpnIPv4, srflxIps, peerIsRemote, directPathVerdict, isVpnHostCandidate, removeVpnInSdp, initViewerDecode, nextViewerDecode, viewerStarved, initCeil, nextCeiling, kickGapMs, initCeilFromLimit, startFromLimit, nextRemembered } = mod.exports;
 
 let failed = 0;
 function check(name, cond, info = "") {
@@ -445,6 +445,26 @@ const MAX = 30e6;
     // повторный обвал там же → выдержка вдвое
     r = nextCeiling({ ...c, prevBwe: 44e6, prevSent: 42e6 }, { bwe: 12e6, sent: 11e6, clean: false, now: t + 2000 }, M);
     check("повторный обвал там же — выдержка 6 мин", r.state.failHoldMs === 360000, String(r.state.failHoldMs));
+}
+// --- 1.23.24: стартовая проверка — не предел; память о пределе между эфирами ---
+{
+    const M = 50e6;
+    let r = nextCeiling(initCeil(0), { bwe: 14e6, sent: 12e6, clean: false, startBps: 50e6, now: 2000 }, M);
+    check("обвал на стартовой проверке 50 → потолок 40, но предел НЕ запомнен", r.state.ceiling === 40e6 && !r.state.failAt, JSON.stringify(r.state));
+    // проба без памяти о старте идёт дальше 46 только до настоящего обвала
+    const c0 = initCeilFromLimit(0, 42.3e6, M);
+    check("по памяти (предел 42.3): потолок 38.1, старт 38.1", Math.round(c0.ceiling / 1e5) === 381 && Math.round(startFromLimit(42.3e6, M) / 1e5) === 381);
+    let c = c0, t = 0, max = 0;
+    while (t < 170000) { t += 2000; r = nextCeiling(c, { bwe: c.ceiling, sent: c.ceiling * 0.9, clean: true, startBps: 38.1e6, now: t }, M); c = r.state; max = Math.max(max, c.ceiling); }
+    check("по памяти первые 3 мин не выше 92% предела (38.9)", max <= 42.3e6 * 0.92 + 1, (max / 1e6).toFixed(1));
+    check("скорость из настроек ниже предела — старт по настройкам", startFromLimit(42.3e6, 20e6) === 20e6);
+    // запись памяти
+    const failSt = { ...initCeil(0), ceiling: 33.8e6, failAt: 42.3e6, failTime: 10000, lastTrouble: 10000 };
+    check("новый обвал → запоминаем 42.3", nextRemembered(0, failSt, false, 11000) === 42.3e6);
+    check("тот же предел повторно не пишем", nextRemembered(42.3e6, failSt, false, 11000) === null);
+    const highSt = { ...initCeil(0), ceiling: 46e6, failAt: 42.3e6, failTime: 0, lastTrouble: 100000 };
+    check("минуту держимся выше предела без обвалов → предел выше", nextRemembered(42.3e6, highSt, true, 200000) === Math.round(46e6 * 1.05));
+    check("без известного предела «держимся» не пишем", nextRemembered(0, { ...highSt, failAt: undefined }, true, 200000) === null);
 }
 // --- 1.23.19: ложные «декодер не успевает» ---
 {
